@@ -18,6 +18,23 @@ The contract model consists of issuer-controlled `TokenInstrument` and `Holding`
 
 Holdings of the same instrument are only mergeable when they disclose to the same set of auditors. Auditor sets are compared by membership, so list order and duplicate entries do not matter.
 
+## Canton Token Standard compatibility
+
+The model package depends on two pinned Token Standard V1 DARs, vendored in `lib/`:
+
+| DAR | Package ID |
+| --- | --- |
+| `splice-api-token-metadata-v1-1.0.0.dar` | `4ded6b668cb3b64f7a88a30874cd41c75829f5e064b3fbbadf41ec7e8363354f` |
+| `splice-api-token-holding-v1-1.0.0.dar` | `718a0f77e505a8de22f188bd4c87fe74101274e9d4cb1bfac7d09aec7158d35b` |
+
+`Holding` implements `Splice.Api.Token.HoldingV1.Holding`, so every holding is readable through the standard interface and its `HoldingView` reports the owner, the standard instrument identifier, the amount, no lock, and empty metadata. Standard `InstrumentId` is derived on read as `admin = issuer` and `id = symbol`; the AMM's own `InstrumentId` remains the canonical identity and nothing is duplicated on-ledger.
+
+That interface declares no choices, so the instance adds no way to move a holding. `TransferExact` and `Merge` remain the only transfer paths and stay owner-controlled, and the view is readable exactly by the existing stakeholders. It omits `auditors`, so it discloses strictly less than the template payload.
+
+`TokenInstrument` implements no interface. The pinned `splice-api-token-metadata-v1` DAR defines only shared data types plus the `AnyContract` marker that its own documentation says no template should implement, so V1 offers no on-ledger instrument-metadata interface to implement. Instrument identity is instead reachable through the standard view of any holding of that instrument.
+
+Pool settlement continues to use the concrete `Holding` template throughout. Deliberately unsupported in this phase: third-party holding implementations, transfer instructions and factories, allocations and allocation requests, registry choice contexts, locked holdings, fragmented multi-input settlement, and mixed V1/V2 assets.
+
 ## Authorization and privacy
 
 The pool operator and governance are co-signatories, so neither can create pool state alone. Holding owners control exact transfers. Direct pool operations add the trader or provider as a controller, while `SwapIntent` execution requires both the operator and governance and carries the trader's authority from the intent.

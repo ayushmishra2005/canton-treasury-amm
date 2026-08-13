@@ -2,6 +2,9 @@ module CantonTreasuryAmm.Token where
 
 import DA.List (dedupSort)
 
+import Splice.Api.Token.HoldingV1 qualified as TokenStandard
+import Splice.Api.Token.MetadataV1 (emptyMetadata)
+
 import CantonTreasuryAmm.Errors
 import CantonTreasuryAmm.Types
 
@@ -9,6 +12,14 @@ data TransferResult = TransferResult with
   movedHoldingCid : ContractId Holding
   changeHoldingCid : Optional (ContractId Holding)
     deriving (Eq, Show)
+
+-- The issuer signs every instrument and holding of that instrument, so it is the administering
+-- party the standard names `admin`. Symbols are unique per issuer, satisfying the standard's
+-- uniqueness requirement for `id`. This projection is derived on read and stores nothing.
+standardInstrumentId : InstrumentId -> TokenStandard.InstrumentId
+standardInstrumentId instrument = TokenStandard.InstrumentId with
+  admin = instrument.issuer
+  id = instrument.symbol
 
 template TokenInstrument
   with
@@ -88,3 +99,15 @@ template Holding
           owner
           amount = amountOf combinedAtoms
           auditors
+
+    -- The standard holding interface declares no choices, so this instance adds no way to move a
+    -- holding: `TransferExact` and `Merge` remain the only paths and stay owner-controlled. The
+    -- view is readable exactly by the existing stakeholders and omits `auditors`, so it discloses
+    -- nothing new. This model has no lock, so every holding reports as unlocked.
+    interface instance TokenStandard.Holding for Holding where
+      view = TokenStandard.HoldingView with
+        owner
+        instrumentId = standardInstrumentId instrument
+        amount
+        lock = None
+        meta = emptyMetadata

@@ -1,0 +1,152 @@
+module CantonTreasuryAmm.Test.TokenStandard where
+
+import DA.Assert ((===))
+import Daml.Script
+
+import Splice.Api.Token.HoldingV1 qualified as TokenStandard
+import Splice.Api.Token.MetadataV1 (emptyMetadata)
+
+import CantonTreasuryAmm.Test.Fixtures
+import CantonTreasuryAmm.Token
+import CantonTreasuryAmm.Types
+
+treasuryStandardId : Fixture -> TokenStandard.InstrumentId
+treasuryStandardId fixture = TokenStandard.InstrumentId with
+  admin = fixture.treasuryIssuer
+  id = "UST"
+
+stableStandardId : Fixture -> TokenStandard.InstrumentId
+stableStandardId fixture = TokenStandard.InstrumentId with
+  admin = fixture.stableIssuer
+  id = "USD"
+
+unlockedView : Party -> TokenStandard.InstrumentId -> Decimal -> TokenStandard.HoldingView
+unlockedView owner instrumentId amount = TokenStandard.HoldingView with
+  owner
+  instrumentId
+  amount
+  lock = None
+  meta = emptyMetadata
+
+standardView : Party -> ContractId Holding -> Script TokenStandard.HoldingView
+standardView reader holdingCid = do
+  result <- queryInterfaceContractId @TokenStandard.Holding reader
+    (toInterfaceContractId @TokenStandard.Holding holdingCid)
+  case result of
+    Some holdingView -> pure holdingView
+    None -> abort "Expected a standard holding view"
+
+issuedHoldingsExposeStandardViews : Script ()
+issuedHoldingsExposeStandardViews = do
+  fixture <- setup
+  Some treasuryInstrument <- queryContractId fixture.treasuryIssuer fixture.treasuryInstrumentCid
+  treasuryInstrument.instrument.issuer === fixture.treasuryIssuer
+  treasuryInstrument.instrument.symbol === "UST"
+
+  treasuryHoldingCid <- issueTreasury fixture fixture.provider 10.0
+  treasuryHoldingView <- standardView fixture.provider treasuryHoldingCid
+  treasuryHoldingView === unlockedView fixture.provider (treasuryStandardId fixture) 10.0
+  treasuryHoldingView.instrumentId.admin === treasuryInstrument.instrument.issuer
+  treasuryHoldingView.instrumentId.id === treasuryInstrument.instrument.symbol
+
+  stableHoldingCid <- issueStable fixture fixture.trader 2.5
+  stableHoldingView <- standardView fixture.trader stableHoldingCid
+  stableHoldingView === unlockedView fixture.trader (stableStandardId fixture) 2.5
+
+transferAndMergeSuccessorsExposeStandardViews : Script ()
+transferAndMergeSuccessorsExposeStandardViews = do
+  fixture <- setup
+  holdingCid <- issueTreasury fixture fixture.provider 10.0
+  totalBefore <- instrumentTotalAtoms fixture fixture.treasuryInstrument
+
+  transfer <- submit fixture.provider $ exerciseCmd holdingCid TransferExact with
+    newOwner = fixture.trader
+    transferAmount = 4.0
+  Some changeCid <- pure transfer.changeHoldingCid
+  movedView <- standardView fixture.trader transfer.movedHoldingCid
+  changeView <- standardView fixture.provider changeCid
+  movedView === unlockedView fixture.trader (treasuryStandardId fixture) 4.0
+  changeView === unlockedView fixture.provider (treasuryStandardId fixture) 6.0
+
+  returned <- submit fixture.trader $ exerciseCmd transfer.movedHoldingCid TransferExact with
+    newOwner = fixture.provider
+    transferAmount = 4.0
+  mergedCid <- submit fixture.provider $ exerciseCmd changeCid Merge with
+    otherHoldingCid = returned.movedHoldingCid
+  mergedView <- standardView fixture.provider mergedCid
+  mergedView === unlockedView fixture.provider (treasuryStandardId fixture) 10.0
+
+  totalAfter <- instrumentTotalAtoms fixture fixture.treasuryInstrument
+  totalAfter === totalBefore
+
+poolReserveAndSwapOutputExposeStandardViews : Script ()
+poolReserveAndSwapOutputExposeStandardViews = do
+  Initialized {fixture, initialized} <- standardPool
+  stableTotalBefore <- instrumentTotalAtoms fixture fixture.stableInstrument
+  initialPool <- assertActivePool fixture initialized.poolCid
+  initialTreasuryReserveView <- standardView fixture.operator initialPool.treasuryReserveHoldingCid
+  initialStableReserveView <- standardView fixture.operator initialPool.stableReserveHoldingCid
+  initialTreasuryReserveView === unlockedView fixture.operator (treasuryStandardId fixture) 0.0005
+  initialStableReserveView === unlockedView fixture.operator (stableStandardId fixture) 0.001
+
+  inputHoldingCid <- issueTreasury fixture fixture.trader 0.0000001
+  result <- submitDirectSwap fixture initialized.poolCid fixture.trader TreasuryForStable
+    inputHoldingCid 0.0000001 0.0
+  outputView <- standardView fixture.trader result.outputHoldingCid
+  outputView === unlockedView fixture.trader (stableStandardId fixture) 0.0000001993
+
+  swappedPool <- assertActivePool fixture result.poolCid
+  treasuryReserveView <- standardView fixture.operator swappedPool.treasuryReserveHoldingCid
+  stableReserveView <- standardView fixture.operator swappedPool.stableReserveHoldingCid
+  treasuryReserveView === unlockedView fixture.operator (treasuryStandardId fixture) 0.0005001
+  stableReserveView === unlockedView fixture.operator (stableStandardId fixture) 0.0009998007
+
+  stableTotalAfter <- instrumentTotalAtoms fixture fixture.stableInstrument
+  stableTotalAfter === stableTotalBefore
+
+standardViewsFollowExistingPrivacy : Script ()
+standardViewsFollowExistingPrivacy = do
+  fixture <- setup
+  holdingCid <- issueTreasury fixture fixture.provider 7.0
+  let standardCid = toInterfaceContractId @TokenStandard.Holding holdingCid
+  let expected = unlockedView fixture.provider (treasuryStandardId fixture) 7.0
+
+  ownerView <- standardView fixture.provider holdingCid
+  auditorView <- standardView fixture.auditor holdingCid
+  issuerView <- standardView fixture.treasuryIssuer holdingCid
+  ownerView === expected
+  auditorView === expected
+  issuerView === expected
+
+  ownerHoldings <- queryInterface @TokenStandard.Holding fixture.provider
+  map fst ownerHoldings === [standardCid]
+
+  outsiderHoldings <- queryInterface @TokenStandard.Holding fixture.other
+  outsiderHoldings === []
+  outsiderView <- queryInterfaceContractId @TokenStandard.Holding fixture.other standardCid
+  outsiderView === None
+
+standardViewGrantsNoTransferAuthority : Script ()
+standardViewGrantsNoTransferAuthority = do
+  fixture <- setup
+  holdingCid <- issueTreasury fixture fixture.provider 3.0
+  auditorView <- standardView fixture.auditor holdingCid
+  issuerView <- standardView fixture.treasuryIssuer holdingCid
+  auditorView === unlockedView fixture.provider (treasuryStandardId fixture) 3.0
+  issuerView === auditorView
+
+  auditorTransfer <- trySubmit (actAs fixture.auditor <> readAs fixture.provider) $
+    exerciseCmd holdingCid TransferExact with
+      newOwner = fixture.auditor
+      transferAmount = 3.0
+  assertAuthorizationError auditorTransfer
+  issuerTransfer <- trySubmit (actAs fixture.treasuryIssuer <> readAs fixture.provider) $
+    exerciseCmd holdingCid TransferExact with
+      newOwner = fixture.treasuryIssuer
+      transferAmount = 3.0
+  assertAuthorizationError issuerTransfer
+
+  Some holding <- queryContractId fixture.provider holdingCid
+  holding.amount === 3.0
+  unchangedView <- standardView fixture.provider holdingCid
+  unchangedView === auditorView
