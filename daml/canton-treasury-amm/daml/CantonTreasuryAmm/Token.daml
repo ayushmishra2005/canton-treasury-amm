@@ -1,0 +1,88 @@
+module CantonTreasuryAmm.Token where
+
+import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.Types
+
+data TransferResult = TransferResult with
+  movedHoldingCid : ContractId Holding
+  changeHoldingCid : Optional (ContractId Holding)
+    deriving (Eq, Show)
+
+template TokenInstrument
+  with
+    instrument : InstrumentId
+    displayName : Text
+    auditors : [Party]
+  where
+    signatory instrument.issuer
+    observer auditors
+
+    nonconsuming choice Issue : ContractId Holding
+      with
+        owner : Party
+        amount : Decimal
+      controller instrument.issuer
+      do
+        requireDomain (amount > 0.0) invalidAmountError "Issued amount must be positive"
+        requireDomain (amount <= maxReserveAmount) reserveCapError "Issued amount exceeds the atom cap"
+        let amountAtoms = atomsOf amount
+        create Holding with
+          instrument
+          owner
+          amount
+          auditors
+
+template Holding
+  with
+    instrument : InstrumentId
+    owner : Party
+    amount : Decimal
+    auditors : [Party]
+  where
+    signatory instrument.issuer
+    observer owner, auditors
+    ensure isPositiveCapped amount
+
+    choice TransferExact : TransferResult
+      with
+        newOwner : Party
+        transferAmount : Decimal
+      controller owner
+      do
+        requireDomain (transferAmount > 0.0) invalidAmountError "Transfer amount must be positive"
+        requireDomain (transferAmount <= maxReserveAmount) reserveCapError "Transfer amount exceeds the atom cap"
+        let transferAtoms = atomsOf transferAmount
+        let balanceAtoms = atomsOf amount
+        requireState (transferAtoms <= balanceAtoms) insufficientBalanceError "Transfer amount exceeds the holding balance"
+        movedHoldingCid <- create Holding with
+          instrument
+          owner = newOwner
+          amount = transferAmount
+          auditors
+        changeHoldingCid <-
+          if transferAtoms == balanceAtoms
+            then pure None
+            else Some <$> create Holding with
+              instrument
+              owner
+              amount = amountOf (balanceAtoms - transferAtoms)
+              auditors
+        pure TransferResult with movedHoldingCid; changeHoldingCid
+
+    choice Merge : ContractId Holding
+      with
+        otherHoldingCid : ContractId Holding
+      controller owner
+      do
+        other <- fetch otherHoldingCid
+        requireDomain (other.instrument == instrument) instrumentMismatchError "Holdings use different instruments"
+        requireDomain (other.owner == owner) ownerMismatchError "Holdings have different owners"
+        requireDomain (other.auditors == auditors) incompatibleHoldingsError "Holdings have different observer sets"
+        let combinedAtoms = atomsOf amount + atomsOf other.amount
+        requireDomain (combinedAtoms <= maxReserveAtoms) reserveCapError "Merged holding exceeds the atom cap"
+        exercise otherHoldingCid Archive
+        create Holding with
+          instrument
+          owner
+          amount = amountOf combinedAtoms
+          auditors

@@ -1,0 +1,45 @@
+module CantonTreasuryAmm.LiquidityPosition where
+
+import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.Types
+
+data BurnPositionResult = BurnPositionResult with
+  remainingPositionCid : Optional (ContractId LiquidityPosition)
+    deriving (Eq, Show)
+
+template LiquidityPosition
+  with
+    poolId : PoolId
+    operator : Party
+    governance : Party
+    provider : Party
+    shares : Decimal
+    auditors : [Party]
+  where
+    signatory operator, governance
+    observer provider, auditors
+    ensure isPositiveCapped shares
+
+    choice BurnPosition : BurnPositionResult
+      with
+        expectedPoolId : PoolId
+        burnAmount : Decimal
+      controller provider
+      do
+        requireDomain (expectedPoolId == poolId) positionError "Liquidity position belongs to another pool"
+        requireDomain (burnAmount > 0.0) invalidAmountError "Burn amount must be positive"
+        requireDomain (burnAmount <= maxReserveAmount) reserveCapError "Burn amount exceeds the atom cap"
+        let burnAtoms = atomsOf burnAmount
+        let shareAtoms = atomsOf shares
+        requireState (burnAtoms <= shareAtoms) positionError "Burn amount exceeds the position"
+        remainingPositionCid <-
+          if burnAtoms == shareAtoms
+            then pure None
+            else Some <$> create LiquidityPosition with
+              poolId
+              operator
+              governance
+              provider
+              shares = amountOf (shareAtoms - burnAtoms)
+              auditors
+        pure BurnPositionResult with remainingPositionCid

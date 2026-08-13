@@ -1,0 +1,3 @@
+packages:
+  - ./daml/canton-treasury-amm
+  - ./daml/canton-treasury-amm-tests

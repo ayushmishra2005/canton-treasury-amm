@@ -1,0 +1,370 @@
+module CantonTreasuryAmm.Pool where
+
+import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.LiquidityPosition
+import CantonTreasuryAmm.Math
+import CantonTreasuryAmm.Token
+import CantonTreasuryAmm.Types
+
+data InitializeResult = InitializeResult with
+  poolCid : ContractId Pool
+  positionCid : ContractId LiquidityPosition
+  treasuryChangeHoldingCid : Optional (ContractId Holding)
+  stableChangeHoldingCid : Optional (ContractId Holding)
+    deriving (Eq, Show)
+
+data SwapResult = SwapResult with
+  poolCid : ContractId Pool
+  outputHoldingCid : ContractId Holding
+  inputChangeHoldingCid : Optional (ContractId Holding)
+  amountOut : Decimal
+    deriving (Eq, Show)
+
+data AddLiquidityResult = AddLiquidityResult with
+  poolCid : ContractId Pool
+  positionCid : ContractId LiquidityPosition
+  treasuryChangeHoldingCid : Optional (ContractId Holding)
+  stableChangeHoldingCid : Optional (ContractId Holding)
+  mintedShares : Decimal
+  usedTreasury : Decimal
+  usedStable : Decimal
+    deriving (Eq, Show)
+
+data RemoveLiquidityResult = RemoveLiquidityResult with
+  poolCid : ContractId Pool
+  remainingPositionCid : Optional (ContractId LiquidityPosition)
+  treasuryOutputHoldingCid : Optional (ContractId Holding)
+  stableOutputHoldingCid : Optional (ContractId Holding)
+  treasuryOut : Decimal
+  stableOut : Decimal
+    deriving (Eq, Show)
+
+template PoolSetup
+  with
+    poolId : PoolId
+    initialProvider : Party
+    auditors : [Party]
+  where
+    signatory poolId.operator, poolId.governance
+    observer initialProvider, auditors
+
+    choice Initialize : InitializeResult
+      with
+        treasuryHoldingCid : ContractId Holding
+        stableHoldingCid : ContractId Holding
+        treasuryAmount : Decimal
+        stableAmount : Decimal
+      controller initialProvider
+      do
+        treasuryHolding <- fetch treasuryHoldingCid
+        stableHolding <- fetch stableHoldingCid
+        requireDomain (treasuryAmount > 0.0 && stableAmount > 0.0) invalidAmountError "Initial deposits must be positive"
+        requireDomain (treasuryAmount <= maxReserveAmount && stableAmount <= maxReserveAmount) reserveCapError "Initial reserve exceeds the atom cap"
+        let treasuryAtoms = atomsOf treasuryAmount
+        let stableAtoms = atomsOf stableAmount
+        requireDomain (poolId.treasuryInstrument /= poolId.stableInstrument) instrumentMismatchError "Pool instruments must differ"
+        requireDomain (treasuryHolding.instrument == poolId.treasuryInstrument) instrumentMismatchError "Treasury holding uses the wrong instrument"
+        requireDomain (stableHolding.instrument == poolId.stableInstrument) instrumentMismatchError "Stablecoin holding uses the wrong instrument"
+        requireDomain (treasuryHolding.owner == initialProvider) ownerMismatchError "Initial provider does not own the Treasury holding"
+        requireDomain (stableHolding.owner == initialProvider) ownerMismatchError "Initial provider does not own the stablecoin holding"
+        requireState (treasuryAtoms <= atomsOf treasuryHolding.amount) insufficientBalanceError "Treasury deposit exceeds the holding balance"
+        requireState (stableAtoms <= atomsOf stableHolding.amount) insufficientBalanceError "Stablecoin deposit exceeds the holding balance"
+        let grossShares = floorSqrtWide (wide treasuryAtoms * wide stableAtoms)
+        requireDomain (grossShares >= minimumInitialSharesAtoms) initialLiquidityError "Initial liquidity is below the minimum share threshold"
+        let providerShares = grossShares - lockedSharesAtoms
+        requireDomain (providerShares > 0) initialLiquidityError "Initial liquidity does not leave provider shares"
+        treasuryTransfer <- exercise treasuryHoldingCid TransferExact with
+          newOwner = poolId.operator
+          transferAmount = treasuryAmount
+        stableTransfer <- exercise stableHoldingCid TransferExact with
+          newOwner = poolId.operator
+          transferAmount = stableAmount
+        poolCid <- create Pool with
+          poolId
+          auditors
+          treasuryReserveHoldingCid = treasuryTransfer.movedHoldingCid
+          stableReserveHoldingCid = stableTransfer.movedHoldingCid
+          treasuryReserveAmount = treasuryAmount
+          stableReserveAmount = stableAmount
+          totalShares = amountOf grossShares
+          lockedShares = amountOf lockedSharesAtoms
+          treasuryFeeAtoms = 0.0
+          stableFeeAtoms = 0.0
+          stateVersion = 0
+        positionCid <- create LiquidityPosition with
+          poolId
+          operator = poolId.operator
+          governance = poolId.governance
+          provider = initialProvider
+          shares = amountOf providerShares
+          auditors
+        pure InitializeResult with
+          poolCid
+          positionCid
+          treasuryChangeHoldingCid = treasuryTransfer.changeHoldingCid
+          stableChangeHoldingCid = stableTransfer.changeHoldingCid
+
+template Pool
+  with
+    poolId : PoolId
+    auditors : [Party]
+    treasuryReserveHoldingCid : ContractId Holding
+    stableReserveHoldingCid : ContractId Holding
+    treasuryReserveAmount : Decimal
+    stableReserveAmount : Decimal
+    totalShares : Decimal
+    lockedShares : Decimal
+    treasuryFeeAtoms : Decimal
+    stableFeeAtoms : Decimal
+    stateVersion : Int
+  where
+    signatory poolId.operator, poolId.governance
+    observer auditors
+    ensure
+      treasuryReserveAmount > 0.0
+        && stableReserveAmount > 0.0
+        && treasuryReserveAmount <= maxReserveAmount
+        && stableReserveAmount <= maxReserveAmount
+        && totalShares >= lockedShares
+        && totalShares <= maxReserveAmount
+        && lockedShares == amountOf lockedSharesAtoms
+
+    choice SwapExactInput : SwapResult
+      with
+        trader : Party
+        direction : SwapDirection
+        inputHoldingCid : ContractId Holding
+        inputAmount : Decimal
+        minimumAmountOut : Decimal
+        deadline : Time
+        expectedVersion : Int
+      controller trader
+      do
+        validatePoolState this expectedVersion
+        inputHolding <- fetch inputHoldingCid
+        now <- getTime
+        requireState (now < deadline) deadlineError "Swap deadline has expired"
+        requireDomain (inputAmount > 0.0 && minimumAmountOut >= 0.0) invalidAmountError "Swap amounts must be positive or zero as required"
+        requireDomain (inputAmount <= maxReserveAmount && minimumAmountOut <= maxReserveAmount) reserveCapError "Swap amount exceeds the atom cap"
+        let inputAtoms = atomsOf inputAmount
+        let minimumOutputAtoms = atomsOf minimumAmountOut
+        case direction of
+          TreasuryForStable -> do
+            requireDomain (inputHolding.instrument == poolId.treasuryInstrument) instrumentMismatchError "Swap input uses the wrong instrument"
+            requireDomain (inputHolding.owner == trader) ownerMismatchError "Trader does not own the swap input"
+            let treasuryReserveAtoms = atomsOf treasuryReserveAmount
+            let stableReserveAtoms = atomsOf stableReserveAmount
+            requireDomain (treasuryReserveAtoms + inputAtoms <= maxReserveAtoms) reserveCapError "Treasury reserve would exceed the atom cap"
+            let outputAtoms = swapOutputAtoms treasuryReserveAtoms stableReserveAtoms inputAtoms
+            validateSwap treasuryReserveAtoms stableReserveAtoms inputAtoms outputAtoms minimumOutputAtoms
+            inputTransfer <- exercise inputHoldingCid TransferExact with
+              newOwner = poolId.operator
+              transferAmount = inputAmount
+            nextTreasuryReserveCid <- exercise treasuryReserveHoldingCid Merge with
+              otherHoldingCid = inputTransfer.movedHoldingCid
+            outputTransfer <- exercise stableReserveHoldingCid TransferExact with
+              newOwner = trader
+              transferAmount = amountOf outputAtoms
+            nextStableReserveCid <- requiredChange outputTransfer.changeHoldingCid
+            let feeAtoms = feeAtomsFor inputAtoms
+            successorPoolCid <- create this with
+              treasuryReserveHoldingCid = nextTreasuryReserveCid
+              stableReserveHoldingCid = nextStableReserveCid
+              treasuryReserveAmount = amountOf (treasuryReserveAtoms + inputAtoms)
+              stableReserveAmount = amountOf (stableReserveAtoms - outputAtoms)
+              treasuryFeeAtoms = amountOf (atomsOf treasuryFeeAtoms + feeAtoms)
+              stateVersion = stateVersion + 1
+            pure SwapResult with
+              poolCid = successorPoolCid
+              outputHoldingCid = outputTransfer.movedHoldingCid
+              inputChangeHoldingCid = inputTransfer.changeHoldingCid
+              amountOut = amountOf outputAtoms
+          StableForTreasury -> do
+            requireDomain (inputHolding.instrument == poolId.stableInstrument) instrumentMismatchError "Swap input uses the wrong instrument"
+            requireDomain (inputHolding.owner == trader) ownerMismatchError "Trader does not own the swap input"
+            let stableReserveAtoms = atomsOf stableReserveAmount
+            let treasuryReserveAtoms = atomsOf treasuryReserveAmount
+            requireDomain (stableReserveAtoms + inputAtoms <= maxReserveAtoms) reserveCapError "Stablecoin reserve would exceed the atom cap"
+            let outputAtoms = swapOutputAtoms stableReserveAtoms treasuryReserveAtoms inputAtoms
+            validateSwap stableReserveAtoms treasuryReserveAtoms inputAtoms outputAtoms minimumOutputAtoms
+            inputTransfer <- exercise inputHoldingCid TransferExact with
+              newOwner = poolId.operator
+              transferAmount = inputAmount
+            nextStableReserveCid <- exercise stableReserveHoldingCid Merge with
+              otherHoldingCid = inputTransfer.movedHoldingCid
+            outputTransfer <- exercise treasuryReserveHoldingCid TransferExact with
+              newOwner = trader
+              transferAmount = amountOf outputAtoms
+            nextTreasuryReserveCid <- requiredChange outputTransfer.changeHoldingCid
+            let feeAtoms = feeAtomsFor inputAtoms
+            successorPoolCid <- create this with
+              treasuryReserveHoldingCid = nextTreasuryReserveCid
+              stableReserveHoldingCid = nextStableReserveCid
+              treasuryReserveAmount = amountOf (treasuryReserveAtoms - outputAtoms)
+              stableReserveAmount = amountOf (stableReserveAtoms + inputAtoms)
+              stableFeeAtoms = amountOf (atomsOf stableFeeAtoms + feeAtoms)
+              stateVersion = stateVersion + 1
+            pure SwapResult with
+              poolCid = successorPoolCid
+              outputHoldingCid = outputTransfer.movedHoldingCid
+              inputChangeHoldingCid = inputTransfer.changeHoldingCid
+              amountOut = amountOf outputAtoms
+
+    choice AddLiquidity : AddLiquidityResult
+      with
+        provider : Party
+        treasuryHoldingCid : ContractId Holding
+        stableHoldingCid : ContractId Holding
+        maximumTreasury : Decimal
+        maximumStable : Decimal
+        minimumShares : Decimal
+        expectedVersion : Int
+      controller provider
+      do
+        validatePoolState this expectedVersion
+        treasuryHolding <- fetch treasuryHoldingCid
+        stableHolding <- fetch stableHoldingCid
+        requireDomain (treasuryHolding.instrument == poolId.treasuryInstrument) instrumentMismatchError "Treasury contribution uses the wrong instrument"
+        requireDomain (stableHolding.instrument == poolId.stableInstrument) instrumentMismatchError "Stablecoin contribution uses the wrong instrument"
+        requireDomain (treasuryHolding.owner == provider && stableHolding.owner == provider) ownerMismatchError "Provider does not own both contribution holdings"
+        requireDomain (maximumTreasury > 0.0 && maximumStable > 0.0 && minimumShares >= 0.0) invalidAmountError "Liquidity amounts must be positive or zero as required"
+        requireDomain (maximumTreasury <= maxReserveAmount && maximumStable <= maxReserveAmount && minimumShares <= maxReserveAmount) reserveCapError "Liquidity amount exceeds the atom cap"
+        let maximumTreasuryAtoms = atomsOf maximumTreasury
+        let maximumStableAtoms = atomsOf maximumStable
+        let minimumShareAtoms = atomsOf minimumShares
+        requireState (maximumTreasuryAtoms <= atomsOf treasuryHolding.amount) insufficientBalanceError "Treasury maximum exceeds the holding balance"
+        requireState (maximumStableAtoms <= atomsOf stableHolding.amount) insufficientBalanceError "Stablecoin maximum exceeds the holding balance"
+        let treasuryReserveAtoms = atomsOf treasuryReserveAmount
+        let stableReserveAtoms = atomsOf stableReserveAmount
+        let totalShareAtoms = atomsOf totalShares
+        let treasuryLimitedShares = mulFloor maximumTreasuryAtoms totalShareAtoms treasuryReserveAtoms
+        let stableLimitedShares = mulFloor maximumStableAtoms totalShareAtoms stableReserveAtoms
+        let mintedShareAtoms = min treasuryLimitedShares stableLimitedShares
+        requireState (mintedShareAtoms > 0) insufficientLiquidityError "Contribution mints no shares"
+        requireDomain (mintedShareAtoms >= minimumShareAtoms) slippageError "Minted shares are below the provider minimum"
+        let usedTreasuryAtoms = mulCeil mintedShareAtoms treasuryReserveAtoms totalShareAtoms
+        let usedStableAtoms = mulCeil mintedShareAtoms stableReserveAtoms totalShareAtoms
+        requireDomain (usedTreasuryAtoms <= maximumTreasuryAtoms && usedStableAtoms <= maximumStableAtoms) contributionError "Required contribution exceeds its maximum"
+        requireDomain (treasuryReserveAtoms + usedTreasuryAtoms <= maxReserveAtoms) reserveCapError "Treasury reserve would exceed the atom cap"
+        requireDomain (stableReserveAtoms + usedStableAtoms <= maxReserveAtoms) reserveCapError "Stablecoin reserve would exceed the atom cap"
+        requireDomain (totalShareAtoms + mintedShareAtoms <= maxReserveAtoms) reserveCapError "LP supply would exceed the atom cap"
+        treasuryTransfer <- exercise treasuryHoldingCid TransferExact with
+          newOwner = poolId.operator
+          transferAmount = amountOf usedTreasuryAtoms
+        stableTransfer <- exercise stableHoldingCid TransferExact with
+          newOwner = poolId.operator
+          transferAmount = amountOf usedStableAtoms
+        nextTreasuryReserveCid <- exercise treasuryReserveHoldingCid Merge with
+          otherHoldingCid = treasuryTransfer.movedHoldingCid
+        nextStableReserveCid <- exercise stableReserveHoldingCid Merge with
+          otherHoldingCid = stableTransfer.movedHoldingCid
+        successorPoolCid <- create this with
+          treasuryReserveHoldingCid = nextTreasuryReserveCid
+          stableReserveHoldingCid = nextStableReserveCid
+          treasuryReserveAmount = amountOf (treasuryReserveAtoms + usedTreasuryAtoms)
+          stableReserveAmount = amountOf (stableReserveAtoms + usedStableAtoms)
+          totalShares = amountOf (totalShareAtoms + mintedShareAtoms)
+          stateVersion = stateVersion + 1
+        positionCid <- create LiquidityPosition with
+          poolId
+          operator = poolId.operator
+          governance = poolId.governance
+          provider
+          shares = amountOf mintedShareAtoms
+          auditors
+        pure AddLiquidityResult with
+          poolCid = successorPoolCid
+          positionCid
+          treasuryChangeHoldingCid = treasuryTransfer.changeHoldingCid
+          stableChangeHoldingCid = stableTransfer.changeHoldingCid
+          mintedShares = amountOf mintedShareAtoms
+          usedTreasury = amountOf usedTreasuryAtoms
+          usedStable = amountOf usedStableAtoms
+
+    choice RemoveLiquidity : RemoveLiquidityResult
+      with
+        provider : Party
+        positionCid : ContractId LiquidityPosition
+        burnShares : Decimal
+        minimumTreasuryOut : Decimal
+        minimumStableOut : Decimal
+        expectedVersion : Int
+      controller provider
+      do
+        validatePoolState this expectedVersion
+        position <- fetch positionCid
+        requireDomain (position.poolId == poolId) positionError "Liquidity position belongs to another pool"
+        requireDomain (position.operator == poolId.operator && position.governance == poolId.governance) positionError "Liquidity position has the wrong signatories"
+        requireDomain (position.provider == provider) ownerMismatchError "Provider does not own the liquidity position"
+        requireDomain (burnShares > 0.0 && minimumTreasuryOut >= 0.0 && minimumStableOut >= 0.0) invalidAmountError "Removal amounts must be positive or zero as required"
+        requireDomain (burnShares <= maxReserveAmount && minimumTreasuryOut <= maxReserveAmount && minimumStableOut <= maxReserveAmount) reserveCapError "Removal amount exceeds the atom cap"
+        let burnShareAtoms = atomsOf burnShares
+        let totalShareAtoms = atomsOf totalShares
+        let lockedShareAtoms = atomsOf lockedShares
+        requireState (burnShareAtoms <= totalShareAtoms - lockedShareAtoms) positionError "Burn would consume locked shares"
+        let treasuryReserveAtoms = atomsOf treasuryReserveAmount
+        let stableReserveAtoms = atomsOf stableReserveAmount
+        let treasuryOutputAtoms = mulFloor burnShareAtoms treasuryReserveAtoms totalShareAtoms
+        let stableOutputAtoms = mulFloor burnShareAtoms stableReserveAtoms totalShareAtoms
+        requireState (treasuryOutputAtoms > 0 || stableOutputAtoms > 0) insufficientLiquidityError "Burn produces no output"
+        requireDomain (treasuryOutputAtoms >= atomsOf minimumTreasuryOut && stableOutputAtoms >= atomsOf minimumStableOut) slippageError "Liquidity output is below its minimum"
+        burnResult <- exercise positionCid BurnPosition with
+          expectedPoolId = poolId
+          burnAmount = burnShares
+        (treasuryOutputHoldingCid, nextTreasuryReserveCid) <-
+          if treasuryOutputAtoms == 0
+            then pure (None, treasuryReserveHoldingCid)
+            else do
+              transfer <- exercise treasuryReserveHoldingCid TransferExact with
+                newOwner = provider
+                transferAmount = amountOf treasuryOutputAtoms
+              remainingCid <- requiredChange transfer.changeHoldingCid
+              pure (Some transfer.movedHoldingCid, remainingCid)
+        (stableOutputHoldingCid, nextStableReserveCid) <-
+          if stableOutputAtoms == 0
+            then pure (None, stableReserveHoldingCid)
+            else do
+              transfer <- exercise stableReserveHoldingCid TransferExact with
+                newOwner = provider
+                transferAmount = amountOf stableOutputAtoms
+              remainingCid <- requiredChange transfer.changeHoldingCid
+              pure (Some transfer.movedHoldingCid, remainingCid)
+        successorPoolCid <- create this with
+          treasuryReserveHoldingCid = nextTreasuryReserveCid
+          stableReserveHoldingCid = nextStableReserveCid
+          treasuryReserveAmount = amountOf (treasuryReserveAtoms - treasuryOutputAtoms)
+          stableReserveAmount = amountOf (stableReserveAtoms - stableOutputAtoms)
+          totalShares = amountOf (totalShareAtoms - burnShareAtoms)
+          stateVersion = stateVersion + 1
+        pure RemoveLiquidityResult with
+          poolCid = successorPoolCid
+          remainingPositionCid = burnResult.remainingPositionCid
+          treasuryOutputHoldingCid
+          stableOutputHoldingCid
+          treasuryOut = amountOf treasuryOutputAtoms
+          stableOut = amountOf stableOutputAtoms
+
+validatePoolState : Pool -> Int -> Update ()
+validatePoolState pool expectedVersion = do
+  requireState (pool.stateVersion == expectedVersion) staleStateError "Pool state version is stale"
+  treasuryReserve <- fetch pool.treasuryReserveHoldingCid
+  stableReserve <- fetch pool.stableReserveHoldingCid
+  requireState (treasuryReserve.instrument == pool.poolId.treasuryInstrument) reserveMismatchError "Treasury reserve uses the wrong instrument"
+  requireState (stableReserve.instrument == pool.poolId.stableInstrument) reserveMismatchError "Stablecoin reserve uses the wrong instrument"
+  requireState (treasuryReserve.owner == pool.poolId.operator && stableReserve.owner == pool.poolId.operator) reserveMismatchError "Pool operator does not own both reserves"
+  requireState (treasuryReserve.amount == pool.treasuryReserveAmount) reserveMismatchError "Treasury reserve amount does not match its holding"
+  requireState (stableReserve.amount == pool.stableReserveAmount) reserveMismatchError "Stablecoin reserve amount does not match its holding"
+
+validateSwap : Int -> Int -> Int -> Int -> Int -> Update ()
+validateSwap reserveInAtoms reserveOutAtoms inputAtoms outputAtoms minimumOutputAtoms = do
+  requireState (reserveInAtoms > 0 && reserveOutAtoms > 0) insufficientLiquidityError "Pool reserves must be positive"
+  requireState (outputAtoms > 0 && outputAtoms < reserveOutAtoms) insufficientLiquidityError "Swap output is empty or exhausts its reserve"
+  requireDomain (outputAtoms >= minimumOutputAtoms) slippageError "Swap output is below the trader minimum"
+  requireState (adjustedInvariantHolds reserveInAtoms reserveOutAtoms inputAtoms outputAtoms) invariantError "Adjusted invariant would decrease"
+  requireState (rawInvariantHolds reserveInAtoms reserveOutAtoms inputAtoms outputAtoms) invariantError "Raw invariant would decrease"
+  assertMsg "Fee-bearing swap must strictly grow raw k" (rawInvariantGrows reserveInAtoms reserveOutAtoms inputAtoms outputAtoms)
+
+requiredChange : Optional (ContractId Holding) -> Update (ContractId Holding)
+requiredChange changeHoldingCid = case changeHoldingCid of
+  Some cid -> pure cid
+  None -> abort "Reserve transfer must leave a successor holding"

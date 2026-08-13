@@ -1,0 +1,85 @@
+module CantonTreasuryAmm.Test.Liquidity where
+
+import DA.Assert ((===))
+import Daml.Script
+
+import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.Math
+import CantonTreasuryAmm.Pool
+import CantonTreasuryAmm.Test.Fixtures
+import CantonTreasuryAmm.Types
+
+subsequentLiquidityUsesBindingLegAndCeiling : Script ()
+subsequentLiquidityUsesBindingLegAndCeiling = do
+  Initialized {fixture, initialized} <- standardPool
+  treasuryHoldingCid <- issueTreasury fixture fixture.provider 0.0001
+  stableHoldingCid <- issueStable fixture fixture.provider 0.0001
+  result <- submitAddLiquidity fixture initialized.poolCid fixture.provider
+    treasuryHoldingCid stableHoldingCid 0.0001 0.0001 0.0
+  let initialShares = floorSqrtWide (wide 5000000 * wide 10000000)
+  let expectedMinted = min
+        (mulFloor 1000000 initialShares 5000000)
+        (mulFloor 1000000 initialShares 10000000)
+  atomsOf result.mintedShares === expectedMinted
+  atomsOf result.usedTreasury === mulCeil expectedMinted 5000000 initialShares
+  atomsOf result.usedStable === mulCeil expectedMinted 10000000 initialShares
+  assert (atomsOf result.usedTreasury <= 1000000)
+  assert (atomsOf result.usedStable <= 1000000)
+  pool <- assertActivePool fixture result.poolCid
+  atomsOf pool.totalShares === initialShares + expectedMinted
+  assertPoolReservesMatch fixture result.poolCid
+
+partialThenNearTotalRemovalLeavesLockedLiquidity : Script ()
+partialThenNearTotalRemovalLeavesLockedLiquidity = do
+  Initialized {fixture, initialized} <- standardPool
+  Some position <- queryContractId fixture.provider initialized.positionCid
+  let providerShareAtoms = atomsOf position.shares
+  let firstBurnAtoms = providerShareAtoms / 2
+  first <- submitRemoveLiquidity fixture initialized.poolCid fixture.provider initialized.positionCid
+    (amountOf firstBurnAtoms) 0.0 0.0
+  Some remainingPositionCid <- pure first.remainingPositionCid
+  Some remainingPosition <- queryContractId fixture.provider remainingPositionCid
+  second <- submitRemoveLiquidity fixture first.poolCid fixture.provider remainingPositionCid
+    remainingPosition.shares 0.0 0.0
+  second.remainingPositionCid === None
+  pool <- assertActivePool fixture second.poolCid
+  atomsOf pool.totalShares === lockedSharesAtoms
+  assert (atomsOf pool.treasuryReserveAmount > 0)
+  assert (atomsOf pool.stableReserveAmount > 0)
+  assertPoolReservesMatch fixture second.poolCid
+
+removalFloorsEachAssetAndRetainsDust : Script ()
+removalFloorsEachAssetAndRetainsDust = do
+  fixture <- setup
+  initialized <- initializePool fixture "rounding-pool" 0.0001 0.0004
+  result <- submitRemoveLiquidity fixture initialized.poolCid fixture.provider initialized.positionCid
+    (amountOf 1) 0.0 0.0
+  atomsOf result.treasuryOut === 0
+  atomsOf result.stableOut === 2
+  result.treasuryOutputHoldingCid === None
+  pool <- assertActivePool fixture result.poolCid
+  atomsOf pool.treasuryReserveAmount === 1000000
+  atomsOf pool.stableReserveAmount === 3999998
+
+zeroMintRejectsAtomically : Script ()
+zeroMintRejectsAtomically = do
+  Initialized {fixture, initialized} <- standardPool
+  treasuryHoldingCid <- issueTreasury fixture fixture.provider (amountOf 1)
+  stableHoldingCid <- issueStable fixture fixture.provider (amountOf 1)
+  disclosures <- poolDisclosures fixture initialized.poolCid
+  before <- assertActivePool fixture initialized.poolCid
+  result <- trySubmit (actAs fixture.provider <> discloseMany disclosures) $
+    exerciseCmd initialized.poolCid AddLiquidity with
+      provider = fixture.provider
+      treasuryHoldingCid
+      stableHoldingCid
+      maximumTreasury = amountOf 1
+      maximumStable = amountOf 1
+      minimumShares = 0.0
+      expectedVersion = before.stateVersion
+  assertFailureId insufficientLiquidityError result
+  after <- assertActivePool fixture initialized.poolCid
+  after === before
+  Some _ <- queryContractId fixture.provider treasuryHoldingCid
+  Some _ <- queryContractId fixture.provider stableHoldingCid
+  pure ()

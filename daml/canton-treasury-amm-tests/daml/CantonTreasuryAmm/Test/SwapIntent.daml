@@ -1,0 +1,120 @@
+module CantonTreasuryAmm.Test.SwapIntent where
+
+import DA.Assert ((===))
+import DA.Time (addRelTime, hours)
+import Daml.Script
+
+import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.Pool
+import CantonTreasuryAmm.SwapIntent
+import CantonTreasuryAmm.Test.Fixtures
+import CantonTreasuryAmm.Types
+
+createTreasuryIntent : Fixture -> ContractId Pool -> Time -> Script (ContractId SwapIntent)
+createTreasuryIntent fixture poolCid deadline = do
+  Some pool <- queryContractId fixture.operator poolCid
+  submit fixture.trader $ createCmd SwapIntent with
+    trader = fixture.trader
+    operator = fixture.operator
+    governance = fixture.governance
+    complianceObservers = [fixture.auditor]
+    poolCid
+    direction = TreasuryForStable
+    inputAmount = amountOf 1000
+    minimumAmountOut = 0.0
+    deadline
+    expectedPoolVersion = pool.stateVersion
+
+jointExecutionUsesTraderAuthorityAndDisclosedInput : Script ()
+jointExecutionUsesTraderAuthorityAndDisclosedInput = do
+  Initialized {fixture, initialized} <- standardPool
+  inputHoldingCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  deadline <- futureDeadline
+  intentCid <- createTreasuryIntent fixture initialized.poolCid deadline
+  inputDisclosure <- disclosureOf fixture.trader inputHoldingCid
+  result <- submit (actAs [fixture.operator, fixture.governance] <> disclose inputDisclosure) $
+    exerciseCmd intentCid Execute with inputHoldingCid
+  atomsOf result.amountOut === 1993
+  _ <- assertActivePool fixture result.poolCid
+  None <- queryContractId fixture.trader intentCid
+  pure ()
+
+bothControllersAreRequired : Script ()
+bothControllersAreRequired = do
+  Initialized {fixture, initialized} <- standardPool
+  inputHoldingCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  deadline <- futureDeadline
+  intentCid <- createTreasuryIntent fixture initialized.poolCid deadline
+  inputDisclosure <- disclosureOf fixture.trader inputHoldingCid
+  operatorOnly <- trySubmit (actAs fixture.operator <> disclose inputDisclosure) $
+    exerciseCmd intentCid Execute with inputHoldingCid
+  assertAuthorizationError operatorOnly
+  Some _ <- queryContractId fixture.trader intentCid
+  governanceOnly <- trySubmit (actAs fixture.governance <> disclose inputDisclosure) $
+    exerciseCmd intentCid Execute with inputHoldingCid
+  assertAuthorizationError governanceOnly
+  Some _ <- queryContractId fixture.trader intentCid
+  _ <- assertActivePool fixture initialized.poolCid
+  pure ()
+
+executionNeedsInputDisclosure : Script ()
+executionNeedsInputDisclosure = do
+  Initialized {fixture, initialized} <- standardPool
+  inputHoldingCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  deadline <- futureDeadline
+  intentCid <- createTreasuryIntent fixture initialized.poolCid deadline
+  submitMustFail (actAs [fixture.operator, fixture.governance]) $
+    exerciseCmd intentCid Execute with inputHoldingCid
+  Some _ <- queryContractId fixture.trader intentCid
+  _ <- assertActivePool fixture initialized.poolCid
+  Some _ <- queryContractId fixture.trader inputHoldingCid
+  pure ()
+
+onlyTraderCancelsAndCancelledIntentCannotExecute : Script ()
+onlyTraderCancelsAndCancelledIntentCannotExecute = do
+  Initialized {fixture, initialized} <- standardPool
+  inputHoldingCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  deadline <- futureDeadline
+  intentCid <- createTreasuryIntent fixture initialized.poolCid deadline
+  unauthorized <- trySubmit fixture.operator $ exerciseCmd intentCid Cancel
+  assertAuthorizationError unauthorized
+  Some _ <- queryContractId fixture.trader intentCid
+  submit fixture.trader $ exerciseCmd intentCid Cancel
+  inputDisclosure <- disclosureOf fixture.trader inputHoldingCid
+  submitMustFail (actAs [fixture.operator, fixture.governance] <> disclose inputDisclosure) $
+    exerciseCmd intentCid Execute with inputHoldingCid
+  _ <- assertActivePool fixture initialized.poolCid
+  Some _ <- queryContractId fixture.trader inputHoldingCid
+  pure ()
+
+staleIntentCannotConsumeAReplacedPool : Script ()
+staleIntentCannotConsumeAReplacedPool = do
+  Initialized {fixture, initialized} <- standardPool
+  intendedInputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  deadline <- futureDeadline
+  intentCid <- createTreasuryIntent fixture initialized.poolCid deadline
+  interveningInputCid <- issueTreasury fixture fixture.other (amountOf 1000)
+  _ <- submitDirectSwap fixture initialized.poolCid fixture.other TreasuryForStable
+    interveningInputCid (amountOf 1000) 0.0
+  inputDisclosure <- disclosureOf fixture.trader intendedInputCid
+  submitMustFail (actAs [fixture.operator, fixture.governance] <> disclose inputDisclosure) $
+    exerciseCmd intentCid Execute with inputHoldingCid = intendedInputCid
+  Some _ <- queryContractId fixture.trader intentCid
+  Some _ <- queryContractId fixture.trader intendedInputCid
+  pure ()
+
+expiredIntentRejectsWithoutChangingState : Script ()
+expiredIntentRejectsWithoutChangingState = do
+  Initialized {fixture, initialized} <- standardPool
+  inputHoldingCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  now <- getTime
+  intentCid <- createTreasuryIntent fixture initialized.poolCid (addRelTime now (hours 1))
+  passTime (hours 2)
+  inputDisclosure <- disclosureOf fixture.trader inputHoldingCid
+  result <- trySubmit (actAs [fixture.operator, fixture.governance] <> disclose inputDisclosure) $
+    exerciseCmd intentCid Execute with inputHoldingCid
+  assertFailureId deadlineError result
+  Some _ <- queryContractId fixture.trader intentCid
+  _ <- assertActivePool fixture initialized.poolCid
+  Some _ <- queryContractId fixture.trader inputHoldingCid
+  pure ()

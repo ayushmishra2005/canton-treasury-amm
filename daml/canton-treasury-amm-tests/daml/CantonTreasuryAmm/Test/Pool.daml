@@ -1,0 +1,72 @@
+module CantonTreasuryAmm.Test.Pool where
+
+import DA.Assert ((===))
+import Daml.Script
+
+import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.Math
+import CantonTreasuryAmm.Pool
+import CantonTreasuryAmm.Test.Fixtures
+import CantonTreasuryAmm.Types
+
+setupInitializesOnceAndOnlyByProvider : Script ()
+setupInitializesOnceAndOnlyByProvider = do
+  fixture <- setup
+  treasuryHoldingCid <- issueTreasury fixture fixture.provider 0.0005
+  stableHoldingCid <- issueStable fixture fixture.provider 0.001
+  setupCid <- createPoolSetup fixture "single-use"
+  unauthorized <- trySubmit (actAs fixture.other <> readAs fixture.provider) $
+    exerciseCmd setupCid Initialize with
+      treasuryHoldingCid
+      stableHoldingCid
+      treasuryAmount = 0.0005
+      stableAmount = 0.001
+  assertAuthorizationError unauthorized
+  Some _ <- queryContractId fixture.provider setupCid
+  initialized <- submit fixture.provider $ exerciseCmd setupCid Initialize with
+    treasuryHoldingCid
+    stableHoldingCid
+    treasuryAmount = 0.0005
+    stableAmount = 0.001
+  assertPoolReservesMatch fixture initialized.poolCid
+  submitMustFail fixture.provider $ exerciseCmd setupCid Initialize with
+    treasuryHoldingCid
+    stableHoldingCid
+    treasuryAmount = 0.0005
+    stableAmount = 0.001
+  _ <- assertActivePool fixture initialized.poolCid
+  pure ()
+
+initialSharesAndReservesAgree : Script ()
+initialSharesAndReservesAgree = do
+  Initialized {fixture, initialized} <- standardPool
+  pool <- assertActivePool fixture initialized.poolCid
+  Some position <- queryContractId fixture.provider initialized.positionCid
+  let grossShares = floorSqrtWide (wide 5000000 * wide 10000000)
+  atomsOf pool.treasuryReserveAmount === 5000000
+  atomsOf pool.stableReserveAmount === 10000000
+  atomsOf pool.totalShares === grossShares
+  atomsOf pool.lockedShares === lockedSharesAtoms
+  atomsOf position.shares === grossShares - lockedSharesAtoms
+  position.poolId === pool.poolId
+  assertPoolReservesMatch fixture initialized.poolCid
+
+staleVersionRejectsWithoutChangingPool : Script ()
+staleVersionRejectsWithoutChangingPool = do
+  Initialized {fixture, initialized} <- standardPool
+  inputHoldingCid <- issueTreasury fixture fixture.trader 0.0000001
+  disclosures <- poolDisclosures fixture initialized.poolCid
+  deadline <- futureDeadline
+  before <- assertActivePool fixture initialized.poolCid
+  result <- trySubmit (actAs fixture.trader <> discloseMany disclosures) $
+    exerciseCmd initialized.poolCid SwapExactInput with
+      trader = fixture.trader
+      direction = TreasuryForStable
+      inputHoldingCid
+      inputAmount = 0.0000001
+      minimumAmountOut = 0.0
+      deadline
+      expectedVersion = before.stateVersion + 1
+  assertFailureId staleStateError result
+  after <- assertActivePool fixture initialized.poolCid
+  after === before

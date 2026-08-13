@@ -1,0 +1,70 @@
+module CantonTreasuryAmm.Test.Token where
+
+import DA.Assert ((===))
+import Daml.Script
+
+import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.Test.Fixtures
+import CantonTreasuryAmm.Token
+
+exactTransferAndMergeConserveAtoms : Script ()
+exactTransferAndMergeConserveAtoms = do
+  fixture <- setup
+  holdingCid <- issueTreasury fixture fixture.provider 10.0
+  totalBefore <- instrumentTotalAtoms fixture fixture.treasuryInstrument
+  transfer <- submit fixture.provider $ exerciseCmd holdingCid TransferExact with
+    newOwner = fixture.trader
+    transferAmount = 4.0
+  Some changeCid <- pure transfer.changeHoldingCid
+  Some moved <- queryContractId fixture.trader transfer.movedHoldingCid
+  Some change <- queryContractId fixture.provider changeCid
+  moved.amount === 4.0
+  change.amount === 6.0
+  returned <- submit fixture.trader $ exerciseCmd transfer.movedHoldingCid TransferExact with
+    newOwner = fixture.provider
+    transferAmount = 4.0
+  mergedCid <- submit fixture.provider $ exerciseCmd changeCid Merge with
+    otherHoldingCid = returned.movedHoldingCid
+  Some merged <- queryContractId fixture.provider mergedCid
+  merged.amount === 10.0
+  totalAfter <- instrumentTotalAtoms fixture fixture.treasuryInstrument
+  totalAfter === totalBefore
+
+tokenDomainFailuresAreStableAndAtomic : Script ()
+tokenDomainFailuresAreStableAndAtomic = do
+  fixture <- setup
+  before <- query @Holding fixture.treasuryIssuer
+  invalidIssue <- trySubmit fixture.treasuryIssuer $
+    exerciseCmd fixture.treasuryInstrumentCid Issue with
+      owner = fixture.provider
+      amount = 0.0
+  assertFailureId invalidAmountError invalidIssue
+  afterInvalidIssue <- query @Holding fixture.treasuryIssuer
+  map fst afterInvalidIssue === map fst before
+  holdingCid <- issueTreasury fixture fixture.provider 2.0
+  overdraw <- trySubmit fixture.provider $ exerciseCmd holdingCid TransferExact with
+    newOwner = fixture.trader
+    transferAmount = 3.0
+  assertFailureId insufficientBalanceError overdraw
+  Some unchanged <- queryContractId fixture.provider holdingCid
+  unchanged.amount === 2.0
+  stableCid <- issueStable fixture fixture.provider 1.0
+  incompatible <- trySubmit fixture.provider $ exerciseCmd holdingCid Merge with
+    otherHoldingCid = stableCid
+  assertFailureId instrumentMismatchError incompatible
+  Some treasuryStillActive <- queryContractId fixture.provider holdingCid
+  Some stableStillActive <- queryContractId fixture.provider stableCid
+  treasuryStillActive.amount === 2.0
+  stableStillActive.amount === 1.0
+
+onlyOwnerCanTransfer : Script ()
+onlyOwnerCanTransfer = do
+  fixture <- setup
+  holdingCid <- issueTreasury fixture fixture.provider 1.0
+  result <- trySubmit (actAs fixture.other <> readAs fixture.provider) $
+    exerciseCmd holdingCid TransferExact with
+      newOwner = fixture.other
+      transferAmount = 1.0
+  assertAuthorizationError result
+  Some holding <- queryContractId fixture.provider holdingCid
+  holding.amount === 1.0

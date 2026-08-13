@@ -1,0 +1,10 @@
+sdk-version: 3.5.5
+name: canton-treasury-amm-tests
+version: 0.1.0
+source: daml
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
+data-dependencies:
+  - ../canton-treasury-amm/.daml/dist/canton-treasury-amm-0.1.0.dar

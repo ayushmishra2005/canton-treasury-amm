@@ -1,0 +1,58 @@
+module CantonTreasuryAmm.Test.Math where
+
+import DA.Assert ((===))
+import Daml.Script
+
+import CantonTreasuryAmm.Math
+import CantonTreasuryAmm.Types
+
+floorAndCeilingIgnoreNumericRounding : Script ()
+floorAndCeilingIgnoreNumericRounding = do
+  wideDiv 2.0 3.0 === 1.0
+  wideDiv 7.0 2.0 === 4.0
+  wideFloorDiv 2.0 3.0 === 0.0
+  wideFloorDiv 7.0 2.0 === 3.0
+  wideCeilDiv 1.0 3.0 === 1.0
+  wideCeilDiv 5.0 2.0 === 3.0
+
+atomConversionsAreExact : Script ()
+atomConversionsAreExact = do
+  atomsOf 1.0 === 10000000000
+  atomsOf 0.0000000001 === 1
+  atomsOf 10000000.0 === maxReserveAtoms
+  amountOf (atomsOf 9999999.9999999999) === 9999999.9999999999
+  atomsOf (amountOf 99999999999999999) === 99999999999999999
+
+boundedSquareRootFloors : Script ()
+boundedSquareRootFloors = do
+  floorSqrtWide 0.0 === 0
+  floorSqrtWide 1.0 === 1
+  floorSqrtWide 2.0 === 1
+  floorSqrtWide 3.0 === 1
+  floorSqrtWide 4.0 === 2
+  floorSqrtWide 99.0 === 9
+  floorSqrtWide 100.0 === 10
+  let capSquared = wide maxReserveAtoms * wide maxReserveAtoms
+  floorSqrtWide capSquared === maxReserveAtoms
+  floorSqrtWide (capSquared - 1.0) === maxReserveAtoms - 1
+  let awkward = 12345678901234567890123456789.0
+  let root = floorSqrtWide awkward
+  assert (wide root * wide root <= awkward)
+  assert (wide (root + 1) * wide (root + 1) > awkward)
+
+swapPricingMatchesReferenceValues : Script ()
+swapPricingMatchesReferenceValues = do
+  swapOutputAtoms 1000 1000 1 === 0
+  swapOutputAtoms 5000000 10000000 1000 === 1993
+  swapOutputAtoms 1000000 1000000 1000 === 996
+
+invariantsHaveAtomSensitivity : Script ()
+invariantsHaveAtomSensitivity = do
+  let reserveIn = 5000000
+  let reserveOut = 10000000
+  let input = 1000
+  let output = swapOutputAtoms reserveIn reserveOut input
+  assert (adjustedInvariantHolds reserveIn reserveOut input output)
+  assert (rawInvariantHolds reserveIn reserveOut input output)
+  assert (rawInvariantGrows reserveIn reserveOut input output)
+  assert (not (adjustedInvariantHolds reserveIn reserveOut input (output + 1)))

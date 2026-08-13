@@ -1,0 +1,65 @@
+module CantonTreasuryAmm.Errors where
+
+import DA.Fail
+import DA.TextMap qualified as TextMap
+
+invalidAmountError : Text
+invalidAmountError = "amm/invalid-amount"
+
+reserveCapError : Text
+reserveCapError = "amm/reserve-cap"
+
+instrumentMismatchError : Text
+instrumentMismatchError = "amm/instrument-mismatch"
+
+ownerMismatchError : Text
+ownerMismatchError = "amm/owner-mismatch"
+
+insufficientBalanceError : Text
+insufficientBalanceError = "amm/insufficient-balance"
+
+incompatibleHoldingsError : Text
+incompatibleHoldingsError = "amm/incompatible-holdings"
+
+staleStateError : Text
+staleStateError = "amm/stale-state"
+
+deadlineError : Text
+deadlineError = "amm/deadline"
+
+slippageError : Text
+slippageError = "amm/slippage"
+
+insufficientLiquidityError : Text
+insufficientLiquidityError = "amm/insufficient-liquidity"
+
+initialLiquidityError : Text
+initialLiquidityError = "amm/initial-liquidity"
+
+contributionError : Text
+contributionError = "amm/contribution"
+
+positionError : Text
+positionError = "amm/position"
+
+reserveMismatchError : Text
+reserveMismatchError = "amm/reserve-mismatch"
+
+invariantError : Text
+invariantError = "amm/invariant"
+
+reject : Text -> Text -> Update a
+reject errorId message =
+  failWithStatus (FailureStatus errorId InvalidIndependentOfSystemState message TextMap.empty)
+
+rejectState : Text -> Text -> Update a
+rejectState errorId message =
+  failWithStatus (FailureStatus errorId InvalidGivenCurrentSystemStateOther message TextMap.empty)
+
+requireDomain : Bool -> Text -> Text -> Update ()
+requireDomain condition errorId message =
+  if condition then pure () else reject errorId message
+
+requireState : Bool -> Text -> Text -> Update ()
+requireState condition errorId message =
+  if condition then pure () else rejectState errorId message

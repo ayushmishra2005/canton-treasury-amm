@@ -1,0 +1,201 @@
+module CantonTreasuryAmm.Test.Fixtures where
+
+import DA.Assert ((===))
+import DA.Time (addRelTime, hours)
+import Daml.Script
+
+import CantonTreasuryAmm.LiquidityPosition
+import CantonTreasuryAmm.Pool
+import CantonTreasuryAmm.Token
+import CantonTreasuryAmm.Types
+
+data Fixture = Fixture with
+  treasuryIssuer : Party
+  stableIssuer : Party
+  operator : Party
+  governance : Party
+  provider : Party
+  trader : Party
+  other : Party
+  auditor : Party
+  treasuryInstrument : InstrumentId
+  stableInstrument : InstrumentId
+  treasuryInstrumentCid : ContractId TokenInstrument
+  stableInstrumentCid : ContractId TokenInstrument
+
+data Initialized = Initialized with
+  fixture : Fixture
+  initialized : InitializeResult
+
+setup : Script Fixture
+setup = do
+  treasuryIssuer <- allocateParty "TreasuryIssuer"
+  stableIssuer <- allocateParty "StableIssuer"
+  operator <- allocateParty "Operator"
+  governance <- allocateParty "Governance"
+  provider <- allocateParty "Provider"
+  trader <- allocateParty "Trader"
+  other <- allocateParty "Other"
+  auditor <- allocateParty "Auditor"
+  let treasuryInstrument = InstrumentId with issuer = treasuryIssuer; symbol = "UST"
+  let stableInstrument = InstrumentId with issuer = stableIssuer; symbol = "USD"
+  treasuryInstrumentCid <- submit treasuryIssuer $ createCmd TokenInstrument with
+    instrument = treasuryInstrument
+    displayName = "Tokenized U.S. Treasury"
+    auditors = [auditor]
+  stableInstrumentCid <- submit stableIssuer $ createCmd TokenInstrument with
+    instrument = stableInstrument
+    displayName = "USD Stablecoin"
+    auditors = [auditor]
+  pure Fixture with
+    treasuryIssuer
+    stableIssuer
+    operator
+    governance
+    provider
+    trader
+    other
+    auditor
+    treasuryInstrument
+    stableInstrument
+    treasuryInstrumentCid
+    stableInstrumentCid
+
+poolIdOf : Fixture -> Text -> PoolId
+poolIdOf fixture setupReference = PoolId with
+  operator = fixture.operator
+  governance = fixture.governance
+  treasuryInstrument = fixture.treasuryInstrument
+  stableInstrument = fixture.stableInstrument
+  setupReference
+
+issueTreasury : Fixture -> Party -> Decimal -> Script (ContractId Holding)
+issueTreasury fixture owner amount = submit fixture.treasuryIssuer $
+  exerciseCmd fixture.treasuryInstrumentCid Issue with owner; amount
+
+issueStable : Fixture -> Party -> Decimal -> Script (ContractId Holding)
+issueStable fixture owner amount = submit fixture.stableIssuer $
+  exerciseCmd fixture.stableInstrumentCid Issue with owner; amount
+
+createPoolSetup : Fixture -> Text -> Script (ContractId PoolSetup)
+createPoolSetup fixture setupReference =
+  submit (actAs [fixture.operator, fixture.governance]) $ createCmd PoolSetup with
+    poolId = poolIdOf fixture setupReference
+    initialProvider = fixture.provider
+    auditors = [fixture.auditor]
+
+initializePool : Fixture -> Text -> Decimal -> Decimal -> Script InitializeResult
+initializePool fixture setupReference treasuryAmount stableAmount = do
+  treasuryHoldingCid <- issueTreasury fixture fixture.provider treasuryAmount
+  stableHoldingCid <- issueStable fixture fixture.provider stableAmount
+  setupCid <- createPoolSetup fixture setupReference
+  submit fixture.provider $ exerciseCmd setupCid Initialize with
+    treasuryHoldingCid
+    stableHoldingCid
+    treasuryAmount
+    stableAmount
+
+standardPool : Script Initialized
+standardPool = do
+  fixture <- setup
+  initialized <- initializePool fixture "standard-pool" 0.0005 0.001
+  pure Initialized with fixture; initialized
+
+futureDeadline : Script Time
+futureDeadline = do
+  now <- getTime
+  pure (addRelTime now (hours 1))
+
+disclosureOf : Template t => Party -> ContractId t -> Script Disclosure
+disclosureOf reader cid = do
+  result <- queryDisclosure reader cid
+  case result of
+    Some disclosure -> pure disclosure
+    None -> abort "Expected contract disclosure"
+
+poolDisclosures : Fixture -> ContractId Pool -> Script [Disclosure]
+poolDisclosures fixture poolCid = do
+  Some pool <- queryContractId fixture.operator poolCid
+  poolDisclosure <- disclosureOf fixture.operator poolCid
+  treasuryDisclosure <- disclosureOf fixture.operator pool.treasuryReserveHoldingCid
+  stableDisclosure <- disclosureOf fixture.operator pool.stableReserveHoldingCid
+  pure [poolDisclosure, treasuryDisclosure, stableDisclosure]
+
+submitDirectSwap : Fixture -> ContractId Pool -> Party -> SwapDirection -> ContractId Holding -> Decimal -> Decimal -> Script SwapResult
+submitDirectSwap fixture poolCid trader direction inputHoldingCid inputAmount minimumAmountOut = do
+  disclosures <- poolDisclosures fixture poolCid
+  deadline <- futureDeadline
+  Some pool <- queryContractId fixture.operator poolCid
+  submit (actAs trader <> discloseMany disclosures) $
+    exerciseCmd poolCid SwapExactInput with
+      trader
+      direction
+      inputHoldingCid
+      inputAmount
+      minimumAmountOut
+      deadline
+      expectedVersion = pool.stateVersion
+
+submitAddLiquidity : Fixture -> ContractId Pool -> Party -> ContractId Holding -> ContractId Holding -> Decimal -> Decimal -> Decimal -> Script AddLiquidityResult
+submitAddLiquidity fixture poolCid provider treasuryHoldingCid stableHoldingCid maximumTreasury maximumStable minimumShares = do
+  disclosures <- poolDisclosures fixture poolCid
+  Some pool <- queryContractId fixture.operator poolCid
+  submit (actAs provider <> discloseMany disclosures) $
+    exerciseCmd poolCid AddLiquidity with
+      provider
+      treasuryHoldingCid
+      stableHoldingCid
+      maximumTreasury
+      maximumStable
+      minimumShares
+      expectedVersion = pool.stateVersion
+
+submitRemoveLiquidity : Fixture -> ContractId Pool -> Party -> ContractId LiquidityPosition -> Decimal -> Decimal -> Decimal -> Script RemoveLiquidityResult
+submitRemoveLiquidity fixture poolCid provider positionCid burnShares minimumTreasuryOut minimumStableOut = do
+  disclosures <- poolDisclosures fixture poolCid
+  Some pool <- queryContractId fixture.operator poolCid
+  submit (actAs provider <> discloseMany disclosures) $
+    exerciseCmd poolCid RemoveLiquidity with
+      provider
+      positionCid
+      burnShares
+      minimumTreasuryOut
+      minimumStableOut
+      expectedVersion = pool.stateVersion
+
+assertFailureId : Text -> Either SubmitError a -> Script ()
+assertFailureId expectedErrorId result = case result of
+  Left (FailureStatusError failureStatus) -> failureStatus.errorId === expectedErrorId
+  Left otherError -> abort ("Expected FailureStatusError, got " <> show otherError)
+  Right _ -> abort ("Expected submission failure " <> expectedErrorId)
+
+assertAuthorizationError : Either SubmitError a -> Script ()
+assertAuthorizationError result = case result of
+  Left AuthorizationError {} -> pure ()
+  Left otherError -> abort ("Expected AuthorizationError, got " <> show otherError)
+  Right _ -> abort "Expected authorization failure"
+
+assertActivePool : Fixture -> ContractId Pool -> Script Pool
+assertActivePool fixture poolCid = do
+  result <- queryContractId fixture.operator poolCid
+  case result of
+    Some pool -> pure pool
+    None -> abort "Expected active pool"
+
+instrumentTotalAtoms : Fixture -> InstrumentId -> Script Int
+instrumentTotalAtoms fixture instrument = do
+  holdings <- query @Holding instrument.issuer
+  pure (foldl (\total (_, holding) ->
+    if holding.instrument == instrument then total + atomsOf holding.amount else total) 0 holdings)
+
+assertPoolReservesMatch : Fixture -> ContractId Pool -> Script ()
+assertPoolReservesMatch fixture poolCid = do
+  pool <- assertActivePool fixture poolCid
+  Some treasuryReserve <- queryContractId fixture.operator pool.treasuryReserveHoldingCid
+  Some stableReserve <- queryContractId fixture.operator pool.stableReserveHoldingCid
+  treasuryReserve.instrument === fixture.treasuryInstrument
+  stableReserve.instrument === fixture.stableInstrument
+  treasuryReserve.owner === fixture.operator
+  stableReserve.owner === fixture.operator
+  treasuryReserve.amount === pool.treasuryReserveAmount
+  stableReserve.amount === pool.stableReserveAmount

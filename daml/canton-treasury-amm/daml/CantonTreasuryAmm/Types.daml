@@ -1,0 +1,65 @@
+module CantonTreasuryAmm.Types where
+
+import DA.Numeric qualified as N
+
+type Wide = Numeric 0
+
+data InstrumentId = InstrumentId with
+  issuer : Party
+  symbol : Text
+    deriving (Eq, Show)
+
+data PoolId = PoolId with
+  operator : Party
+  governance : Party
+  treasuryInstrument : InstrumentId
+  stableInstrument : InstrumentId
+  setupReference : Text
+    deriving (Eq, Show)
+
+data SwapDirection
+  = TreasuryForStable
+  | StableForTreasury
+  deriving (Eq, Show)
+
+atom : Decimal
+atom = 0.0000000001
+
+maxReserveAtoms : Int
+maxReserveAtoms = 100000000000000000
+
+minimumInitialSharesAtoms : Int
+minimumInitialSharesAtoms = 1000000
+
+lockedSharesAtoms : Int
+lockedSharesAtoms = 1
+
+feeMultiplier : Int
+feeMultiplier = 997
+
+feeDenominator : Int
+feeDenominator = 1000
+
+feeUnits : Int
+feeUnits = 3
+
+wide : Int -> Wide
+wide = intToNumeric
+
+narrow : Wide -> Int
+narrow = truncate
+
+atomsOf : Decimal -> Int
+atomsOf amount = truncate (N.shift @0 amount : Wide)
+
+amountOf : Int -> Decimal
+amountOf atoms = N.shift @10 (intToNumeric atoms : Wide)
+
+maxReserveAmount : Decimal
+maxReserveAmount = amountOf maxReserveAtoms
+
+isPositiveCapped : Decimal -> Bool
+isPositiveCapped amount = amount > 0.0 && amount <= maxReserveAmount
+
+isNonNegativeCapped : Decimal -> Bool
+isNonNegativeCapped amount = amount >= 0.0 && amount <= maxReserveAmount

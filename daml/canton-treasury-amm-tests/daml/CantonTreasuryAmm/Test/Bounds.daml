@@ -1,0 +1,65 @@
+module CantonTreasuryAmm.Test.Bounds where
+
+import DA.Assert ((===))
+import Daml.Script
+
+import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.Test.Fixtures
+import CantonTreasuryAmm.Token
+import CantonTreasuryAmm.Types
+
+reserveCapBoundaryAndWideArithmetic : Script ()
+reserveCapBoundaryAndWideArithmetic = do
+  fixture <- setup
+  initialized <- initializePool fixture "cap-pool" maxReserveAmount maxReserveAmount
+  pool <- assertActivePool fixture initialized.poolCid
+  atomsOf pool.treasuryReserveAmount === maxReserveAtoms
+  atomsOf pool.stableReserveAmount === maxReserveAtoms
+  atomsOf pool.totalShares === maxReserveAtoms
+  holdingsBefore <- query @Holding fixture.treasuryIssuer
+  overCap <- trySubmit fixture.treasuryIssuer $
+    exerciseCmd fixture.treasuryInstrumentCid Issue with
+      owner = fixture.trader
+      amount = amountOf (maxReserveAtoms + 1)
+  assertFailureId reserveCapError overCap
+  holdingsAfter <- query @Holding fixture.treasuryIssuer
+  map fst holdingsAfter === map fst holdingsBefore
+  let capIntermediate =
+        (wide maxReserveAtoms * wide feeDenominator + wide maxReserveAtoms * wide feeMultiplier)
+          * wide maxReserveAtoms
+  assert (capIntermediate > 10000000000000000000000000000000000000.0)
+  assert (capIntermediate < 99999999999999999999999999999999999999.0)
+  narrow 9223372036854775807.0 === 9223372036854775807
+  narrow (-9223372036854775808.0) === -9223372036854775808
+
+capScaleSwapCompletesWithoutOverflow : Script ()
+capScaleSwapCompletesWithoutOverflow = do
+  fixture <- setup
+  let halfCap = maxReserveAtoms / 2
+  initialized <- initializePool fixture "cap-swap" (amountOf halfCap) (amountOf halfCap)
+  inputHoldingCid <- issueTreasury fixture fixture.trader (amountOf halfCap)
+  result <- submitDirectSwap fixture initialized.poolCid fixture.trader TreasuryForStable
+    inputHoldingCid (amountOf halfCap) 0.0
+  pool <- assertActivePool fixture result.poolCid
+  atomsOf pool.treasuryReserveAmount === maxReserveAtoms
+  assert (atomsOf pool.stableReserveAmount > 0)
+  assertPoolReservesMatch fixture result.poolCid
+
+bothInstrumentsAreConservedAcrossLifecycle : Script ()
+bothInstrumentsAreConservedAcrossLifecycle = do
+  Initialized {fixture, initialized} <- standardPool
+  swapInputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  addTreasuryCid <- issueTreasury fixture fixture.provider (amountOf 100000)
+  addStableCid <- issueStable fixture fixture.provider (amountOf 200000)
+  treasuryBefore <- instrumentTotalAtoms fixture fixture.treasuryInstrument
+  stableBefore <- instrumentTotalAtoms fixture fixture.stableInstrument
+  swapped <- submitDirectSwap fixture initialized.poolCid fixture.trader TreasuryForStable
+    swapInputCid (amountOf 1000) 0.0
+  added <- submitAddLiquidity fixture swapped.poolCid fixture.provider
+    addTreasuryCid addStableCid (amountOf 100000) (amountOf 200000) 0.0
+  _ <- submitRemoveLiquidity fixture added.poolCid fixture.provider added.positionCid
+    added.mintedShares 0.0 0.0
+  treasuryAfter <- instrumentTotalAtoms fixture fixture.treasuryInstrument
+  stableAfter <- instrumentTotalAtoms fixture fixture.stableInstrument
+  treasuryAfter === treasuryBefore
+  stableAfter === stableBefore

@@ -1,0 +1,40 @@
+module CantonTreasuryAmm.SwapIntent where
+
+import CantonTreasuryAmm.Pool
+import CantonTreasuryAmm.Token
+import CantonTreasuryAmm.Types
+
+template SwapIntent
+  with
+    trader : Party
+    operator : Party
+    governance : Party
+    complianceObservers : [Party]
+    poolCid : ContractId Pool
+    direction : SwapDirection
+    inputAmount : Decimal
+    minimumAmountOut : Decimal
+    deadline : Time
+    expectedPoolVersion : Int
+  where
+    signatory trader
+    observer operator, governance, complianceObservers
+    ensure isPositiveCapped inputAmount && isNonNegativeCapped minimumAmountOut
+
+    choice Cancel : ()
+      controller trader
+      do pure ()
+
+    choice Execute : SwapResult
+      with
+        inputHoldingCid : ContractId Holding
+      controller operator, governance
+      do
+        exercise poolCid SwapExactInput with
+          trader
+          direction
+          inputHoldingCid
+          inputAmount
+          minimumAmountOut
+          deadline
+          expectedVersion = expectedPoolVersion

@@ -1,0 +1,192 @@
+module CantonTreasuryAmm.Test.Authorization where
+
+import DA.Assert ((===))
+import Daml.Script
+
+import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.LiquidityPosition
+import CantonTreasuryAmm.Pool
+import CantonTreasuryAmm.Test.Fixtures
+import CantonTreasuryAmm.Token
+import CantonTreasuryAmm.Types
+
+neitherPoolSignatoryCanForgeStateAlone : Script ()
+neitherPoolSignatoryCanForgeStateAlone = do
+  fixture <- setup
+  treasuryReserveCid <- issueTreasury fixture fixture.operator 0.0001
+  stableReserveCid <- issueStable fixture fixture.operator 0.0001
+  let pool = Pool with
+        poolId = poolIdOf fixture "unauthorized-pool"
+        auditors = [fixture.auditor]
+        treasuryReserveHoldingCid = treasuryReserveCid
+        stableReserveHoldingCid = stableReserveCid
+        treasuryReserveAmount = 0.0001
+        stableReserveAmount = 0.0001
+        totalShares = 0.0001
+        lockedShares = amountOf lockedSharesAtoms
+        treasuryFeeAtoms = 0.0
+        stableFeeAtoms = 0.0
+        stateVersion = 0
+  before <- query @Pool fixture.operator
+  operatorOnly <- trySubmit fixture.operator $ createCmd pool
+  assertAuthorizationError operatorOnly
+  governanceOnly <- trySubmit fixture.governance $ createCmd pool
+  assertAuthorizationError governanceOnly
+  after <- query @Pool fixture.operator
+  map fst after === map fst before
+
+wrongInstrumentIssuerAndOwnerAreRejected : Script ()
+wrongInstrumentIssuerAndOwnerAreRejected = do
+  Initialized {fixture, initialized} <- standardPool
+  stableInputCid <- issueStable fixture fixture.trader (amountOf 1000)
+  disclosures <- poolDisclosures fixture initialized.poolCid
+  deadline <- futureDeadline
+  pool <- assertActivePool fixture initialized.poolCid
+  wrongInstrument <- trySubmit (actAs fixture.trader <> discloseMany disclosures) $
+    exerciseCmd initialized.poolCid SwapExactInput with
+      trader = fixture.trader
+      direction = TreasuryForStable
+      inputHoldingCid = stableInputCid
+      inputAmount = amountOf 1000
+      minimumAmountOut = 0.0
+      deadline
+      expectedVersion = pool.stateVersion
+  assertFailureId instrumentMismatchError wrongInstrument
+  _ <- assertActivePool fixture initialized.poolCid
+  let wrongIssuerInstrument = InstrumentId with issuer = fixture.stableIssuer; symbol = "UST"
+  wrongIssuerInstrumentCid <- submit fixture.stableIssuer $ createCmd TokenInstrument with
+    instrument = wrongIssuerInstrument
+    displayName = "Wrong issuer Treasury"
+    auditors = [fixture.auditor]
+  wrongIssuerHoldingCid <- submit fixture.stableIssuer $
+    exerciseCmd wrongIssuerInstrumentCid Issue with owner = fixture.trader; amount = amountOf 1000
+  wrongIssuerDisclosure <- disclosureOf fixture.trader wrongIssuerHoldingCid
+  wrongIssuer <- trySubmit (actAs fixture.trader <> discloseMany (wrongIssuerDisclosure :: disclosures)) $
+    exerciseCmd initialized.poolCid SwapExactInput with
+      trader = fixture.trader
+      direction = TreasuryForStable
+      inputHoldingCid = wrongIssuerHoldingCid
+      inputAmount = amountOf 1000
+      minimumAmountOut = 0.0
+      deadline
+      expectedVersion = pool.stateVersion
+  assertFailureId instrumentMismatchError wrongIssuer
+  ownedByOtherCid <- issueTreasury fixture fixture.other (amountOf 1000)
+  otherDisclosure <- disclosureOf fixture.other ownedByOtherCid
+  wrongOwner <- trySubmit (actAs fixture.trader <> discloseMany (otherDisclosure :: disclosures)) $
+    exerciseCmd initialized.poolCid SwapExactInput with
+      trader = fixture.trader
+      direction = TreasuryForStable
+      inputHoldingCid = ownedByOtherCid
+      inputAmount = amountOf 1000
+      minimumAmountOut = 0.0
+      deadline
+      expectedVersion = pool.stateVersion
+  assertAuthorizationError wrongOwner
+  _ <- assertActivePool fixture initialized.poolCid
+  Some _ <- queryContractId fixture.other ownedByOtherCid
+  pure ()
+
+foreignReserveHoldingIsRejected : Script ()
+foreignReserveHoldingIsRejected = do
+  fixture <- setup
+  first <- initializePool fixture "first" 0.0005 0.001
+  second <- initializePool fixture "second" 0.0006 0.0012
+  firstPool <- assertActivePool fixture first.poolCid
+  secondPool <- assertActivePool fixture second.poolCid
+  forgedCid <- submit (actAs [fixture.operator, fixture.governance]) $ createCmd firstPool with
+    treasuryReserveHoldingCid = secondPool.treasuryReserveHoldingCid
+    stableReserveHoldingCid = secondPool.stableReserveHoldingCid
+  inputHoldingCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  forgedDisclosures <- poolDisclosures fixture forgedCid
+  deadline <- futureDeadline
+  result <- trySubmit (actAs fixture.trader <> discloseMany forgedDisclosures) $
+    exerciseCmd forgedCid SwapExactInput with
+      trader = fixture.trader
+      direction = TreasuryForStable
+      inputHoldingCid
+      inputAmount = amountOf 1000
+      minimumAmountOut = 0.0
+      deadline
+      expectedVersion = firstPool.stateVersion
+  assertFailureId reserveMismatchError result
+  _ <- assertActivePool fixture forgedCid
+  _ <- assertActivePool fixture first.poolCid
+  _ <- assertActivePool fixture second.poolCid
+  pure ()
+
+nonProviderAndForeignPositionsCannotRemove : Script ()
+nonProviderAndForeignPositionsCannotRemove = do
+  Initialized {fixture, initialized} <- standardPool
+  pool <- assertActivePool fixture initialized.poolCid
+  disclosures <- poolDisclosures fixture initialized.poolCid
+  positionDisclosure <- disclosureOf fixture.provider initialized.positionCid
+  nonProvider <- trySubmit (actAs fixture.other <> discloseMany (positionDisclosure :: disclosures)) $
+    exerciseCmd initialized.poolCid RemoveLiquidity with
+      provider = fixture.other
+      positionCid = initialized.positionCid
+      burnShares = amountOf 1
+      minimumTreasuryOut = 0.0
+      minimumStableOut = 0.0
+      expectedVersion = pool.stateVersion
+  assertFailureId ownerMismatchError nonProvider
+  _ <- assertActivePool fixture initialized.poolCid
+  Some _ <- queryContractId fixture.provider initialized.positionCid
+  foreignPositionCid <- submit (actAs [fixture.other, fixture.auditor]) $ createCmd LiquidityPosition with
+    poolId = pool.poolId
+    operator = fixture.other
+    governance = fixture.auditor
+    provider = fixture.provider
+    shares = amountOf 10
+    auditors = []
+  foreignResult <- trySubmit (actAs fixture.provider <> discloseMany disclosures) $
+    exerciseCmd initialized.poolCid RemoveLiquidity with
+      provider = fixture.provider
+      positionCid = foreignPositionCid
+      burnShares = amountOf 1
+      minimumTreasuryOut = 0.0
+      minimumStableOut = 0.0
+      expectedVersion = pool.stateVersion
+  assertFailureId positionError foreignResult
+  _ <- assertActivePool fixture initialized.poolCid
+  Some _ <- queryContractId fixture.provider foreignPositionCid
+  wrongPoolPositionCid <- submit (actAs [fixture.operator, fixture.governance]) $ createCmd LiquidityPosition with
+    poolId = poolIdOf fixture "another-pool"
+    operator = fixture.operator
+    governance = fixture.governance
+    provider = fixture.provider
+    shares = amountOf 10
+    auditors = []
+  wrongPoolResult <- trySubmit (actAs fixture.provider <> discloseMany disclosures) $
+    exerciseCmd initialized.poolCid RemoveLiquidity with
+      provider = fixture.provider
+      positionCid = wrongPoolPositionCid
+      burnShares = amountOf 1
+      minimumTreasuryOut = 0.0
+      minimumStableOut = 0.0
+      expectedVersion = pool.stateVersion
+  assertFailureId positionError wrongPoolResult
+  _ <- assertActivePool fixture initialized.poolCid
+  Some _ <- queryContractId fixture.provider wrongPoolPositionCid
+  pure ()
+
+poolPrivacyRequiresExplicitDisclosure : Script ()
+poolPrivacyRequiresExplicitDisclosure = do
+  Initialized {fixture, initialized} <- standardPool
+  poolsVisibleToTrader <- query @Pool fixture.trader
+  poolsVisibleToTrader === []
+  inputHoldingCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  deadline <- futureDeadline
+  submitMustFail fixture.trader $ exerciseCmd initialized.poolCid SwapExactInput with
+    trader = fixture.trader
+    direction = TreasuryForStable
+    inputHoldingCid
+    inputAmount = amountOf 1000
+    minimumAmountOut = 0.0
+    deadline
+    expectedVersion = 0
+  _ <- assertActivePool fixture initialized.poolCid
+  Some _ <- queryContractId fixture.trader inputHoldingCid
+  result <- submitDirectSwap fixture initialized.poolCid fixture.trader TreasuryForStable
+    inputHoldingCid (amountOf 1000) 0.0
+  atomsOf result.amountOut === 1993

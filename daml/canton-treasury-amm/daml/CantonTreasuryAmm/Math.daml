@@ -1,0 +1,75 @@
+module CantonTreasuryAmm.Math where
+
+import DA.Numeric qualified as N
+
+import CantonTreasuryAmm.Types
+
+wideDiv : Wide -> Wide -> Wide
+wideDiv = N.div @0 @0 @0
+
+wideFloorDiv : Wide -> Wide -> Wide
+wideFloorDiv numerator denominator =
+  let
+    quotient = wideDiv numerator denominator
+    remainder = numerator - quotient * denominator
+  in if remainder < 0.0 then quotient - 1.0 else quotient
+
+wideCeilDiv : Wide -> Wide -> Wide
+wideCeilDiv numerator denominator =
+  let quotient = wideFloorDiv numerator denominator
+  in if quotient * denominator == numerator then quotient else quotient + 1.0
+
+mulFloor : Int -> Int -> Int -> Int
+mulFloor left right denominator =
+  narrow (wideFloorDiv (wide left * wide right) (wide denominator))
+
+mulCeil : Int -> Int -> Int -> Int
+mulCeil left right denominator =
+  narrow (wideCeilDiv (wide left * wide right) (wide denominator))
+
+sqrtSearch : Wide -> Int -> Int -> Int -> Int
+sqrtSearch target lower upper fuel
+  | fuel <= 0 = lower
+  | upper - lower <= 1 = lower
+  | otherwise =
+      let midpoint = (lower + upper) / 2
+      in if wide midpoint * wide midpoint <= target
+           then sqrtSearch target midpoint upper (fuel - 1)
+           else sqrtSearch target lower midpoint (fuel - 1)
+
+floorSqrtWide : Wide -> Int
+floorSqrtWide target
+  | target <= 0.0 = 0
+  | otherwise = sqrtSearch target 0 (maxReserveAtoms + 1) 60
+
+swapOutputAtoms : Int -> Int -> Int -> Int
+swapOutputAtoms reserveInAtoms reserveOutAtoms inputAtoms =
+  narrow (wideFloorDiv numerator denominator)
+  where
+    inputWithFee = wide inputAtoms * wide feeMultiplier
+    numerator = inputWithFee * wide reserveOutAtoms
+    denominator = wide reserveInAtoms * wide feeDenominator + inputWithFee
+
+feeAtomsFor : Int -> Int
+feeAtomsFor inputAtoms =
+  narrow (wideCeilDiv (wide inputAtoms * wide feeUnits) (wide feeDenominator))
+
+adjustedInvariantHolds : Int -> Int -> Int -> Int -> Bool
+adjustedInvariantHolds reserveInAtoms reserveOutAtoms inputAtoms outputAtoms =
+  adjustedLeft >= adjustedRight
+  where
+    adjustedLeft =
+      (wide reserveInAtoms * wide feeDenominator + wide inputAtoms * wide feeMultiplier)
+        * wide (reserveOutAtoms - outputAtoms)
+    -- The reduced form is algebraically equivalent to Uniswap V2's check and stays below Numeric 0's bound.
+    adjustedRight = wide reserveInAtoms * wide reserveOutAtoms * wide feeDenominator
+
+rawInvariantHolds : Int -> Int -> Int -> Int -> Bool
+rawInvariantHolds reserveInAtoms reserveOutAtoms inputAtoms outputAtoms =
+  wide (reserveInAtoms + inputAtoms) * wide (reserveOutAtoms - outputAtoms)
+    >= wide reserveInAtoms * wide reserveOutAtoms
+
+rawInvariantGrows : Int -> Int -> Int -> Int -> Bool
+rawInvariantGrows reserveInAtoms reserveOutAtoms inputAtoms outputAtoms =
+  wide (reserveInAtoms + inputAtoms) * wide (reserveOutAtoms - outputAtoms)
+    > wide reserveInAtoms * wide reserveOutAtoms
