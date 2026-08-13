@@ -6,6 +6,7 @@ import Daml.Script
 import CantonTreasuryAmm.Errors
 import CantonTreasuryAmm.Test.Fixtures
 import CantonTreasuryAmm.Token
+import CantonTreasuryAmm.Types
 
 exactTransferAndMergeConserveAtoms : Script ()
 exactTransferAndMergeConserveAtoms = do
@@ -56,6 +57,42 @@ tokenDomainFailuresAreStableAndAtomic = do
   Some stableStillActive <- queryContractId fixture.provider stableCid
   treasuryStillActive.amount === 2.0
   stableStillActive.amount === 1.0
+
+auditorCompatibilityIgnoresOrderAndDuplicates : Script ()
+auditorCompatibilityIgnoresOrderAndDuplicates = do
+  fixture <- setup
+  let issueFrom auditors amount = do
+        instrumentCid <- submit fixture.treasuryIssuer $ createCmd TokenInstrument with
+          instrument = fixture.treasuryInstrument
+          displayName = "Tokenized U.S. Treasury"
+          auditors
+        submit fixture.treasuryIssuer $
+          exerciseCmd instrumentCid Issue with owner = fixture.provider; amount
+  totalBefore <- instrumentTotalAtoms fixture fixture.treasuryInstrument
+
+  orderedCid <- issueFrom [fixture.auditor, fixture.other] 1.0
+  reversedCid <- issueFrom [fixture.other, fixture.auditor] 2.0
+  reorderedMergeCid <- submit fixture.provider $
+    exerciseCmd orderedCid Merge with otherHoldingCid = reversedCid
+  Some reorderedMerge <- queryContractId fixture.provider reorderedMergeCid
+  reorderedMerge.amount === 3.0
+
+  duplicatedCid <- issueFrom [fixture.other, fixture.auditor, fixture.auditor] 4.0
+  duplicateMergeCid <- submit fixture.provider $
+    exerciseCmd reorderedMergeCid Merge with otherHoldingCid = duplicatedCid
+  Some duplicateMerge <- queryContractId fixture.provider duplicateMergeCid
+  duplicateMerge.amount === 7.0
+
+  narrowerCid <- issueFrom [fixture.auditor] 5.0
+  incompatible <- trySubmit fixture.provider $
+    exerciseCmd duplicateMergeCid Merge with otherHoldingCid = narrowerCid
+  assertFailureId incompatibleHoldingsError incompatible
+  Some keptMerge <- queryContractId fixture.provider duplicateMergeCid
+  Some keptNarrower <- queryContractId fixture.provider narrowerCid
+  keptMerge.amount === 7.0
+  keptNarrower.amount === 5.0
+  totalAfter <- instrumentTotalAtoms fixture fixture.treasuryInstrument
+  totalAfter === totalBefore + atomsOf 12.0
 
 onlyOwnerCanTransfer : Script ()
 onlyOwnerCanTransfer = do

@@ -88,13 +88,11 @@ template PoolSetup
           stableReserveAmount = stableAmount
           totalShares = amountOf grossShares
           lockedShares = amountOf lockedSharesAtoms
-          treasuryFeeAtoms = 0.0
-          stableFeeAtoms = 0.0
+          treasuryFeeAmount = 0.0
+          stableFeeAmount = 0.0
           stateVersion = 0
         positionCid <- create LiquidityPosition with
           poolId
-          operator = poolId.operator
-          governance = poolId.governance
           provider = initialProvider
           shares = amountOf providerShares
           auditors
@@ -114,8 +112,8 @@ template Pool
     stableReserveAmount : Decimal
     totalShares : Decimal
     lockedShares : Decimal
-    treasuryFeeAtoms : Decimal
-    stableFeeAtoms : Decimal
+    treasuryFeeAmount : Decimal
+    stableFeeAmount : Decimal
     stateVersion : Int
   where
     signatory poolId.operator, poolId.governance
@@ -128,6 +126,8 @@ template Pool
         && totalShares >= lockedShares
         && totalShares <= maxReserveAmount
         && lockedShares == amountOf lockedSharesAtoms
+        && isNonNegativeCapped treasuryFeeAmount
+        && isNonNegativeCapped stableFeeAmount
 
     choice SwapExactInput : SwapResult
       with
@@ -172,7 +172,7 @@ template Pool
               stableReserveHoldingCid = nextStableReserveCid
               treasuryReserveAmount = amountOf (treasuryReserveAtoms + inputAtoms)
               stableReserveAmount = amountOf (stableReserveAtoms - outputAtoms)
-              treasuryFeeAtoms = amountOf (atomsOf treasuryFeeAtoms + feeAtoms)
+              treasuryFeeAmount = creditReportingFee treasuryFeeAmount feeAtoms
               stateVersion = stateVersion + 1
             pure SwapResult with
               poolCid = successorPoolCid
@@ -202,7 +202,7 @@ template Pool
               stableReserveHoldingCid = nextStableReserveCid
               treasuryReserveAmount = amountOf (treasuryReserveAtoms - outputAtoms)
               stableReserveAmount = amountOf (stableReserveAtoms + inputAtoms)
-              stableFeeAtoms = amountOf (atomsOf stableFeeAtoms + feeAtoms)
+              stableFeeAmount = creditReportingFee stableFeeAmount feeAtoms
               stateVersion = stateVersion + 1
             pure SwapResult with
               poolCid = successorPoolCid
@@ -237,14 +237,16 @@ template Pool
         let treasuryReserveAtoms = atomsOf treasuryReserveAmount
         let stableReserveAtoms = atomsOf stableReserveAmount
         let totalShareAtoms = atomsOf totalShares
-        let treasuryLimitedShares = mulFloor maximumTreasuryAtoms totalShareAtoms treasuryReserveAtoms
-        let stableLimitedShares = mulFloor maximumStableAtoms totalShareAtoms stableReserveAtoms
+        treasuryLimitedShares <- narrowAtoms (wideMulFloor maximumTreasuryAtoms totalShareAtoms treasuryReserveAtoms)
+        stableLimitedShares <- narrowAtoms (wideMulFloor maximumStableAtoms totalShareAtoms stableReserveAtoms)
         let mintedShareAtoms = min treasuryLimitedShares stableLimitedShares
         requireState (mintedShareAtoms > 0) insufficientLiquidityError "Contribution mints no shares"
         requireDomain (mintedShareAtoms >= minimumShareAtoms) slippageError "Minted shares are below the provider minimum"
-        let usedTreasuryAtoms = mulCeil mintedShareAtoms treasuryReserveAtoms totalShareAtoms
-        let usedStableAtoms = mulCeil mintedShareAtoms stableReserveAtoms totalShareAtoms
-        requireDomain (usedTreasuryAtoms <= maximumTreasuryAtoms && usedStableAtoms <= maximumStableAtoms) contributionError "Required contribution exceeds its maximum"
+        usedTreasuryAtoms <- narrowAtoms (wideMulCeil mintedShareAtoms treasuryReserveAtoms totalShareAtoms)
+        usedStableAtoms <- narrowAtoms (wideMulCeil mintedShareAtoms stableReserveAtoms totalShareAtoms)
+        -- mintedShareAtoms <= floor(maximum * supply / reserve) forces ceil(minted * reserve / supply) <= maximum.
+        assertMsg "Required contribution cannot exceed its maximum"
+          (usedTreasuryAtoms <= maximumTreasuryAtoms && usedStableAtoms <= maximumStableAtoms)
         requireDomain (treasuryReserveAtoms + usedTreasuryAtoms <= maxReserveAtoms) reserveCapError "Treasury reserve would exceed the atom cap"
         requireDomain (stableReserveAtoms + usedStableAtoms <= maxReserveAtoms) reserveCapError "Stablecoin reserve would exceed the atom cap"
         requireDomain (totalShareAtoms + mintedShareAtoms <= maxReserveAtoms) reserveCapError "LP supply would exceed the atom cap"
@@ -267,8 +269,6 @@ template Pool
           stateVersion = stateVersion + 1
         positionCid <- create LiquidityPosition with
           poolId
-          operator = poolId.operator
-          governance = poolId.governance
           provider
           shares = amountOf mintedShareAtoms
           auditors
@@ -294,7 +294,6 @@ template Pool
         validatePoolState this expectedVersion
         position <- fetch positionCid
         requireDomain (position.poolId == poolId) positionError "Liquidity position belongs to another pool"
-        requireDomain (position.operator == poolId.operator && position.governance == poolId.governance) positionError "Liquidity position has the wrong signatories"
         requireDomain (position.provider == provider) ownerMismatchError "Provider does not own the liquidity position"
         requireDomain (burnShares > 0.0 && minimumTreasuryOut >= 0.0 && minimumStableOut >= 0.0) invalidAmountError "Removal amounts must be positive or zero as required"
         requireDomain (burnShares <= maxReserveAmount && minimumTreasuryOut <= maxReserveAmount && minimumStableOut <= maxReserveAmount) reserveCapError "Removal amount exceeds the atom cap"
@@ -304,8 +303,8 @@ template Pool
         requireState (burnShareAtoms <= totalShareAtoms - lockedShareAtoms) positionError "Burn would consume locked shares"
         let treasuryReserveAtoms = atomsOf treasuryReserveAmount
         let stableReserveAtoms = atomsOf stableReserveAmount
-        let treasuryOutputAtoms = mulFloor burnShareAtoms treasuryReserveAtoms totalShareAtoms
-        let stableOutputAtoms = mulFloor burnShareAtoms stableReserveAtoms totalShareAtoms
+        treasuryOutputAtoms <- narrowAtoms (wideMulFloor burnShareAtoms treasuryReserveAtoms totalShareAtoms)
+        stableOutputAtoms <- narrowAtoms (wideMulFloor burnShareAtoms stableReserveAtoms totalShareAtoms)
         requireState (treasuryOutputAtoms > 0 || stableOutputAtoms > 0) insufficientLiquidityError "Burn produces no output"
         requireDomain (treasuryOutputAtoms >= atomsOf minimumTreasuryOut && stableOutputAtoms >= atomsOf minimumStableOut) slippageError "Liquidity output is below its minimum"
         burnResult <- exercise positionCid BurnPosition with

@@ -1,8 +1,56 @@
 module CantonTreasuryAmm.SwapIntent where
 
+import CantonTreasuryAmm.Errors
 import CantonTreasuryAmm.Pool
 import CantonTreasuryAmm.Token
 import CantonTreasuryAmm.Types
+
+-- The factory carries operator and governance authority, so its trader-controlled choice is
+-- the only way to reach SwapIntent's three signatories and cannot be bypassed by a trader
+-- creating the intent directly.
+template SwapIntentFactory
+  with
+    operator : Party
+    governance : Party
+    authorizedTraders : [Party]
+    complianceObservers : [Party]
+  where
+    signatory operator, governance
+    observer authorizedTraders, complianceObservers
+
+    nonconsuming choice SubmitSwapIntent : ContractId SwapIntent
+      with
+        trader : Party
+        poolCid : ContractId Pool
+        direction : SwapDirection
+        inputAmount : Decimal
+        minimumAmountOut : Decimal
+        deadline : Time
+        expectedPoolVersion : Int
+      controller trader
+      do
+        requireDomain (trader `elem` authorizedTraders) unauthorizedTraderError
+          "Trader is not authorized by this factory"
+        requireDomain (inputAmount > 0.0) invalidAmountError "Intent input must be positive"
+        requireDomain (inputAmount <= maxReserveAmount) reserveCapError
+          "Intent input exceeds the atom cap"
+        requireDomain (minimumAmountOut >= 0.0) invalidAmountError
+          "Intent minimum output must not be negative"
+        requireDomain (minimumAmountOut <= maxReserveAmount) reserveCapError
+          "Intent minimum output exceeds the atom cap"
+        now <- getTime
+        requireState (now < deadline) deadlineError "Intent deadline has already expired"
+        create SwapIntent with
+          trader
+          operator
+          governance
+          complianceObservers
+          poolCid
+          direction
+          inputAmount
+          minimumAmountOut
+          deadline
+          expectedPoolVersion
 
 template SwapIntent
   with
@@ -17,8 +65,8 @@ template SwapIntent
     deadline : Time
     expectedPoolVersion : Int
   where
-    signatory trader
-    observer operator, governance, complianceObservers
+    signatory trader, operator, governance
+    observer complianceObservers
     ensure isPositiveCapped inputAmount && isNonNegativeCapped minimumAmountOut
 
     choice Cancel : ()

@@ -5,10 +5,13 @@ import Daml.Script
 
 import CantonTreasuryAmm.Errors
 import CantonTreasuryAmm.LiquidityPosition
-import CantonTreasuryAmm.Math
 import CantonTreasuryAmm.Pool
 import CantonTreasuryAmm.Test.Fixtures
 import CantonTreasuryAmm.Types
+
+reserveProduct : Pool -> Wide
+reserveProduct pool =
+  wide (atomsOf pool.treasuryReserveAmount) * wide (atomsOf pool.stableReserveAmount)
 
 treasuryForStableUsesExactInputPricing : Script ()
 treasuryForStableUsesExactInputPricing = do
@@ -23,7 +26,8 @@ treasuryForStableUsesExactInputPricing = do
   pool <- assertActivePool fixture result.poolCid
   atomsOf pool.treasuryReserveAmount === 5001000
   atomsOf pool.stableReserveAmount === 9998007
-  atomsOf pool.treasuryFeeAtoms === feeAtomsFor 1000
+  atomsOf pool.treasuryFeeAmount === 3
+  atomsOf pool.stableFeeAmount === 0
   assertPoolReservesMatch fixture result.poolCid
 
 stableForTreasuryIsSymmetric : Script ()
@@ -32,13 +36,15 @@ stableForTreasuryIsSymmetric = do
   inputHoldingCid <- issueStable fixture fixture.trader (amountOf 1000)
   result <- submitDirectSwap fixture initialized.poolCid fixture.trader StableForTreasury
     inputHoldingCid (amountOf 1000) 0.0
-  let expectedOutput = swapOutputAtoms 10000000 5000000 1000
-  atomsOf result.amountOut === expectedOutput
+  atomsOf result.amountOut === 498
   Some output <- queryContractId fixture.trader result.outputHoldingCid
   output.instrument === fixture.treasuryInstrument
-  atomsOf output.amount === expectedOutput
+  atomsOf output.amount === 498
   pool <- assertActivePool fixture result.poolCid
-  atomsOf pool.stableFeeAtoms === feeAtomsFor 1000
+  atomsOf pool.treasuryReserveAmount === 4999502
+  atomsOf pool.stableReserveAmount === 10001000
+  atomsOf pool.stableFeeAmount === 3
+  atomsOf pool.treasuryFeeAmount === 0
   assertPoolReservesMatch fixture result.poolCid
 
 feesAccumulateInBothAssetsAndRawKGrows : Script ()
@@ -51,10 +57,46 @@ feesAccumulateInBothAssetsAndRawKGrows = do
   second <- submitDirectSwap fixture first.poolCid fixture.trader StableForTreasury
     stableInputCid (amountOf 2000) 0.0
   pool <- assertActivePool fixture second.poolCid
-  atomsOf pool.treasuryFeeAtoms === feeAtomsFor 1000
-  atomsOf pool.stableFeeAtoms === feeAtomsFor 2000
-  assert (wide (atomsOf pool.treasuryReserveAmount) * wide (atomsOf pool.stableReserveAmount)
-    > wide 5000000 * wide 10000000)
+  atomsOf pool.treasuryFeeAmount === 3
+  atomsOf pool.stableFeeAmount === 6
+  assert (reserveProduct pool > wide 5000000 * wide 10000000)
+
+reportingFeesSaturateWithoutBlockingSwaps : Script ()
+reportingFeesSaturateWithoutBlockingSwaps = do
+  Initialized {fixture, initialized} <- standardPool
+  pool <- assertActivePool fixture initialized.poolCid
+  nearCapPoolCid <- submit (actAs [fixture.operator, fixture.governance]) $ createCmd pool with
+    treasuryFeeAmount = amountOf (maxReserveAtoms - 1)
+    stableFeeAmount = amountOf (maxReserveAtoms - 1)
+
+  firstInputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  first <- submitDirectSwap fixture nearCapPoolCid fixture.trader TreasuryForStable
+    firstInputCid (amountOf 1000) 0.0
+  atomsOf first.amountOut === 1993
+  saturated <- assertActivePool fixture first.poolCid
+  atomsOf saturated.treasuryFeeAmount === maxReserveAtoms
+  atomsOf saturated.stableFeeAmount === maxReserveAtoms - 1
+  assert (reserveProduct saturated > reserveProduct pool)
+  assertPoolReservesMatch fixture first.poolCid
+
+  secondInputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  second <- submitDirectSwap fixture first.poolCid fixture.trader TreasuryForStable
+    secondInputCid (amountOf 1000) 0.0
+  assert (atomsOf second.amountOut > 0)
+  stillSaturated <- assertActivePool fixture second.poolCid
+  atomsOf stillSaturated.treasuryFeeAmount === maxReserveAtoms
+  assert (reserveProduct stillSaturated > reserveProduct saturated)
+  assertPoolReservesMatch fixture second.poolCid
+
+  stableInputCid <- issueStable fixture fixture.trader (amountOf 1000)
+  third <- submitDirectSwap fixture second.poolCid fixture.trader StableForTreasury
+    stableInputCid (amountOf 1000) 0.0
+  assert (atomsOf third.amountOut > 0)
+  bothSaturated <- assertActivePool fixture third.poolCid
+  atomsOf bothSaturated.treasuryFeeAmount === maxReserveAtoms
+  atomsOf bothSaturated.stableFeeAmount === maxReserveAtoms
+  assert (reserveProduct bothSaturated > reserveProduct stillSaturated)
+  assertPoolReservesMatch fixture third.poolCid
 
 slippageFailureLeavesAllInputsAndPoolUnchanged : Script ()
 slippageFailureLeavesAllInputsAndPoolUnchanged = do

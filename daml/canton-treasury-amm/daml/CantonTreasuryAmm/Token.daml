@@ -1,5 +1,7 @@
 module CantonTreasuryAmm.Token where
 
+import DA.List (dedupSort)
+
 import CantonTreasuryAmm.Errors
 import CantonTreasuryAmm.Types
 
@@ -25,7 +27,6 @@ template TokenInstrument
       do
         requireDomain (amount > 0.0) invalidAmountError "Issued amount must be positive"
         requireDomain (amount <= maxReserveAmount) reserveCapError "Issued amount exceeds the atom cap"
-        let amountAtoms = atomsOf amount
         create Holding with
           instrument
           owner
@@ -77,7 +78,8 @@ template Holding
         other <- fetch otherHoldingCid
         requireDomain (other.instrument == instrument) instrumentMismatchError "Holdings use different instruments"
         requireDomain (other.owner == owner) ownerMismatchError "Holdings have different owners"
-        requireDomain (other.auditors == auditors) incompatibleHoldingsError "Holdings have different observer sets"
+        requireDomain (dedupSort other.auditors == dedupSort auditors) incompatibleHoldingsError
+          "Holdings disclose to different auditors"
         let combinedAtoms = atomsOf amount + atomsOf other.amount
         requireDomain (combinedAtoms <= maxReserveAtoms) reserveCapError "Merged holding exceeds the atom cap"
         exercise otherHoldingCid Archive

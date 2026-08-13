@@ -24,8 +24,8 @@ neitherPoolSignatoryCanForgeStateAlone = do
         stableReserveAmount = 0.0001
         totalShares = 0.0001
         lockedShares = amountOf lockedSharesAtoms
-        treasuryFeeAtoms = 0.0
-        stableFeeAtoms = 0.0
+        treasuryFeeAmount = 0.0
+        stableFeeAmount = 0.0
         stateVersion = 0
   before <- query @Pool fixture.operator
   operatorOnly <- trySubmit fixture.operator $ createCmd pool
@@ -87,6 +87,47 @@ wrongInstrumentIssuerAndOwnerAreRejected = do
   Some _ <- queryContractId fixture.other ownedByOtherCid
   pure ()
 
+-- The pool's own reserves are visible to the pool parties and owned by the operator, whose
+-- authority the swap already carries, so the explicit owner check is the only thing stopping
+-- a trader from having the pool fund its own input leg.
+poolReserveCannotFundASwap : Script ()
+poolReserveCannotFundASwap = do
+  Initialized {fixture, initialized} <- standardPool
+  before <- assertActivePool fixture initialized.poolCid
+  disclosures <- poolDisclosures fixture initialized.poolCid
+  deadline <- futureDeadline
+
+  treasuryAttempt <- trySubmit (actAs fixture.trader <> discloseMany disclosures) $
+    exerciseCmd initialized.poolCid SwapExactInput with
+      trader = fixture.trader
+      direction = TreasuryForStable
+      inputHoldingCid = before.treasuryReserveHoldingCid
+      inputAmount = amountOf 1000
+      minimumAmountOut = 0.0
+      deadline
+      expectedVersion = before.stateVersion
+  assertFailureId ownerMismatchError treasuryAttempt
+
+  stableAttempt <- trySubmit (actAs fixture.trader <> discloseMany disclosures) $
+    exerciseCmd initialized.poolCid SwapExactInput with
+      trader = fixture.trader
+      direction = StableForTreasury
+      inputHoldingCid = before.stableReserveHoldingCid
+      inputAmount = amountOf 1000
+      minimumAmountOut = 0.0
+      deadline
+      expectedVersion = before.stateVersion
+  assertFailureId ownerMismatchError stableAttempt
+
+  after <- assertActivePool fixture initialized.poolCid
+  after === before
+  Some treasuryReserve <- queryContractId fixture.operator before.treasuryReserveHoldingCid
+  Some stableReserve <- queryContractId fixture.operator before.stableReserveHoldingCid
+  treasuryReserve.amount === before.treasuryReserveAmount
+  stableReserve.amount === before.stableReserveAmount
+  traderHoldings <- query @Holding fixture.trader
+  traderHoldings === []
+
 foreignReserveHoldingIsRejected : Script ()
 foreignReserveHoldingIsRejected = do
   fixture <- setup
@@ -132,28 +173,20 @@ nonProviderAndForeignPositionsCannotRemove = do
   assertFailureId ownerMismatchError nonProvider
   _ <- assertActivePool fixture initialized.poolCid
   Some _ <- queryContractId fixture.provider initialized.positionCid
-  foreignPositionCid <- submit (actAs [fixture.other, fixture.auditor]) $ createCmd LiquidityPosition with
+
+  -- Position signatories are derived from the pool identifier, so a position naming the real
+  -- pool cannot be created without the real operator and governance.
+  foreignAttempt <- trySubmit (actAs [fixture.other, fixture.auditor]) $ createCmd LiquidityPosition with
     poolId = pool.poolId
-    operator = fixture.other
-    governance = fixture.auditor
     provider = fixture.provider
     shares = amountOf 10
     auditors = []
-  foreignResult <- trySubmit (actAs fixture.provider <> discloseMany disclosures) $
-    exerciseCmd initialized.poolCid RemoveLiquidity with
-      provider = fixture.provider
-      positionCid = foreignPositionCid
-      burnShares = amountOf 1
-      minimumTreasuryOut = 0.0
-      minimumStableOut = 0.0
-      expectedVersion = pool.stateVersion
-  assertFailureId positionError foreignResult
-  _ <- assertActivePool fixture initialized.poolCid
-  Some _ <- queryContractId fixture.provider foreignPositionCid
+  assertAuthorizationError foreignAttempt
+  positions <- query @LiquidityPosition fixture.provider
+  map fst positions === [initialized.positionCid]
+
   wrongPoolPositionCid <- submit (actAs [fixture.operator, fixture.governance]) $ createCmd LiquidityPosition with
     poolId = poolIdOf fixture "another-pool"
-    operator = fixture.operator
-    governance = fixture.governance
     provider = fixture.provider
     shares = amountOf 10
     auditors = []

@@ -4,6 +4,8 @@ import DA.Assert ((===))
 import Daml.Script
 
 import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.LiquidityPosition
+import CantonTreasuryAmm.Pool
 import CantonTreasuryAmm.Test.Fixtures
 import CantonTreasuryAmm.Token
 import CantonTreasuryAmm.Types
@@ -44,6 +46,52 @@ capScaleSwapCompletesWithoutOverflow = do
   atomsOf pool.treasuryReserveAmount === maxReserveAtoms
   assert (atomsOf pool.stableReserveAmount > 0)
   assertPoolReservesMatch fixture result.poolCid
+
+-- A pool with one-atom reserves against a cap-scale share supply is template-valid, and its
+-- proportional share calculation exceeds the Int64 atom range.
+degenerateShareArithmeticIsRejected : Script ()
+degenerateShareArithmeticIsRejected = do
+  fixture <- setup
+  treasuryReserveCid <- issueTreasury fixture fixture.operator (amountOf 1)
+  stableReserveCid <- issueStable fixture fixture.operator (amountOf 1)
+  degenerateCid <- submit (actAs [fixture.operator, fixture.governance]) $ createCmd Pool with
+    poolId = poolIdOf fixture "degenerate"
+    auditors = [fixture.auditor]
+    treasuryReserveHoldingCid = treasuryReserveCid
+    stableReserveHoldingCid = stableReserveCid
+    treasuryReserveAmount = amountOf 1
+    stableReserveAmount = amountOf 1
+    totalShares = maxReserveAmount
+    lockedShares = amountOf lockedSharesAtoms
+    treasuryFeeAmount = 0.0
+    stableFeeAmount = 0.0
+    stateVersion = 0
+  before <- assertActivePool fixture degenerateCid
+  treasuryHoldingCid <- issueTreasury fixture fixture.provider maxReserveAmount
+  stableHoldingCid <- issueStable fixture fixture.provider maxReserveAmount
+  disclosures <- poolDisclosures fixture degenerateCid
+  result <- trySubmit (actAs fixture.provider <> discloseMany disclosures) $
+    exerciseCmd degenerateCid AddLiquidity with
+      provider = fixture.provider
+      treasuryHoldingCid
+      stableHoldingCid
+      maximumTreasury = maxReserveAmount
+      maximumStable = maxReserveAmount
+      minimumShares = 0.0
+      expectedVersion = before.stateVersion
+  assertFailureId arithmeticRangeError result
+  after <- assertActivePool fixture degenerateCid
+  after === before
+  Some treasuryHolding <- queryContractId fixture.provider treasuryHoldingCid
+  Some stableHolding <- queryContractId fixture.provider stableHoldingCid
+  treasuryHolding.amount === maxReserveAmount
+  stableHolding.amount === maxReserveAmount
+  Some treasuryReserve <- queryContractId fixture.operator treasuryReserveCid
+  Some stableReserve <- queryContractId fixture.operator stableReserveCid
+  atomsOf treasuryReserve.amount === 1
+  atomsOf stableReserve.amount === 1
+  positions <- query @LiquidityPosition fixture.provider
+  positions === []
 
 bothInstrumentsAreConservedAcrossLifecycle : Script ()
 bothInstrumentsAreConservedAcrossLifecycle = do

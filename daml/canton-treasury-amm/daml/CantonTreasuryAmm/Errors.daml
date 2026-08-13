@@ -15,6 +15,9 @@ instrumentMismatchError = "amm/instrument-mismatch"
 ownerMismatchError : Text
 ownerMismatchError = "amm/owner-mismatch"
 
+unauthorizedTraderError : Text
+unauthorizedTraderError = "amm/unauthorized-trader"
+
 insufficientBalanceError : Text
 insufficientBalanceError = "amm/insufficient-balance"
 
@@ -36,8 +39,8 @@ insufficientLiquidityError = "amm/insufficient-liquidity"
 initialLiquidityError : Text
 initialLiquidityError = "amm/initial-liquidity"
 
-contributionError : Text
-contributionError = "amm/contribution"
+arithmeticRangeError : Text
+arithmeticRangeError = "amm/arithmetic-range"
 
 positionError : Text
 positionError = "amm/position"

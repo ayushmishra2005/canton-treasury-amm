@@ -4,7 +4,7 @@ import DA.Assert ((===))
 import Daml.Script
 
 import CantonTreasuryAmm.Errors
-import CantonTreasuryAmm.Math
+import CantonTreasuryAmm.LiquidityPosition
 import CantonTreasuryAmm.Pool
 import CantonTreasuryAmm.Test.Fixtures
 import CantonTreasuryAmm.Types
@@ -42,7 +42,8 @@ initialSharesAndReservesAgree = do
   Initialized {fixture, initialized} <- standardPool
   pool <- assertActivePool fixture initialized.poolCid
   Some position <- queryContractId fixture.provider initialized.positionCid
-  let grossShares = floorSqrtWide (wide 5000000 * wide 10000000)
+  -- floor(sqrt(5000000 * 10000000)) = floor(sqrt(5e13))
+  let grossShares = 7071067
   atomsOf pool.treasuryReserveAmount === 5000000
   atomsOf pool.stableReserveAmount === 10000000
   atomsOf pool.totalShares === grossShares
@@ -50,6 +51,28 @@ initialSharesAndReservesAgree = do
   atomsOf position.shares === grossShares - lockedSharesAtoms
   position.poolId === pool.poolId
   assertPoolReservesMatch fixture initialized.poolCid
+
+dustInitializationIsRejected : Script ()
+dustInitializationIsRejected = do
+  fixture <- setup
+  treasuryHoldingCid <- issueTreasury fixture fixture.provider (amountOf 1000)
+  stableHoldingCid <- issueStable fixture fixture.provider (amountOf 1000)
+  setupCid <- createPoolSetup fixture "dust"
+  result <- trySubmit fixture.provider $ exerciseCmd setupCid Initialize with
+    treasuryHoldingCid
+    stableHoldingCid
+    treasuryAmount = amountOf 1000
+    stableAmount = amountOf 1000
+  assertFailureId initialLiquidityError result
+  Some _ <- queryContractId fixture.provider setupCid
+  Some treasuryHolding <- queryContractId fixture.provider treasuryHoldingCid
+  Some stableHolding <- queryContractId fixture.provider stableHoldingCid
+  atomsOf treasuryHolding.amount === 1000
+  atomsOf stableHolding.amount === 1000
+  pools <- query @Pool fixture.operator
+  pools === []
+  positions <- query @LiquidityPosition fixture.provider
+  positions === []
 
 staleVersionRejectsWithoutChangingPool : Script ()
 staleVersionRejectsWithoutChangingPool = do

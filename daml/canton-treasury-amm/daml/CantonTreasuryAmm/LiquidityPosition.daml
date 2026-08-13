@@ -10,13 +10,11 @@ data BurnPositionResult = BurnPositionResult with
 template LiquidityPosition
   with
     poolId : PoolId
-    operator : Party
-    governance : Party
     provider : Party
     shares : Decimal
     auditors : [Party]
   where
-    signatory operator, governance
+    signatory poolId.operator, poolId.governance
     observer provider, auditors
     ensure isPositiveCapped shares
 
@@ -37,8 +35,6 @@ template LiquidityPosition
             then pure None
             else Some <$> create LiquidityPosition with
               poolId
-              operator
-              governance
               provider
               shares = amountOf (shareAtoms - burnAtoms)
               auditors

@@ -2,6 +2,7 @@ module CantonTreasuryAmm.Math where
 
 import DA.Numeric qualified as N
 
+import CantonTreasuryAmm.Errors
 import CantonTreasuryAmm.Types
 
 wideDiv : Wide -> Wide -> Wide
@@ -19,13 +20,20 @@ wideCeilDiv numerator denominator =
   let quotient = wideFloorDiv numerator denominator
   in if quotient * denominator == numerator then quotient else quotient + 1.0
 
-mulFloor : Int -> Int -> Int -> Int
-mulFloor left right denominator =
-  narrow (wideFloorDiv (wide left * wide right) (wide denominator))
+wideMulFloor : Int -> Int -> Int -> Wide
+wideMulFloor left right denominator = wideFloorDiv (wide left * wide right) (wide denominator)
 
-mulCeil : Int -> Int -> Int -> Int
-mulCeil left right denominator =
-  narrow (wideCeilDiv (wide left * wide right) (wide denominator))
+wideMulCeil : Int -> Int -> Int -> Wide
+wideMulCeil left right denominator = wideCeilDiv (wide left * wide right) (wide denominator)
+
+-- Proportional results depend on live reserves and supply, so they are range-checked here
+-- rather than narrowed straight into an Int where an out-of-range value would raise
+-- ArithmeticError instead of a domain rejection.
+narrowAtoms : Wide -> Update Int
+narrowAtoms value = do
+  requireState (value >= 0.0 && value <= wide maxReserveAtoms) arithmeticRangeError
+    "Computed atom amount is outside the supported range"
+  pure (narrow value)
 
 sqrtSearch : Wide -> Int -> Int -> Int -> Int
 sqrtSearch target lower upper fuel
@@ -42,6 +50,7 @@ floorSqrtWide target
   | target <= 0.0 = 0
   | otherwise = sqrtSearch target 0 (maxReserveAtoms + 1) 60
 
+-- The quotient is strictly below reserveOutAtoms, so it always fits an Int.
 swapOutputAtoms : Int -> Int -> Int -> Int
 swapOutputAtoms reserveInAtoms reserveOutAtoms inputAtoms =
   narrow (wideFloorDiv numerator denominator)
@@ -53,6 +62,12 @@ swapOutputAtoms reserveInAtoms reserveOutAtoms inputAtoms =
 feeAtomsFor : Int -> Int
 feeAtomsFor inputAtoms =
   narrow (wideCeilDiv (wide inputAtoms * wide feeUnits) (wide feeDenominator))
+
+-- The counter is reporting-only, so it saturates at the cap instead of growing without
+-- bound; the economic fee stays in the reserves either way.
+creditReportingFee : Decimal -> Int -> Decimal
+creditReportingFee currentAmount feeAtoms =
+  amountOf (min maxReserveAtoms (atomsOf currentAmount + feeAtoms))
 
 adjustedInvariantHolds : Int -> Int -> Int -> Int -> Bool
 adjustedInvariantHolds reserveInAtoms reserveOutAtoms inputAtoms outputAtoms =
