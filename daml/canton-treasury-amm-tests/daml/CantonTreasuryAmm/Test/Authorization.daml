@@ -306,6 +306,118 @@ operatorAloneCanDivertReserveAndFreezePool = do
   stableTotalAfter <- instrumentTotalAtoms fixture fixture.stableInstrument
   stableTotalAfter === stableTotalBefore
 
+-- Characterizes CURRENT BEHAVIOUR of the implicit `Archive` choice on a pool reserve.
+-- Attackers: the operator, governance, both together, and the issuer of the other instrument.
+-- Required authority: `Archive` is controlled by the signatories of `Holding`, which are only
+-- `instrument.issuer`. The operator merely observes the reserve as its owner, and governance is
+-- not a stakeholder, so governance attempts are made both without and with explicit disclosure.
+-- Expected: without disclosure governance fails on visibility (`ContractNotFound`); every
+-- attempt that can see the reserve fails with `AuthorizationError`; the reserve and Pool persist.
+-- Implication: owning a reserve grants `TransferExact` (see the operator diversion test) but not
+-- `Archive`, and neither pool signatory, alone or jointly, can archive an issuer's holding.
+-- Limitation: shows only that these parties lack `Archive`; it says nothing about the operator's
+-- owner-controlled `TransferExact` and `Merge`, which remain sufficient to divert reserves.
+poolPartiesCannotArchiveReserveHoldings : Script ()
+poolPartiesCannotArchiveReserveHoldings = do
+  Initialized {fixture, initialized} <- standardPool
+  poolBefore <- assertActivePool fixture initialized.poolCid
+  let reserveCid = poolBefore.treasuryReserveHoldingCid
+  Some reserveBefore <- queryContractId fixture.operator reserveCid
+  reserveDisclosure <- disclosureOf fixture.operator reserveCid
+  governanceView <- queryContractId fixture.governance reserveCid
+  governanceView === None
+
+  operatorOnly <- trySubmit fixture.operator $ exerciseCmd reserveCid Archive
+  assertAuthorizationError operatorOnly
+  governanceHidden <- trySubmit fixture.governance $ exerciseCmd reserveCid Archive
+  case governanceHidden of
+    Left ContractNotFound {unknownContractIds} ->
+      NonEmpty.toList unknownContractIds === [show reserveCid]
+    otherResult -> abort ("Expected ContractNotFound for the hidden reserve, got " <> show otherResult)
+  governanceDisclosed <- trySubmit (actAs fixture.governance <> discloseMany [reserveDisclosure]) $
+    exerciseCmd reserveCid Archive
+  assertAuthorizationError governanceDisclosed
+  jointPoolParties <- trySubmit (actAs [fixture.operator, fixture.governance]) $
+    exerciseCmd reserveCid Archive
+  assertAuthorizationError jointPoolParties
+  otherIssuer <- trySubmit (actAs fixture.stableIssuer <> discloseMany [reserveDisclosure]) $
+    exerciseCmd reserveCid Archive
+  assertAuthorizationError otherIssuer
+  Some reserveAfter <- queryContractId fixture.operator reserveCid
+  reserveAfter === reserveBefore
+  poolAfter <- assertActivePool fixture initialized.poolCid
+  poolAfter === poolBefore
+  assertPoolReservesMatch fixture initialized.poolCid
+
+-- Characterizes CURRENT VULNERABLE BEHAVIOUR; it passes because the weakness exists.
+-- Attacker: the Treasury issuer. Required authority: the issuer alone, as the sole signatory of
+-- every holding of its instrument, including pool reserves owned by the operator.
+-- Initial state: a legitimately initialized pool with the provider's liquidity position.
+-- Attack: the issuer exercises the implicit `Archive` on the Treasury reserve.
+-- Expected: archival succeeds and destroys the reserve's value, the Pool stays active but
+-- references a consumed reserve, and the provider's later `RemoveLiquidity` fails at the engine
+-- level with `ContractNotFound` for that reserve, leaving every other contract untouched.
+-- Implication: pool reserves are only as durable as each issuer's goodwill; an issuer can
+-- unilaterally freeze the pool and every LP withdrawal, which no pool check can prevent.
+-- Limitation: shows archival of one reserve on the IDE ledger. The issuer cannot move the
+-- holding with the owner-controlled `TransferExact` (see `standardViewGrantsNoTransferAuthority`).
+issuerCanArchiveReserveAndFreezePool : Script ()
+issuerCanArchiveReserveAndFreezePool = do
+  Initialized {fixture, initialized} <- standardPool
+  poolBefore <- assertActivePool fixture initialized.poolCid
+  let treasuryReserveCid = poolBefore.treasuryReserveHoldingCid
+  let stableReserveCid = poolBefore.stableReserveHoldingCid
+  Some treasuryReserveBefore <- queryContractId fixture.operator treasuryReserveCid
+  Some stableReserveBefore <- queryContractId fixture.operator stableReserveCid
+  Some positionBefore <- queryContractId fixture.provider initialized.positionCid
+  providerHoldingsBefore <- query @Holding fixture.provider
+  treasuryTotalBefore <- instrumentTotalAtoms fixture fixture.treasuryInstrument
+  stableTotalBefore <- instrumentTotalAtoms fixture fixture.stableInstrument
+
+  submit fixture.treasuryIssuer $ exerciseCmd treasuryReserveCid Archive
+
+  issuerView <- queryContractId fixture.treasuryIssuer treasuryReserveCid
+  issuerView === None
+  operatorView <- queryContractId fixture.operator treasuryReserveCid
+  operatorView === None
+  poolAfterArchive <- assertActivePool fixture initialized.poolCid
+  poolAfterArchive === poolBefore
+  poolAfterArchive.treasuryReserveHoldingCid === treasuryReserveCid
+  treasuryTotalAfterArchive <- instrumentTotalAtoms fixture fixture.treasuryInstrument
+  treasuryTotalAfterArchive === treasuryTotalBefore - atomsOf treasuryReserveBefore.amount
+
+  poolDisclosure <- disclosureOf fixture.operator initialized.poolCid
+  stableReserveDisclosure <- disclosureOf fixture.operator stableReserveCid
+  let removal = exerciseCmd initialized.poolCid RemoveLiquidity with
+        provider = fixture.provider
+        positionCid = initialized.positionCid
+        burnShares = amountOf 1
+        minimumTreasuryOut = 0.0
+        minimumStableOut = 0.0
+        expectedVersion = poolBefore.stateVersion
+
+  disclosedAttempt <- trySubmit
+    (actAs fixture.provider <> discloseMany [poolDisclosure, stableReserveDisclosure]) removal
+  assertConsumedContract treasuryReserveCid disclosedAttempt
+  -- Reading as the operator rules out the provider merely lacking visibility of the reserve.
+  operatorVisibleAttempt <- trySubmit (actAs fixture.provider <> readAs fixture.operator) removal
+  assertConsumedContract treasuryReserveCid operatorVisibleAttempt
+
+  poolAfterRemoval <- assertActivePool fixture initialized.poolCid
+  poolAfterRemoval === poolBefore
+  Some stableReserveAfter <- queryContractId fixture.operator stableReserveCid
+  stableReserveAfter === stableReserveBefore
+  Some positionAfter <- queryContractId fixture.provider initialized.positionCid
+  positionAfter === positionBefore
+  providerHoldingsAfter <- query @Holding fixture.provider
+  providerHoldingsAfter === providerHoldingsBefore
+  operatorHoldings <- query @Holding fixture.operator
+  map fst operatorHoldings === [stableReserveCid]
+  treasuryTotalAfter <- instrumentTotalAtoms fixture fixture.treasuryInstrument
+  treasuryTotalAfter === treasuryTotalAfterArchive
+  stableTotalAfter <- instrumentTotalAtoms fixture fixture.stableInstrument
+  stableTotalAfter === stableTotalBefore
+
 assertConsumedContract : ContractId t -> Either SubmitError a -> Script ()
 assertConsumedContract consumedCid result = case result of
   Left ContractNotFound {unknownContractIds}
