@@ -1,0 +1,1122 @@
+-- Stage 1.3 tests for the PROTOTYPE authenticated pool: exact-input swaps, liquidity after swaps,
+-- adversarial settlement and the residual trust of the full core signatory set.
+-- Successful transitions go through `settleSwap`, `settleAdd` and `settleRemove`, which check the
+-- result against the pre-state: exact amounts, both reserves, LP supply, one version step, the
+-- consumed input and its change, both constant-product invariants, conserved instrument totals
+-- and untouched positions of other providers. Rejected attempts compare a full snapshot (pool,
+-- positions, every holding of both instruments and the totals) before and after.
+module CantonTreasuryAmm.Test.ProtectedPoolSettlementTests where
+
+import DA.Action (unless)
+import DA.Assert ((===), (=/=))
+import DA.Foldable (forA_, mapA_)
+import DA.List (sort, sortOn)
+import DA.NonEmpty qualified as NonEmpty
+import DA.Text (isInfixOf)
+import DA.Time (addRelTime, hours, microseconds, seconds)
+import Daml.Script
+
+import Splice.Api.Token.HoldingV1 qualified as TokenStandard
+
+import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.LiquidityPosition
+import CantonTreasuryAmm.Math
+import CantonTreasuryAmm.Test.Fixtures
+import CantonTreasuryAmm.Test.ProtectedCustodyPrototype
+import CantonTreasuryAmm.Test.ProtectedPoolPrototype
+import CantonTreasuryAmm.Test.ProtectedPoolPrototypeTests
+  (PoolSetup (..), addSecondProvider, assertWronglyTyped, assetAtoms, lineageFor, poolDisclosure, removeAs)
+import CantonTreasuryAmm.Token
+import CantonTreasuryAmm.Types
+
+openPool : Fixture -> Party -> Text -> Party -> Int -> Int -> Script (ContractId PoolCharter, InitializeResult)
+openPool fixture custodian charterReference provider treasuryAtoms stableAtoms = do
+  let lineage = lineageFor fixture custodian charterReference
+  charterCid <- submit (actAs (lineageSignatories lineage)) $ createCmd PoolCharter with
+    lineage
+    initialProvider = provider
+  treasuryHoldingCid <- issueTreasury fixture provider (amountOf treasuryAtoms)
+  stableHoldingCid <- issueStable fixture provider (amountOf stableAtoms)
+  initialized <- submit provider $ exerciseCmd charterCid InitializePool with
+    treasuryHoldingCid
+    stableHoldingCid
+    treasuryAmount = amountOf treasuryAtoms
+    stableAmount = amountOf stableAtoms
+  pure (charterCid, initialized)
+
+marketWith : Text -> Int -> Int -> Script PoolSetup
+marketWith charterReference treasuryAtoms stableAtoms = do
+  fixture <- setup
+  custodian <- allocateParty "Custodian"
+  secondProvider <- allocateParty "SecondProvider"
+  (charterCid, initialized) <- openPool fixture custodian charterReference fixture.provider treasuryAtoms stableAtoms
+  pure PoolSetup with
+    fixture
+    custodian
+    secondProvider
+    lineage = lineageFor fixture custodian charterReference
+    charterCid
+    initialized
+
+-- The established fixture: 5,000,000 Treasury and 10,000,000 stablecoin atoms.
+standardMarket : Text -> Script PoolSetup
+standardMarket charterReference = marketWith charterReference 5000000 10000000
+
+positionsOf : PoolSetup -> Script [(ContractId PoolPosition, PoolPosition)]
+positionsOf setup = do
+  positions <- query @PoolPosition setup.custodian
+  pure (sortOn fst (filter (\(_, position) -> position.genesisCid == setup.charterCid) positions))
+
+-- This initialized pool has exactly this one active state, its supply is the locked share plus
+-- its positions, and the locked floor is intact.
+checkPool : PoolSetup -> ContractId ProtectedPool -> Script ProtectedPool
+checkPool setup poolCid = do
+  states <- query @ProtectedPool setup.custodian
+  map fst (filter (\(_, state) -> state.genesisCid == setup.charterCid) states) === [poolCid]
+  Some pool <- queryContractId setup.custodian poolCid
+  pool.lineage === setup.lineage
+  atomsOf pool.lockedShares === lockedSharesAtoms
+  positions <- positionsOf setup
+  sum (map (\(_, position) -> atomsOf position.shares) positions) + lockedSharesAtoms === atomsOf pool.totalShares
+  pure pool
+
+-- Recorded supply less the locked share and every position of this pool; zero when reconciled.
+supplyDrift : PoolSetup -> ContractId ProtectedPool -> Script Int
+supplyDrift setup poolCid = do
+  Some pool <- queryContractId setup.custodian poolCid
+  positions <- positionsOf setup
+  pure (atomsOf pool.totalShares - atomsOf pool.lockedShares - sum (map (\(_, position) -> atomsOf position.shares) positions))
+
+data Totals = Totals with
+  treasury : Int
+  stable : Int
+    deriving (Eq, Show)
+
+totalsOf : PoolSetup -> Script Totals
+totalsOf setup = do
+  treasury <- assetAtoms setup.fixture setup.fixture.treasuryInstrument
+  stable <- assetAtoms setup.fixture setup.fixture.stableInstrument
+  pure Totals with treasury; stable
+
+holdingAtoms : Party -> InstrumentId -> Script Int
+holdingAtoms party instrument = do
+  holdings <- query @Holding party
+  pure (sum (map (\(_, holding) -> if holding.owner == party && holding.instrument == instrument then atomsOf holding.amount else 0) holdings))
+
+data Snapshot = Snapshot with
+  pool : ProtectedPool
+  positions : [(ContractId PoolPosition, PoolPosition)]
+  holdings : [(ContractId Holding, Holding)]
+  totals : Totals
+    deriving (Eq, Show)
+
+snapshotOf : PoolSetup -> ContractId ProtectedPool -> Script Snapshot
+snapshotOf setup poolCid = do
+  pool <- checkPool setup poolCid
+  positions <- positionsOf setup
+  treasuryHoldings <- query @Holding setup.fixture.treasuryIssuer
+  stableHoldings <- query @Holding setup.fixture.stableIssuer
+  totals <- totalsOf setup
+  pure Snapshot with pool; positions; holdings = sortOn fst (treasuryHoldings ++ stableHoldings); totals
+
+assertUnchanged : PoolSetup -> ContractId ProtectedPool -> Snapshot -> Script ()
+assertUnchanged setup poolCid before = do
+  after <- snapshotOf setup poolCid
+  after === before
+
+oriented : SwapDirection -> ProtectedPool -> (Int, Int)
+oriented TreasuryForStable pool = (atomsOf pool.treasuryReserve, atomsOf pool.stableReserve)
+oriented StableForTreasury pool = (atomsOf pool.stableReserve, atomsOf pool.treasuryReserve)
+
+instrumentsFor : SwapDirection -> PoolLineage -> (InstrumentId, InstrumentId)
+instrumentsFor TreasuryForStable lineage = (lineage.treasuryInstrument, lineage.stableInstrument)
+instrumentsFor StableForTreasury lineage = (lineage.stableInstrument, lineage.treasuryInstrument)
+
+-- The production AMM's quote for this pool state.
+quote : ProtectedPool -> SwapDirection -> Int -> Int
+quote pool direction inputAtoms =
+  let (reserveInAtoms, reserveOutAtoms) = oriented direction pool
+  in swapOutputAtoms reserveInAtoms reserveOutAtoms inputAtoms
+
+swapCommand : ContractId ProtectedPool -> Party -> SwapDirection -> ContractId Holding -> Int -> Int -> Time -> Int -> Commands SwapResult
+swapCommand poolCid trader direction inputHoldingCid inputAtoms minimumOutAtoms deadline expectedVersion =
+  exerciseCmd poolCid SwapExactInput with
+    trader
+    direction
+    inputHoldingCid
+    inputAmount = amountOf inputAtoms
+    minimumAmountOut = amountOf minimumOutAtoms
+    deadline
+    expectedVersion
+
+swapAs : PoolSetup -> Party -> ContractId ProtectedPool -> SwapDirection -> ContractId Holding -> Int -> Script SwapResult
+swapAs setup trader poolCid direction inputHoldingCid inputAtoms = do
+  disclosure <- poolDisclosure setup poolCid
+  Some pool <- queryContractId setup.custodian poolCid
+  deadline <- futureDeadline
+  submit (actAs trader <> discloseMany [disclosure]) $
+    swapCommand poolCid trader direction inputHoldingCid inputAtoms 0 deadline pool.stateVersion
+
+settleSwap : PoolSetup -> Party -> ContractId ProtectedPool -> SwapDirection -> ContractId Holding -> Int -> Int -> Script SwapResult
+settleSwap setup trader poolCid direction inputHoldingCid inputAtoms expectedOut = do
+  before <- checkPool setup poolCid
+  positionsBefore <- positionsOf setup
+  totalsBefore <- totalsOf setup
+  Some input <- queryContractId trader inputHoldingCid
+  let (reserveInAtoms, reserveOutAtoms) = oriented direction before
+  let (inputInstrument, outputInstrument) = instrumentsFor direction before.lineage
+  quote before direction inputAtoms === expectedOut
+  outputBefore <- holdingAtoms trader outputInstrument
+  inputBalanceBefore <- holdingAtoms trader inputInstrument
+
+  result <- swapAs setup trader poolCid direction inputHoldingCid inputAtoms
+  atomsOf result.amountOut === expectedOut
+  after <- checkPool setup result.poolCid
+  consumedPool <- queryContractId setup.custodian poolCid
+  consumedPool === None
+  consumedInput <- queryContractId trader inputHoldingCid
+  consumedInput === None
+  oriented direction after === (reserveInAtoms + inputAtoms, reserveOutAtoms - expectedOut)
+  after.totalShares === before.totalShares
+  after.stateVersion === before.stateVersion + 1
+  after.genesisCid === before.genesisCid
+  Some output <- queryContractId trader result.outputHoldingCid
+  (output.owner, output.instrument, atomsOf output.amount) === (trader, outputInstrument, expectedOut)
+  case result.inputChangeCid of
+    None -> atomsOf input.amount === inputAtoms
+    Some changeCid -> do
+      Some change <- queryContractId trader changeCid
+      change === input with amount = amountOf (atomsOf input.amount - inputAtoms)
+  outputAfter <- holdingAtoms trader outputInstrument
+  inputBalanceAfter <- holdingAtoms trader inputInstrument
+  (outputAfter - outputBefore, inputBalanceBefore - inputBalanceAfter) === (expectedOut, inputAtoms)
+  assert (adjustedInvariantHolds reserveInAtoms reserveOutAtoms inputAtoms expectedOut)
+  assert (rawInvariantGrows reserveInAtoms reserveOutAtoms inputAtoms expectedOut)
+  totalsAfter <- totalsOf setup
+  totalsAfter === totalsBefore
+  positionsAfter <- positionsOf setup
+  positionsAfter === positionsBefore
+  pure result
+
+settleAdd : PoolSetup -> Party -> ContractId ProtectedPool -> ContractId Holding -> ContractId Holding -> Int -> Int -> Script AddResult
+settleAdd setup provider poolCid treasuryHoldingCid stableHoldingCid maximumTreasuryAtoms maximumStableAtoms = do
+  before <- checkPool setup poolCid
+  positionsBefore <- positionsOf setup
+  totalsBefore <- totalsOf setup
+  let totalAtoms = atomsOf before.totalShares
+  let treasuryAtoms = atomsOf before.treasuryReserve
+  let stableAtoms = atomsOf before.stableReserve
+  let minted = min (narrow (wideMulFloor maximumTreasuryAtoms totalAtoms treasuryAtoms))
+                   (narrow (wideMulFloor maximumStableAtoms totalAtoms stableAtoms))
+  let usedTreasury = narrow (wideMulCeil minted treasuryAtoms totalAtoms)
+  let usedStable = narrow (wideMulCeil minted stableAtoms totalAtoms)
+  disclosure <- poolDisclosure setup poolCid
+  result <- submit (actAs provider <> discloseMany [disclosure]) $ exerciseCmd poolCid AddLiquidity with
+    provider
+    treasuryHoldingCid
+    stableHoldingCid
+    maximumTreasury = amountOf maximumTreasuryAtoms
+    maximumStable = amountOf maximumStableAtoms
+    minimumShares = 0.0
+    expectedVersion = before.stateVersion
+  (atomsOf result.mintedShares, atomsOf result.usedTreasury, atomsOf result.usedStable) === (minted, usedTreasury, usedStable)
+  after <- checkPool setup result.poolCid
+  (atomsOf after.treasuryReserve, atomsOf after.stableReserve, atomsOf after.totalShares)
+    === (treasuryAtoms + usedTreasury, stableAtoms + usedStable, totalAtoms + minted)
+  after.stateVersion === before.stateVersion + 1
+  Some position <- queryContractId provider result.positionCid
+  position === PoolPosition with lineage = setup.lineage; genesisCid = setup.charterCid; provider; shares = amountOf minted
+  positionsAfter <- positionsOf setup
+  positionsAfter === sortOn fst ((result.positionCid, position) :: positionsBefore)
+  totalsAfter <- totalsOf setup
+  totalsAfter === totalsBefore
+  pure result
+
+settleRemove : PoolSetup -> Party -> ContractId ProtectedPool -> ContractId PoolPosition -> Int -> Script RemoveResult
+settleRemove setup provider poolCid positionCid burnAtoms = do
+  before <- checkPool setup poolCid
+  positionsBefore <- positionsOf setup
+  totalsBefore <- totalsOf setup
+  Some position <- queryContractId provider positionCid
+  let totalAtoms = atomsOf before.totalShares
+  let treasuryOut = narrow (wideMulFloor burnAtoms (atomsOf before.treasuryReserve) totalAtoms)
+  let stableOut = narrow (wideMulFloor burnAtoms (atomsOf before.stableReserve) totalAtoms)
+  treasuryHeld <- holdingAtoms provider setup.fixture.treasuryInstrument
+  stableHeld <- holdingAtoms provider setup.fixture.stableInstrument
+  result <- removeAs setup provider poolCid positionCid (amountOf burnAtoms)
+  (atomsOf result.treasuryOut, atomsOf result.stableOut) === (treasuryOut, stableOut)
+  after <- checkPool setup result.poolCid
+  (atomsOf after.treasuryReserve, atomsOf after.stableReserve, atomsOf after.totalShares)
+    === (atomsOf before.treasuryReserve - treasuryOut, atomsOf before.stableReserve - stableOut, totalAtoms - burnAtoms)
+  after.stateVersion === before.stateVersion + 1
+  treasuryHeldAfter <- holdingAtoms provider setup.fixture.treasuryInstrument
+  stableHeldAfter <- holdingAtoms provider setup.fixture.stableInstrument
+  (treasuryHeldAfter - treasuryHeld, stableHeldAfter - stableHeld) === (treasuryOut, stableOut)
+  positionsAfter <- positionsOf setup
+  let others = filter (\(cid, _) -> cid /= positionCid)
+  case result.remainingPositionCid of
+    None -> do
+      atomsOf position.shares === burnAtoms
+      positionsAfter === others positionsBefore
+    Some remainingCid -> do
+      Some remaining <- queryContractId provider remainingCid
+      remaining === position with shares = amountOf (atomsOf position.shares - burnAtoms)
+      filter (\(cid, _) -> cid /= remainingCid) positionsAfter === others positionsBefore
+  totalsAfter <- totalsOf setup
+  totalsAfter === totalsBefore
+  pure result
+
+-- TEST A. Actor: a trader holding 2,500 Treasury atoms; only its own authority.
+-- Expected: the production quote floor(1000 * 997 * 1e7 / (5e6 * 1000 + 1000 * 997)) = 1993
+-- stablecoin atoms; without the fee it would be floor(1000 * 1e7 / 5,001,000) = 1999. The full
+-- 1,000-atom input, its 3-atom fee included, joins the Treasury reserve; 1,500 atoms return as
+-- change; supply stays 7,071,067 and the version steps once.
+-- Guarantee: exact-input pricing, fee retention and conservation match the production AMM.
+treasuryForStableSwapSettlesAtProductionPrice : Script ()
+treasuryForStableSwapSettlesAtProductionPrice = do
+  setup@PoolSetup {fixture, initialized} <- standardMarket "swap-a"
+  inputCid <- issueTreasury fixture fixture.trader (amountOf 2500)
+  narrow (wideFloorDiv (wide 1000 * wide 10000000) (wide 5001000)) === 1999
+  feeAtomsFor 1000 === 3
+  result <- settleSwap setup fixture.trader initialized.poolCid TreasuryForStable inputCid 1000 1993
+  pool <- checkPool setup result.poolCid
+  (atomsOf pool.treasuryReserve, atomsOf pool.stableReserve, atomsOf pool.totalShares, pool.stateVersion)
+    === (5001000, 9998007, 7071067, 1)
+  wide 5001000 * wide 9998007 === wide 50000033007000
+  Some changeCid <- pure result.inputChangeCid
+  Some change <- queryContractId fixture.trader changeCid
+  atomsOf change.amount === 1500
+  traderHoldings <- query @Holding fixture.trader
+  sort (map fst traderHoldings) === sort [result.outputHoldingCid, changeCid]
+
+-- TEST B. Actors: two traders paying stablecoin. Required authority: each trader alone.
+-- Expected: on 10,000,000 stablecoin in and 5,000,000 Treasury out, 1,000 stablecoin atoms buy
+-- floor(997,000 * 5e6 / 10,000,997,000) = 498 Treasury atoms (499 without the fee). On the
+-- resulting 10,001,000 / 4,999,502 reserves, 3,000 atoms buy
+-- floor(2,991,000 * 4,999,502 / 10,003,991,000) = 1494.
+-- Guarantee: the opposite direction reads the stablecoin reserve as input and pays Treasury.
+stableForTreasurySwapUsesOppositeReserveOrientation : Script ()
+stableForTreasurySwapUsesOppositeReserveOrientation = do
+  setup@PoolSetup {fixture, initialized} <- standardMarket "swap-b"
+  secondTrader <- allocateParty "SecondTrader"
+  narrow (wideFloorDiv (wide 1000 * wide 5000000) (wide 10001000)) === 499
+  firstInputCid <- issueStable fixture fixture.trader (amountOf 1000)
+  first <- settleSwap setup fixture.trader initialized.poolCid StableForTreasury firstInputCid 1000 498
+  first.inputChangeCid === None
+  afterFirst <- checkPool setup first.poolCid
+  (atomsOf afterFirst.treasuryReserve, atomsOf afterFirst.stableReserve) === (4999502, 10001000)
+  secondInputCid <- issueStable fixture secondTrader (amountOf 3000)
+  second <- settleSwap setup secondTrader first.poolCid StableForTreasury secondInputCid 3000 1494
+  afterSecond <- checkPool setup second.poolCid
+  (atomsOf afterSecond.treasuryReserve, atomsOf afterSecond.stableReserve, atomsOf afterSecond.totalShares)
+    === (4998008, 10004000, 7071067)
+  Some output <- queryContractId secondTrader second.outputHoldingCid
+  output.instrument === fixture.treasuryInstrument
+
+-- TEST C. Actors: a trader, then the initial LP. Required authority: each alone.
+-- Expected: after the Test A swap, burning 1,000,000 of 7,071,067 shares pays
+-- floor(1e6 * 5,001,000 / 7,071,067) = 707,248 Treasury and floor(1e6 * 9,998,007 / 7,071,067)
+-- = 1,413,931 stablecoin atoms (707,106 and 1,414,213 before any swap); burning the remaining
+-- 6,071,066 pays 4,293,751 and 8,584,074, leaving 1 and 2 atoms behind the locked share.
+-- Guarantee: positions are untouched by swaps, swap input and fee stay in the reserves, and
+-- withdrawals are proportional to the updated reserves and reconcile exactly.
+liquidityWithdrawalAfterSwapUsesUpdatedReserves : Script ()
+liquidityWithdrawalAfterSwapUsesUpdatedReserves = do
+  setup@PoolSetup {fixture, initialized} <- standardMarket "swap-c"
+  Some position <- queryContractId fixture.provider initialized.positionCid
+  inputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  swapped <- settleSwap setup fixture.trader initialized.poolCid TreasuryForStable inputCid 1000 1993
+  Some positionAfterSwap <- queryContractId fixture.provider initialized.positionCid
+  positionAfterSwap === position
+
+  partial <- settleRemove setup fixture.provider swapped.poolCid initialized.positionCid 1000000
+  (atomsOf partial.treasuryOut, atomsOf partial.stableOut) === (707248, 1413931)
+  afterPartial <- checkPool setup partial.poolCid
+  (atomsOf afterPartial.treasuryReserve, atomsOf afterPartial.stableReserve, atomsOf afterPartial.totalShares)
+    === (4293752, 8584076, 6071067)
+  Some remainingCid <- pure partial.remainingPositionCid
+  full <- settleRemove setup fixture.provider partial.poolCid remainingCid 6071066
+  (atomsOf full.treasuryOut, atomsOf full.stableOut) === (4293751, 8584074)
+  final <- checkPool setup full.poolCid
+  (atomsOf final.treasuryReserve, atomsOf final.stableReserve, atomsOf final.totalShares) === (1, 2, 1)
+  providerTreasury <- holdingAtoms fixture.provider fixture.treasuryInstrument
+  providerStable <- holdingAtoms fixture.provider fixture.stableInstrument
+  (providerTreasury, providerStable) === (707248 + 4293751, 1413931 + 8584074)
+  traderStable <- holdingAtoms fixture.trader fixture.stableInstrument
+  (providerTreasury + 1, providerStable + 2 + traderStable) === (5000000 + 1000, 10000000)
+
+-- TEST D. Actors: two LPs and two traders. Required authority: each actor alone.
+-- Sequence: initialize; second LP adds (707,106 shares for 500,000 / 1,000,000 atoms); trader
+-- one swaps 1,000 Treasury (1993 out); trader two swaps 5,000 stablecoin (2492 out); second LP
+-- removes half; trader one swaps 2,000 Treasury; second LP exits; the initial LP exits fully.
+-- Each step is checked against its own pre-state by the settle helpers.
+-- Guarantee: conservation and entitlement isolation hold after every transition, and the
+-- final balances account for every atom ever issued.
+multiTraderMultiProviderSequenceConservesEveryStep : Script ()
+multiTraderMultiProviderSequenceConservesEveryStep = do
+  setup@PoolSetup {fixture, secondProvider, initialized} <- standardMarket "swap-d"
+  secondTrader <- allocateParty "SecondTrader"
+  addTreasuryCid <- issueTreasury fixture secondProvider 0.0001
+  addStableCid <- issueStable fixture secondProvider 0.0001
+  firstInputCid <- issueTreasury fixture fixture.trader (amountOf 3000)
+  secondInputCid <- issueStable fixture secondTrader (amountOf 5000)
+  issued <- totalsOf setup
+
+  added <- settleAdd setup secondProvider initialized.poolCid addTreasuryCid addStableCid 1000000 1000000
+  (atomsOf added.mintedShares, atomsOf added.usedTreasury, atomsOf added.usedStable) === (707106, 500000, 1000000)
+  first <- settleSwap setup fixture.trader added.poolCid TreasuryForStable firstInputCid 1000 1993
+  Some firstChangeCid <- pure first.inputChangeCid
+  second <- settleSwap setup secondTrader first.poolCid StableForTreasury secondInputCid 5000 2492
+  afterSwaps <- checkPool setup second.poolCid
+  (atomsOf afterSwaps.treasuryReserve, atomsOf afterSwaps.stableReserve) === (5498508, 11003007)
+  partial <- settleRemove setup secondProvider second.poolCid added.positionCid 353553
+  Some secondRemainingCid <- pure partial.remainingPositionCid
+  Some afterPartial <- queryContractId setup.custodian partial.poolCid
+  let third = quote afterPartial TreasuryForStable 2000
+  assert (third > 0)
+  thirdSwap <- settleSwap setup fixture.trader partial.poolCid TreasuryForStable firstChangeCid 2000 third
+  secondExit <- settleRemove setup secondProvider thirdSwap.poolCid secondRemainingCid 353553
+  secondExit.remainingPositionCid === None
+  firstExit <- settleRemove setup fixture.provider secondExit.poolCid initialized.positionCid 7071066
+  final <- checkPool setup firstExit.poolCid
+  atomsOf final.totalShares === lockedSharesAtoms
+  positions <- positionsOf setup
+  positions === []
+
+  finalTotals <- totalsOf setup
+  finalTotals === issued
+  let parties = [fixture.provider, secondProvider, fixture.trader, secondTrader]
+  treasuryHeld <- mapA (\party -> holdingAtoms party fixture.treasuryInstrument) parties
+  stableHeld <- mapA (\party -> holdingAtoms party fixture.stableInstrument) parties
+  (sum treasuryHeld + atomsOf final.treasuryReserve, sum stableHeld + atomsOf final.stableReserve)
+    === (issued.treasury, issued.stable)
+  traderOne <- holdingAtoms fixture.trader fixture.stableInstrument
+  traderOne === 1993 + third
+
+-- S1. Actors: a trader, the operator, the custodian and the full core signatory set, each
+-- trying to spend a Treasury holding owned by another party who disclosed it to them.
+-- Required authority: the swap's controller is the named trader; the input must be its own.
+-- Expected: naming oneself as trader with the foreign holding fails `amm/owner-mismatch`,
+-- even with every pool signatory submitting; naming the real trader without its authority
+-- fails with `AuthorizationError`. Neither holding, the pool nor any balance changes.
+-- Guarantee: issuer authority carried by the pool never substitutes for the owner's consent.
+foreignOwnedSwapInputIsRejected : Script ()
+foreignOwnedSwapInputIsRejected = do
+  setup@PoolSetup {fixture, custodian, lineage, initialized} <- standardMarket "s1-swap"
+  victimCid <- issueTreasury fixture fixture.other (amountOf 1000)
+  traderInputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  victimDisclosure <- disclosureOf fixture.other victimCid
+  traderDisclosure <- disclosureOf fixture.trader traderInputCid
+  poolDisclosed <- poolDisclosure setup initialized.poolCid
+  before <- snapshotOf setup initialized.poolCid
+  deadline <- futureDeadline
+  let swapWith submitters trader inputCid =
+        trySubmit (actAs submitters <> discloseMany [poolDisclosed, victimDisclosure, traderDisclosure]) $
+          swapCommand initialized.poolCid trader TreasuryForStable inputCid 1000 0 deadline 0
+  let core = lineageSignatories lineage
+
+  traderTakes <- swapWith [fixture.trader] fixture.trader victimCid
+  assertFailureId ownerMismatchError traderTakes
+  operatorTakes <- swapWith [fixture.operator] fixture.operator victimCid
+  assertFailureId ownerMismatchError operatorTakes
+  custodianTakes <- swapWith [custodian] custodian victimCid
+  assertFailureId ownerMismatchError custodianTakes
+  coreTakes <- swapWith core fixture.operator victimCid
+  assertFailureId ownerMismatchError coreTakes
+  operatorImpersonates <- swapWith [fixture.operator] fixture.trader traderInputCid
+  assertAuthorizationError operatorImpersonates
+  custodianImpersonates <- swapWith [custodian] fixture.trader traderInputCid
+  assertAuthorizationError custodianImpersonates
+  coreImpersonates <- swapWith core fixture.trader traderInputCid
+  assertAuthorizationError coreImpersonates
+
+  assertUnchanged setup initialized.poolCid before
+  Some victim <- queryContractId fixture.other victimCid
+  (victim.owner, atomsOf victim.amount) === (fixture.other, 1000)
+
+-- S1 for deposit paths. Actors: a second provider and a new pool's initial provider, each
+-- given another party's disclosed holding. Required authority: the depositor alone.
+-- Expected: `AddLiquidity` with a foreign Treasury leg and `InitializePool` with a foreign
+-- stablecoin leg both fail `amm/owner-mismatch`; holdings, pool, charter and supply unchanged.
+foreignOwnedDepositsAreRejected : Script ()
+foreignOwnedDepositsAreRejected = do
+  setup@PoolSetup {fixture, custodian, secondProvider, initialized} <- standardMarket "s1-deposit"
+  victimTreasuryCid <- issueTreasury fixture fixture.other 0.0001
+  victimStableCid <- issueStable fixture fixture.other 0.001
+  ownStableCid <- issueStable fixture secondProvider 0.0001
+  victimTreasuryDisclosure <- disclosureOf fixture.other victimTreasuryCid
+  victimStableDisclosure <- disclosureOf fixture.other victimStableCid
+  poolDisclosed <- poolDisclosure setup initialized.poolCid
+  let newLineage = lineageFor fixture custodian "s1-deposit-new"
+  charterCid <- submit (actAs (lineageSignatories newLineage)) $ createCmd PoolCharter with
+    lineage = newLineage
+    initialProvider = secondProvider
+  ownTreasuryCid <- issueTreasury fixture secondProvider 0.0005
+  before <- snapshotOf setup initialized.poolCid
+
+  addResult <- trySubmit (actAs secondProvider <> discloseMany [poolDisclosed, victimTreasuryDisclosure]) $
+    exerciseCmd initialized.poolCid AddLiquidity with
+      provider = secondProvider
+      treasuryHoldingCid = victimTreasuryCid
+      stableHoldingCid = ownStableCid
+      maximumTreasury = 0.0001
+      maximumStable = 0.0001
+      minimumShares = 0.0
+      expectedVersion = 0
+  assertFailureId ownerMismatchError addResult
+  initResult <- trySubmit (actAs secondProvider <> discloseMany [victimStableDisclosure]) $
+    exerciseCmd charterCid InitializePool with
+      treasuryHoldingCid = ownTreasuryCid
+      stableHoldingCid = victimStableCid
+      treasuryAmount = 0.0005
+      stableAmount = 0.001
+  assertFailureId ownerMismatchError initResult
+
+  assertUnchanged setup initialized.poolCid before
+  Some _ <- queryContractId secondProvider charterCid
+  newPools <- query @ProtectedPool secondProvider
+  newPools === []
+
+-- S2. Actors: operator and governance, then wider coalitions, after swaps in both directions
+-- have moved the reserves. Required authority: a position needs every core signatory and its
+-- provider. Attacks: forge a position for governance (operator, governance), for the operator
+-- (three of four core signers with governance), and for an unwilling trader (all four core
+-- signers); redeem the genuine LP's position in the coalition's name and in the LP's name.
+-- Expected: forgeries fail at creation with `AuthorizationError`, the security boundary
+-- itself; the redemptions fail `amm/owner-mismatch` and `AuthorizationError`. A Phase 0
+-- production position is additionally rejected as the wrong template. The genuine LP then
+-- redeems normally. Limitation: the full core set with a cooperating provider can forge; see
+-- `fullCoreSignerCoalitionRemainsTrusted`.
+forgedEntitlementCannotRedeemAfterSwaps : Script ()
+forgedEntitlementCannotRedeemAfterSwaps = do
+  setup@PoolSetup {fixture, custodian, lineage, charterCid, initialized} <- standardMarket "s2"
+  treasuryInputCid <- issueTreasury fixture fixture.trader (amountOf 4000)
+  stableInputCid <- issueStable fixture fixture.trader (amountOf 7000)
+  Some genesis <- queryContractId custodian initialized.poolCid
+  first <- settleSwap setup fixture.trader initialized.poolCid TreasuryForStable treasuryInputCid 4000 (quote genesis TreasuryForStable 4000)
+  Some current <- queryContractId custodian first.poolCid
+  second <- settleSwap setup fixture.trader first.poolCid StableForTreasury stableInputCid 7000 (quote current StableForTreasury 7000)
+  before <- snapshotOf setup second.poolCid
+  let forged provider = PoolPosition with lineage; genesisCid = charterCid; provider; shares = amountOf 1000000
+  let core = lineageSignatories lineage
+
+  pairForgery <- trySubmit (actAs [fixture.operator, fixture.governance]) $ createCmd (forged fixture.governance)
+  assertAuthorizationError pairForgery
+  threeOfFourForgery <- trySubmit (actAs [fixture.operator, fixture.governance, custodian, fixture.treasuryIssuer]) $
+    createCmd (forged fixture.operator)
+  assertAuthorizationError threeOfFourForgery
+  unwillingProviderForgery <- trySubmit (actAs core) $ createCmd (forged fixture.trader)
+  assertAuthorizationError unwillingProviderForgery
+
+  disclosure <- poolDisclosure setup second.poolCid
+  positionDisclosure <- disclosureOf fixture.provider initialized.positionCid
+  let redeemGenuine provider = trySubmit (actAs [fixture.operator, fixture.governance] <> discloseMany [disclosure, positionDisclosure]) $
+        exerciseCmd second.poolCid RemoveLiquidity with
+          provider
+          positionCid = initialized.positionCid
+          burnShares = amountOf 1000000
+          minimumTreasuryOut = 0.0
+          minimumStableOut = 0.0
+          expectedVersion = before.pool.stateVersion
+  ownName <- redeemGenuine fixture.operator
+  assertFailureId ownerMismatchError ownName
+  impersonation <- redeemGenuine fixture.provider
+  assertAuthorizationError impersonation
+
+  phaseZeroCid <- submit (actAs [fixture.operator, fixture.governance]) $ createCmd LiquidityPosition with
+    poolId = poolIdOf fixture "s2"
+    provider = fixture.governance
+    shares = amountOf 1000000
+    auditors = []
+  phaseZero <- trySubmit (actAs fixture.governance <> discloseMany [disclosure]) $
+    exerciseCmd second.poolCid RemoveLiquidity with
+      provider = fixture.governance
+      positionCid = coerceContractId phaseZeroCid
+      burnShares = amountOf 1000000
+      minimumTreasuryOut = 0.0
+      minimumStableOut = 0.0
+      expectedVersion = before.pool.stateVersion
+  assertWronglyTyped phaseZero
+
+  assertUnchanged setup second.poolCid before
+  _ <- settleRemove setup fixture.provider second.poolCid initialized.positionCid 1000000
+  pure ()
+
+-- S3. Actors: privileged coalitions after swaps. Required authority: a pool state needs every
+-- core signer. Attacks: replicate the current state (same lineage, genesis, reserves, supply
+-- and version) as seven representative coalitions; deploy a coalition-signed counterfeit pool
+-- with the same fields and pay out its reserves.
+-- Expected: replicas fail with `AuthorizationError`; the counterfeit can exist but its payout
+-- needs the Treasury issuer and fails. The genuine state is unchanged and still settles swaps.
+-- Limitation: only the full core set (with or without governance) can create a competing
+-- authorized state; `everyNonCoreSignerSubsetIsRejected` covers every other subset.
+counterfeitPoolCannotSettleAfterSwaps : Script ()
+counterfeitPoolCannotSettleAfterSwaps = do
+  setup@PoolSetup {fixture, custodian, lineage, initialized} <- standardMarket "s3"
+  firstInputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  first <- settleSwap setup fixture.trader initialized.poolCid TreasuryForStable firstInputCid 1000 1993
+  secondInputCid <- issueStable fixture fixture.trader (amountOf 1000)
+  before <- snapshotOf setup first.poolCid
+  let ti = fixture.treasuryIssuer
+  let si = fixture.stableIssuer
+  let coalitions =
+        [ [fixture.operator, fixture.governance]
+        , [fixture.operator, custodian]
+        , [custodian, ti, si]
+        , [fixture.operator, ti, si]
+        , [fixture.operator, custodian, ti]
+        , [fixture.operator, custodian, si]
+        , [fixture.governance, custodian, ti, si] ]
+  results <- mapA (\coalition -> trySubmit (actAs coalition) $ createCmd before.pool) coalitions
+  mapA_ assertAuthorizationError results
+
+  counterfeitCid <- submit (actAs [fixture.operator, fixture.governance]) $ createCmd CounterfeitPool with
+    lineage
+    treasuryReserve = before.pool.treasuryReserve
+    stableReserve = before.pool.stableReserve
+    totalShares = before.pool.totalShares
+  payoutAttempt <- trySubmit fixture.operator $ exerciseCmd counterfeitCid CounterfeitWithdraw with
+    recipient = fixture.operator
+  assertAuthorizationError payoutAttempt
+  assertUnchanged setup first.poolCid before
+
+  _ <- settleSwap setup fixture.trader first.poolCid StableForTreasury secondInputCid 1000 (quote before.pool StableForTreasury 1000)
+  pure ()
+
+-- S4. Actors: a trader and the initial LP holding previously valid contract data.
+-- Attacks: a wrong version on the active state; the consumed predecessor through an operator
+-- read and through its stale explicit disclosure; the consumed input holding on the current
+-- state; the identical first submission replayed; a consumed LP position.
+-- Expected: the wrong version fails `amm/stale-state` on an active state; every reference to a
+-- consumed contract fails as `ContractNotFound` naming only consumed contracts (the replay
+-- references two; the IDE ledger names the input holding). The stale
+-- explicit disclosure fails as `ContractNotFound` on the IDE ledger and at confirmation as
+-- `LOCAL_VERDICT_INACTIVE_CONTRACTS` on the sandbox participant. Nothing changes, and the current
+-- state then settles.
+staleStateAndReplayCannotSettleTwice : Script ()
+staleStateAndReplayCannotSettleTwice = do
+  setup@PoolSetup {fixture, initialized} <- standardMarket "s4"
+  predecessorDisclosure <- poolDisclosure setup initialized.poolCid
+  firstInputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  deadline <- futureDeadline
+  let firstSwap = swapCommand initialized.poolCid fixture.trader TreasuryForStable firstInputCid 1000 0 deadline 0
+  first <- submit (actAs fixture.trader <> discloseMany [predecessorDisclosure]) firstSwap
+  secondInputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  currentDisclosure <- poolDisclosure setup first.poolCid
+  before <- snapshotOf setup first.poolCid
+  let asTrader disclosures = trySubmit (actAs fixture.trader <> discloseMany disclosures)
+
+  wrongVersion <- asTrader [currentDisclosure] $
+    swapCommand first.poolCid fixture.trader TreasuryForStable secondInputCid 1000 0 deadline 0
+  assertFailureId staleStateError wrongVersion
+  consumedRead <- trySubmit (actAs fixture.trader <> readAs fixture.operator) $
+    swapCommand initialized.poolCid fixture.trader TreasuryForStable secondInputCid 1000 0 deadline 0
+  assertConsumedAmong [show initialized.poolCid] consumedRead
+  consumedDisclosed <- asTrader [predecessorDisclosure] $
+    swapCommand initialized.poolCid fixture.trader TreasuryForStable secondInputCid 1000 0 deadline 0
+  assertConsumedAmong [show initialized.poolCid] consumedDisclosed
+  staleInput <- asTrader [currentDisclosure] $
+    swapCommand first.poolCid fixture.trader TreasuryForStable firstInputCid 1000 0 deadline 1
+  assertConsumedAmong [show firstInputCid] staleInput
+  replay <- asTrader [predecessorDisclosure] firstSwap
+  assertConsumedAmong [show initialized.poolCid, show firstInputCid] replay
+  assertUnchanged setup first.poolCid before
+
+  removed <- settleRemove setup fixture.provider first.poolCid initialized.positionCid 1000
+  removedDisclosure <- poolDisclosure setup removed.poolCid
+  stalePosition <- trySubmit (actAs fixture.provider <> discloseMany [removedDisclosure]) $
+    exerciseCmd removed.poolCid RemoveLiquidity with
+      provider = fixture.provider
+      positionCid = initialized.positionCid
+      burnShares = amountOf 1000
+      minimumTreasuryOut = 0.0
+      minimumStableOut = 0.0
+      expectedVersion = 2
+  assertConsumedAmong [show initialized.positionCid] stalePosition
+  Some current <- queryContractId setup.custodian removed.poolCid
+  _ <- settleSwap setup fixture.trader removed.poolCid TreasuryForStable secondInputCid 1000 (quote current TreasuryForStable 1000)
+  pure ()
+
+-- S5. Actor: a trader. Attacks and boundaries: a deadline equal to the ledger time, one already
+-- passed, and one overtaken by `passTime`; a minimum output one atom above the quote; zero and
+-- negative amounts; an input above the holding balance and above the atom cap; an input that
+-- quotes zero output; an input that would push a near-cap reserve over the cap.
+-- Expected: `amm/deadline`, `amm/slippage`, `amm/invalid-amount`, `amm/insufficient-balance`,
+-- `amm/reserve-cap` and `amm/insufficient-liquidity` as appropriate, each with every holding and
+-- the pool unchanged; a deadline one microsecond after ledger time settles.
+deadlineSlippageAndBoundsRejectWithoutStateChange : Script ()
+deadlineSlippageAndBoundsRejectWithoutStateChange = do
+  setup@PoolSetup {fixture, custodian, initialized} <- standardMarket "s5"
+  treasuryInputCid <- issueTreasury fixture fixture.trader (amountOf 2000)
+  stableInputCid <- issueStable fixture fixture.trader (amountOf 1)
+  disclosure <- poolDisclosure setup initialized.poolCid
+  now <- getTime
+  let later = addRelTime now (hours 1)
+  let attempt direction inputCid inputAtoms minimumOutAtoms deadline =
+        trySubmit (actAs fixture.trader <> discloseMany [disclosure]) $
+          swapCommand initialized.poolCid fixture.trader direction inputCid inputAtoms minimumOutAtoms deadline 0
+  let rejects errorId direction inputCid inputAtoms minimumOutAtoms deadline = do
+        before <- snapshotOf setup initialized.poolCid
+        result <- attempt direction inputCid inputAtoms minimumOutAtoms deadline
+        assertFailureId errorId result
+        assertUnchanged setup initialized.poolCid before
+
+  rejects deadlineError TreasuryForStable treasuryInputCid 1000 0 now
+  rejects deadlineError TreasuryForStable treasuryInputCid 1000 0 (addRelTime now (seconds (-1)))
+  rejects slippageError TreasuryForStable treasuryInputCid 1000 1994 later
+  rejects invalidAmountError TreasuryForStable treasuryInputCid 0 0 later
+  rejects invalidAmountError TreasuryForStable treasuryInputCid 1000 (-1) later
+  rejects insufficientBalanceError TreasuryForStable treasuryInputCid 2001 0 later
+  rejects reserveCapError TreasuryForStable treasuryInputCid (maxReserveAtoms + 1) 0 later
+  Some genesis <- queryContractId custodian initialized.poolCid
+  quote genesis StableForTreasury 1 === 0
+  rejects insufficientLiquidityError StableForTreasury stableInputCid 1 0 later
+
+  passTime (hours 2)
+  rejects deadlineError TreasuryForStable treasuryInputCid 1000 0 later
+  boundary <- getTime
+  Some pool <- queryContractId custodian initialized.poolCid
+  boundaryResult <- submit (actAs fixture.trader <> discloseMany [disclosure]) $
+    swapCommand initialized.poolCid fixture.trader TreasuryForStable treasuryInputCid 1000 1993
+      (addRelTime boundary (microseconds 1)) pool.stateVersion
+  atomsOf boundaryResult.amountOut === 1993
+
+  nearCap@PoolSetup {initialized = nearCapInitialized} <- marketWith "s5-cap" (maxReserveAtoms - 500) 10000000
+  capInputCid <- issueTreasury nearCap.fixture nearCap.fixture.trader (amountOf 1000)
+  capDisclosure <- poolDisclosure nearCap nearCapInitialized.poolCid
+  capBefore <- snapshotOf nearCap nearCapInitialized.poolCid
+  capDeadline <- futureDeadline
+  capResult <- trySubmit (actAs nearCap.fixture.trader <> discloseMany [capDisclosure]) $
+    swapCommand nearCapInitialized.poolCid nearCap.fixture.trader TreasuryForStable capInputCid 1000 0 capDeadline 0
+  assertFailureId reserveCapError capResult
+  assertUnchanged nearCap nearCapInitialized.poolCid capBefore
+
+-- S6. Actor: a trader submitting two commands as one transaction. Required authority: the
+-- trader alone. Attacks: (1) two swaps against the same pool state; (2) a valid swap on this
+-- pool followed by a swap on a second genuine pool whose minimum output is one atom too high.
+-- In both, the first swap fully executes (input archived, change and payout created, successor
+-- created) before the second command fails.
+-- Expected: (1) fails as `ContractNotFound` naming the state the first swap consumed, so one
+-- state cannot settle twice; (2) fails `amm/slippage`. Both pools, both inputs and every
+-- balance are exactly as before, and each command then settles on its own.
+batchedSettlementRollsBackAfterCompletedSwap : Script ()
+batchedSettlementRollsBackAfterCompletedSwap = do
+  setup@PoolSetup {fixture, custodian, initialized} <- standardMarket "s6"
+  (otherCharterCid, otherInitialized) <- openPool fixture custodian "s6-other" fixture.provider 5000000 10000000
+  let otherSetup = setup with
+        lineage = lineageFor fixture custodian "s6-other"
+        charterCid = otherCharterCid
+        initialized = otherInitialized
+  firstInputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  secondInputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  disclosure <- poolDisclosure setup initialized.poolCid
+  otherDisclosure <- poolDisclosure otherSetup otherInitialized.poolCid
+  before <- snapshotOf setup initialized.poolCid
+  otherBefore <- snapshotOf otherSetup otherInitialized.poolCid
+  deadline <- futureDeadline
+  let batch = trySubmit (actAs fixture.trader <> discloseMany [disclosure, otherDisclosure])
+
+  doubleSettlement <- batch $ (,)
+    <$> swapCommand initialized.poolCid fixture.trader TreasuryForStable firstInputCid 1000 0 deadline 0
+    <*> swapCommand initialized.poolCid fixture.trader TreasuryForStable secondInputCid 1000 0 deadline 0
+  assertConsumedContract initialized.poolCid doubleSettlement
+  lateFailure <- batch $ (,)
+    <$> swapCommand initialized.poolCid fixture.trader TreasuryForStable firstInputCid 1000 0 deadline 0
+    <*> swapCommand otherInitialized.poolCid fixture.trader TreasuryForStable secondInputCid 1000 1994 deadline 0
+  assertFailureId slippageError lateFailure
+
+  assertUnchanged setup initialized.poolCid before
+  assertUnchanged otherSetup otherInitialized.poolCid otherBefore
+  _ <- settleSwap setup fixture.trader initialized.poolCid TreasuryForStable firstInputCid 1000 1993
+  _ <- settleSwap otherSetup fixture.trader otherInitialized.poolCid TreasuryForStable secondInputCid 1000 1993
+  pure ()
+
+-- The submitting engine reports `ContractNotFound` naming only consumed contracts. On a Canton
+-- participant a stale explicitly disclosed contract passes the submitting engine and is rejected
+-- at confirmation as `LOCAL_VERDICT_INACTIVE_CONTRACTS`, which does not name the contract.
+assertConsumedAmong : [Text] -> Either SubmitError a -> Script ()
+assertConsumedAmong consumedCids result = case result of
+  Left ContractNotFound {unknownContractIds}
+    | all (`elem` consumedCids) (NonEmpty.toList unknownContractIds) -> pure ()
+  Left UnknownError {unknownErrorMessage}
+    | "LOCAL_VERDICT_INACTIVE_CONTRACTS" `isInfixOf` unknownErrorMessage -> pure ()
+  Left otherError -> abort ("Expected ContractNotFound for a consumed contract, got " <> show otherError)
+  Right _ -> abort "Expected the operation to fail on a consumed contract"
+
+subsetsOf : [a] -> [[a]]
+subsetsOf [] = [[]]
+subsetsOf (first :: rest) = let others = subsetsOf rest in map (first ::) others ++ others
+
+-- S7. Actors: every one of the 31 non-empty subsets of custodian, operator, governance and the
+-- two issuers. Required authority: pool states need all four core signers; positions also need
+-- their provider; swaps need the named trader and its own input.
+-- Attacks for every subset: archive the genuine LP's position; swap the trader's holding in the
+-- trader's name and in the subset's own name. For the 29 subsets that do not contain all four
+-- core signers, also: replicate the current pool state, forge a position for a subset member,
+-- and archive the pool state.
+-- Expected: `AuthorizationError` everywhere except the own-name swap, which fails
+-- `amm/owner-mismatch`; nothing changes. Not executed here: pool creation and archival by the
+-- two subsets containing all core signers, which succeed (see the trust-limit test).
+everyNonCoreSignerSubsetIsRejected : Script ()
+everyNonCoreSignerSubsetIsRejected = do
+  setup@PoolSetup {fixture, custodian, lineage, charterCid, initialized} <- standardMarket "s7"
+  firstInputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  swapped <- settleSwap setup fixture.trader initialized.poolCid TreasuryForStable firstInputCid 1000 1993
+  traderInputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  poolDisclosed <- poolDisclosure setup swapped.poolCid
+  positionDisclosed <- disclosureOf fixture.provider initialized.positionCid
+  inputDisclosed <- disclosureOf fixture.trader traderInputCid
+  before <- snapshotOf setup swapped.poolCid
+  deadline <- futureDeadline
+  let core = lineageSignatories lineage
+  let candidates = filter (not . null)
+        (subsetsOf [custodian, fixture.operator, fixture.governance, fixture.treasuryIssuer, fixture.stableIssuer])
+  let coversCore subset = all (`elem` subset) core
+  length candidates === 31
+  length (filter (not . coversCore) candidates) === 29
+  let swapAsSubset subset trader = trySubmit (actAs subset <> discloseMany [poolDisclosed, inputDisclosed]) $
+        swapCommand swapped.poolCid trader TreasuryForStable traderInputCid 1000 0 deadline before.pool.stateVersion
+
+  forA_ candidates $ \subset -> do
+    member <- case subset of
+      party :: _ -> pure party
+      [] -> abort "Candidate subsets are non-empty"
+    positionArchive <- trySubmit (actAs subset <> discloseMany [positionDisclosed]) $
+      exerciseCmd initialized.positionCid Archive
+    assertAuthorizationError positionArchive
+    impersonation <- swapAsSubset subset fixture.trader
+    assertAuthorizationError impersonation
+    ownName <- swapAsSubset subset member
+    assertFailureId ownerMismatchError ownName
+    unless (coversCore subset) $ do
+      replica <- trySubmit (actAs subset) $ createCmd before.pool
+      assertAuthorizationError replica
+      forged <- trySubmit (actAs subset) $ createCmd PoolPosition with
+        lineage
+        genesisCid = charterCid
+        provider = member
+        shares = amountOf 1000000
+      assertAuthorizationError forged
+      poolArchive <- trySubmit (actAs subset <> discloseMany [poolDisclosed]) $ exerciseCmd swapped.poolCid Archive
+      assertAuthorizationError poolArchive
+
+  assertUnchanged setup swapped.poolCid before
+
+-- S8. Actors: operator, custodian and governance using Stage 1.1 custody controls after swaps.
+-- Setup: a genuine custody agreement and `ProtectedReserve` for the same custodian and operator,
+-- and a mandate that has legitimately released its whole allowance from that reserve.
+-- Attacks against the pool: a live mandate sized to the Treasury reserve; the spent mandate; a
+-- custodian-approved release request; a joint custodian and operator `Release`; a coalition
+-- `Sweep`; a mandate forged by the operator; a counterfeit `ProtectedReserve` copying the pool's
+-- reserve. Expected: the custody paths fail as the wrong template, the spent mandate as
+-- `ContractNotFound`, and the forgeries with `AuthorizationError`. The pool, every holding and
+-- the protected reserve's remainder are unchanged.
+-- Guarantee: Stage 1.1 controls act only on `ProtectedReserve` contracts and are no withdrawal
+-- route for pool reserves. Acknowledged: the mandate did release from its own reserve.
+custodyControlsCannotReachSwapPoolReserves : Script ()
+custodyControlsCannotReachSwapPoolReserves = do
+  setup@PoolSetup {fixture, custodian, initialized} <- standardMarket "s8"
+  inputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  swapped <- settleSwap setup fixture.trader initialized.poolCid TreasuryForStable inputCid 1000 1993
+  agreementCid <- submit (actAs [fixture.treasuryIssuer, custodian]) $ createCmd CustodyAgreement with
+    instrument = fixture.treasuryInstrument
+    custodian
+    operator = fixture.operator
+  depositCid <- issueTreasury fixture fixture.other (amountOf 5000)
+  agreementDisclosure <- disclosureOf custodian agreementCid
+  reserveCid <- submit (actAs fixture.other <> discloseMany [agreementDisclosure]) $
+    exerciseCmd agreementCid Deposit with depositor = fixture.other; holdingCid = depositCid
+  spentMandateCid <- submit custodian $ createCmd ReleaseMandate with
+    custodian
+    operator = fixture.operator
+    instrument = fixture.treasuryInstrument
+    beneficiary = fixture.operator
+    remainingAllowance = amountOf 2000
+  drawn <- submit fixture.operator $ exerciseCmd spentMandateCid ReleaseUnderMandate with
+    reserveCid
+    releaseAmount = amountOf 2000
+  drawn.nextMandateCid === None
+  Some remainderCid <- pure drawn.release.remainderCid
+  Some remainder <- queryContractId custodian remainderCid
+  atomsOf remainder.amount === 3000
+
+  before <- snapshotOf setup swapped.poolCid
+  disclosure <- poolDisclosure setup swapped.poolCid
+  let poolAsReserve = coerceContractId @ProtectedPool @ProtectedReserve swapped.poolCid
+  let fullReserve = before.pool.treasuryReserve
+  let asParties parties = actAs parties <> discloseMany [disclosure]
+
+  liveMandateCid <- submit custodian $ createCmd ReleaseMandate with
+    custodian
+    operator = fixture.operator
+    instrument = fixture.treasuryInstrument
+    beneficiary = fixture.operator
+    remainingAllowance = fullReserve
+  liveDraw <- trySubmit (asParties [fixture.operator]) $ exerciseCmd liveMandateCid ReleaseUnderMandate with
+    reserveCid = poolAsReserve
+    releaseAmount = fullReserve
+  assertWronglyTyped liveDraw
+  spentDraw <- trySubmit (asParties [fixture.operator]) $ exerciseCmd spentMandateCid ReleaseUnderMandate with
+    reserveCid = poolAsReserve
+    releaseAmount = amountOf 1
+  assertConsumedContract spentMandateCid spentDraw
+  requestCid <- submit fixture.operator $ createCmd ReleaseRequest with
+    operator = fixture.operator
+    custodian
+    reserveCid = poolAsReserve
+    recipient = fixture.operator
+    releaseAmount = fullReserve
+  approved <- trySubmit (asParties [custodian]) $ exerciseCmd requestCid ApproveRelease
+  assertWronglyTyped approved
+  jointRelease <- trySubmit (asParties [custodian, fixture.operator]) $ exerciseCmd poolAsReserve Release with
+    recipient = fixture.operator
+    releaseAmount = fullReserve
+  assertWronglyTyped jointRelease
+  controllerCid <- submit (actAs [fixture.operator, fixture.governance]) $ createCmd CoalitionReserveController with
+    operator = fixture.operator
+    governance = fixture.governance
+    reserveCid = poolAsReserve
+  sweep <- trySubmit (asParties [fixture.operator]) $ exerciseCmd controllerCid Sweep with
+    recipient = fixture.operator
+    releaseAmount = fullReserve
+  assertWronglyTyped sweep
+  forgedMandate <- trySubmit fixture.operator $ createCmd ReleaseMandate with
+    custodian
+    operator = fixture.operator
+    instrument = fixture.treasuryInstrument
+    beneficiary = fixture.operator
+    remainingAllowance = fullReserve
+  assertAuthorizationError forgedMandate
+  counterfeitReserve <- trySubmit (actAs [fixture.operator, fixture.governance]) $ createCmd ProtectedReserve with
+    instrument = fixture.treasuryInstrument
+    custodian
+    operator = fixture.operator
+    amount = fullReserve
+  assertAuthorizationError counterfeitReserve
+
+  assertUnchanged setup swapped.poolCid before
+  Some remainderAfter <- queryContractId custodian remainderCid
+  remainderAfter === remainder
+
+-- TRUST LIMIT. Actors: the full core signatory set (custodian, operator, both issuers), with
+-- the operator also acting as a cooperating provider.
+-- Demonstrated, not prevented: the set charters a second pool with an identical `PoolLineage`;
+-- it creates an unbacked state that carries the genuine genesis ID, so two active states share
+-- one identity and both issuers' outstanding value rises by the invented reserves; it mints a
+-- position for the operator and redeems it from the genuine reserves, leaving the honest LP's
+-- entitlement larger than the remaining supply; it archives the genuine state.
+-- Prevented by genesis binding: the honest LP's position from the duplicate pool cannot redeem
+-- from the original despite equal lineage (`amm/position`).
+-- Guarantee: smaller coalitions are rejected elsewhere; this coalition is trusted, not
+-- constrained, and signature sets do not give global pool uniqueness.
+fullCoreSignerCoalitionRemainsTrusted : Script ()
+fullCoreSignerCoalitionRemainsTrusted = do
+  setup@PoolSetup {fixture, custodian, lineage, charterCid, initialized} <- standardMarket "trusted"
+  inputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  swapped <- settleSwap setup fixture.trader initialized.poolCid TreasuryForStable inputCid 1000 1993
+  let core = lineageSignatories lineage
+
+  (duplicateCharterCid, duplicate) <- openPool fixture custodian "trusted" fixture.provider 5000000 10000000
+  duplicateCharterCid =/= charterCid
+  states <- query @ProtectedPool custodian
+  sort (map fst (filter (\(_, state) -> state.lineage == lineage) states)) === sort [swapped.poolCid, duplicate.poolCid]
+  Some current <- queryContractId custodian swapped.poolCid
+  disclosure <- poolDisclosure setup swapped.poolCid
+  crossPool <- trySubmit (actAs fixture.provider <> discloseMany [disclosure]) $
+    exerciseCmd swapped.poolCid RemoveLiquidity with
+      provider = fixture.provider
+      positionCid = duplicate.positionCid
+      burnShares = amountOf 1000000
+      minimumTreasuryOut = 0.0
+      minimumStableOut = 0.0
+      expectedVersion = current.stateVersion
+  assertFailureId positionError crossPool
+
+  totalsBefore <- totalsOf setup
+  unbackedCid <- submit (actAs core) $ createCmd current with treasuryReserve = 1.0; stableReserve = 1.0
+  sameGenesis <- query @ProtectedPool custodian
+  sort (map fst (filter (\(_, state) -> state.genesisCid == charterCid) sameGenesis)) === sort [swapped.poolCid, unbackedCid]
+  totalsInflated <- totalsOf setup
+  totalsInflated === Totals with
+    treasury = totalsBefore.treasury + atomsOf 1.0
+    stable = totalsBefore.stable + atomsOf 1.0
+
+  forgedCid <- submit (actAs core) $ createCmd PoolPosition with
+    lineage
+    genesisCid = charterCid
+    provider = fixture.operator
+    shares = amountOf 1000000
+  drained <- removeAs setup fixture.operator swapped.poolCid forgedCid (amountOf 1000000)
+  assert (atomsOf drained.treasuryOut > 0 && atomsOf drained.stableOut > 0)
+  operatorTreasury <- holdingAtoms fixture.operator fixture.treasuryInstrument
+  operatorTreasury === atomsOf drained.treasuryOut
+  drift <- supplyDrift setup drained.poolCid
+  drift === -1000000
+
+  submit (actAs core) $ exerciseCmd drained.poolCid Archive
+  frozen <- queryContractId custodian drained.poolCid
+  frozen === None
+
+-- MUTATION B GUARD. Actors: the second LP with privileged coalitions. Required authority: a
+-- position's `Archive` needs the provider and all four core signers; `PoolPosition` has no
+-- other choice. Attacks: the provider with operator and governance, and the provider with three
+-- core signers, archive its position; then the provider with all four core signers does.
+-- Expected: the first two fail with `AuthorizationError`. The authorized out-of-band burn
+-- succeeds, moves no asset, and `supplyDrift` reports exactly the burned 707,106 shares as
+-- supply without an entitlement; the initial LP's full exit then receives only its own
+-- proportion, so the orphaned value stays in the pool.
+-- Guarantee: an unaccounted burn is detectable by reconciliation and needs the provider plus
+-- the full core set. Limitation: a newly added choice is not exercised by any test; the
+-- choice-surface check covers that structurally.
+outOfBandPositionBurnIsDetectedAsSupplyDrift : Script ()
+outOfBandPositionBurnIsDetectedAsSupplyDrift = do
+  setup@PoolSetup {fixture, custodian, secondProvider, lineage, initialized} <- standardMarket "burn"
+  added <- addSecondProvider setup initialized.poolCid
+  inputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  swapped <- settleSwap setup fixture.trader added.poolCid TreasuryForStable inputCid 1000 1993
+  reconciled <- supplyDrift setup swapped.poolCid
+  reconciled === 0
+  positionDisclosed <- disclosureOf secondProvider added.positionCid
+  let archiveAs parties = trySubmit (actAs parties <> discloseMany [positionDisclosed]) $
+        exerciseCmd added.positionCid Archive
+  withPair <- archiveAs [secondProvider, fixture.operator, fixture.governance]
+  assertAuthorizationError withPair
+  withThree <- archiveAs [secondProvider, custodian, fixture.operator, fixture.treasuryIssuer]
+  assertAuthorizationError withThree
+
+  totalsBefore <- totalsOf setup
+  submit (actAs (secondProvider :: lineageSignatories lineage)) $ exerciseCmd added.positionCid Archive
+  totalsAfter <- totalsOf setup
+  totalsAfter === totalsBefore
+  drift <- supplyDrift setup swapped.poolCid
+  drift === atomsOf added.mintedShares
+
+  Some pool <- queryContractId custodian swapped.poolCid
+  exit <- removeAs setup fixture.provider swapped.poolCid initialized.positionCid (amountOf 7071066)
+  atomsOf exit.treasuryOut === narrow (wideMulFloor 7071066 (atomsOf pool.treasuryReserve) 7778173)
+  Some final <- queryContractId custodian exit.poolCid
+  atomsOf final.totalShares === 707106 + lockedSharesAtoms
+  assert (atomsOf final.treasuryReserve > 400000 && atomsOf final.stableReserve > 900000)
+
+-- MUTATION C, REACHABLE STATES. Actors: two LPs and a trader on a pool seeded at exactly the
+-- minimum supply (1,000,000 gross shares, one locked). Steps: a seed one share below the minimum
+-- is rejected (`amm/initial-liquidity`); a second LP adds; a swap moves the price; the initial
+-- LP exits fully, then the second LP. Dust of 2 Treasury and 1 stablecoin atoms stays behind the
+-- locked share, a one-atom swap there quotes zero and is rejected without change, and a new
+-- deposit can still re-seed at the dust price (500,000 shares).
+-- Guarantee: supply never falls below the locked share and reserves stay positive through full
+-- exit in this order; `multiTraderMultiProviderSequenceConservesEveryStep` exits in the other.
+lockedShareFloorHoldsThroughFullExit : Script ()
+lockedShareFloorHoldsThroughFullExit = do
+  setup@PoolSetup {fixture, custodian, secondProvider, initialized} <- marketWith "floor" 1000000 1000000
+  genesis <- checkPool setup initialized.poolCid
+  atomsOf genesis.totalShares === minimumInitialSharesAtoms
+  Some firstPosition <- queryContractId fixture.provider initialized.positionCid
+  atomsOf firstPosition.shares === minimumInitialSharesAtoms - lockedSharesAtoms
+
+  let belowLineage = lineageFor fixture custodian "floor-below"
+  belowCharterCid <- submit (actAs (lineageSignatories belowLineage)) $ createCmd PoolCharter with
+    lineage = belowLineage
+    initialProvider = fixture.provider
+  belowTreasuryCid <- issueTreasury fixture fixture.provider (amountOf 999999)
+  belowStableCid <- issueStable fixture fixture.provider (amountOf 1000000)
+  below <- trySubmit fixture.provider $ exerciseCmd belowCharterCid InitializePool with
+    treasuryHoldingCid = belowTreasuryCid
+    stableHoldingCid = belowStableCid
+    treasuryAmount = amountOf 999999
+    stableAmount = amountOf 1000000
+  assertFailureId initialLiquidityError below
+
+  addTreasuryCid <- issueTreasury fixture secondProvider (amountOf 1000000)
+  addStableCid <- issueStable fixture secondProvider (amountOf 1000000)
+  added <- settleAdd setup secondProvider initialized.poolCid addTreasuryCid addStableCid 1000000 1000000
+  atomsOf added.mintedShares === 1000000
+  inputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  swapped <- settleSwap setup fixture.trader added.poolCid TreasuryForStable inputCid 1000 996
+  firstExit <- settleRemove setup fixture.provider swapped.poolCid initialized.positionCid 999999
+  secondExit <- settleRemove setup secondProvider firstExit.poolCid added.positionCid 1000000
+  dust <- checkPool setup secondExit.poolCid
+  (atomsOf dust.treasuryReserve, atomsOf dust.stableReserve, atomsOf dust.totalShares) === (2, 1, lockedSharesAtoms)
+
+  tinyCid <- issueStable fixture fixture.trader (amountOf 1)
+  quote dust StableForTreasury 1 === 0
+  quote dust TreasuryForStable 1 === 0
+  before <- snapshotOf setup secondExit.poolCid
+  disclosure <- poolDisclosure setup secondExit.poolCid
+  deadline <- futureDeadline
+  zeroOut <- trySubmit (actAs fixture.trader <> discloseMany [disclosure]) $
+    swapCommand secondExit.poolCid fixture.trader StableForTreasury tinyCid 1 0 deadline dust.stateVersion
+  assertFailureId insufficientLiquidityError zeroOut
+  assertUnchanged setup secondExit.poolCid before
+
+  reseedTreasuryCid <- issueTreasury fixture secondProvider (amountOf 1000000)
+  reseedStableCid <- issueStable fixture secondProvider (amountOf 1000000)
+  reseeded <- settleAdd setup secondProvider secondExit.poolCid reseedTreasuryCid reseedStableCid 1000000 1000000
+  atomsOf reseeded.mintedShares === 500000
+
+-- MUTATION C, GUARD. Actors: the full core set minting the operator a position for the pool's
+-- entire supply, 7,071,067 shares, one more than every honest entitlement can reach.
+-- Expected: redeeming all of it fails `amm/position` at the locked-share guard; the pool and
+-- every holding are unchanged. Without the guard, the burn would pay out both whole reserves
+-- and the successor's positive-reserve `ensure` would reject it instead.
+-- Guarantee: the locked floor is enforced even against entitlements created outside the
+-- permitted lifecycle; within it, positions never exceed circulating supply.
+lockedShareGuardRejectsOutOfBandOversizedPosition : Script ()
+lockedShareGuardRejectsOutOfBandOversizedPosition = do
+  setup@PoolSetup {fixture, custodian, lineage, charterCid, initialized} <- standardMarket "guard"
+  oversizedCid <- submit (actAs (lineageSignatories lineage)) $ createCmd PoolPosition with
+    lineage
+    genesisCid = charterCid
+    provider = fixture.operator
+    shares = amountOf 7071067
+  drift <- supplyDrift setup initialized.poolCid
+  drift === -7071067
+  Some pool <- queryContractId custodian initialized.poolCid
+  treasuryHoldings <- query @Holding fixture.treasuryIssuer
+  stableHoldings <- query @Holding fixture.stableIssuer
+  totalsBefore <- totalsOf setup
+
+  disclosure <- poolDisclosure setup initialized.poolCid
+  oversized <- trySubmit (actAs fixture.operator <> discloseMany [disclosure]) $
+    exerciseCmd initialized.poolCid RemoveLiquidity with
+      provider = fixture.operator
+      positionCid = oversizedCid
+      burnShares = amountOf 7071067
+      minimumTreasuryOut = 0.0
+      minimumStableOut = 0.0
+      expectedVersion = pool.stateVersion
+  assertFailureId positionError oversized
+
+  Some poolAfter <- queryContractId custodian initialized.poolCid
+  poolAfter === pool
+  treasuryAfter <- query @Holding fixture.treasuryIssuer
+  stableAfter <- query @Holding fixture.stableIssuer
+  (sortOn fst treasuryAfter, sortOn fst stableAfter) === (sortOn fst treasuryHoldings, sortOn fst stableHoldings)
+  totalsAfter <- totalsOf setup
+  totalsAfter === totalsBefore
+
+-- COMPATIBILITY. Swap payouts are production `Holding`s and expose the pinned Token Standard V1
+-- holding view; pool reserves are fields of the pool state, so a standard-holding query by the
+-- issuer sees ordinary holdings only, and the custodian, a pool signatory, sees none.
+-- Guarantee: reserves are invisible to Token Standard wallets and registries; only payouts and
+-- change are standard-visible. Nothing here makes arbitrary standard holdings usable as input.
+poolReservesAreNotTokenStandardHoldings : Script ()
+poolReservesAreNotTokenStandardHoldings = do
+  setup@PoolSetup {fixture, custodian, initialized} <- standardMarket "compat"
+  inputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  swapped <- settleSwap setup fixture.trader initialized.poolCid TreasuryForStable inputCid 1000 1993
+  outputView <- queryInterfaceContractId @TokenStandard.Holding fixture.trader
+    (toInterfaceContractId @TokenStandard.Holding swapped.outputHoldingCid)
+  Some view <- pure outputView
+  (view.owner, view.instrumentId.admin, view.instrumentId.id, atomsOf view.amount)
+    === (fixture.trader, fixture.stableIssuer, "USD", 1993)
+  Some pool <- queryContractId custodian swapped.poolCid
+  issuerViews <- queryInterface @TokenStandard.Holding fixture.stableIssuer
+  let standardStable = sum (map (\(_, optionalView) -> case optionalView of
+        Some holdingView | holdingView.instrumentId.admin == fixture.stableIssuer -> atomsOf holdingView.amount
+        _ -> 0) issuerViews)
+  totals <- totalsOf setup
+  standardStable === totals.stable - atomsOf pool.stableReserve
+  standardStable === 1993
+  custodianViews <- queryInterface @TokenStandard.Holding custodian
+  length custodianViews === 0

@@ -1,45 +1,56 @@
--- PROTOTYPE ONLY. Experimental security model for authenticated pool state and LP entitlements,
--- kept in the test package; it is not a deployed or production design and does not swap.
+-- PROTOTYPE ONLY. Experimental security model for authenticated pool state, LP entitlements and
+-- exact-input swaps, kept in the test package; it is not a deployed or production design.
+-- `PROTOTYPE_SECURITY.md` in this package records the full trust, backing and liveness model.
 --
 -- Why pool reserves are not Stage 1.1 `ProtectedReserve`s: DAML authority belongs to parties,
 -- not contracts. `Release` accepts custodian and operator authority from any source, and the
 -- custodian-signed `ReleaseMandate` supplies exactly that for every matching reserve. A pool that
 -- referenced protected reserves could be drained by a mandate while its accounting still named
 -- them. Here the authenticated pool state is itself the reserve record, and it has no release
--- choice: value leaves only through `RemoveLiquidity`, coupled to burning a genuine position.
+-- choice: value leaves only through `SwapExactInput`, against an accounted input, or through
+-- `RemoveLiquidity`, coupled to burning a genuine position.
 --
--- Lineage and authentication: a `PoolCharter`, every `ProtectedPool` state and every
--- `PoolPosition` are signed by the lineage signatories, the custodian, the operator and both
--- instrument issuers; positions are also signed by their provider. A copied `PoolLineage` value
--- authenticates nothing: what cannot be forged is the signature set, so any strict subset of
--- those parties, such as operator and governance, cannot create, copy or archive pool state or
--- positions. The charter is consumed by `InitializePool`, and each transition consumes the
--- current state and creates exactly one successor, so a lineage has one active state unless the
--- full signatory set deliberately creates another.
+-- Reserve backing: deposits and swap inputs archive the depositor's `Holding`; reserve balances
+-- are then issuer-signed records on the pool state, and payouts are new issuer-signed holdings.
+-- Each instrument's outstanding value is its holdings plus pool reserves, and every choice here
+-- moves value between the two without changing the total. This is issuer-mediated accounting,
+-- not custody of independently issued assets: it requires both issuers as pool signatories.
+--
+-- Authentication and identity: a `PoolCharter`, every `ProtectedPool` state and every
+-- `PoolPosition` need the signatures of the custodian, the operator and both instrument issuers;
+-- positions also need their provider's. No strict subset of those parties can create, copy or
+-- archive them. A signature set is an authorization requirement, not a unique identifier: the
+-- full set can sign any number of pools with identical `PoolLineage` values. Pool states and
+-- positions therefore also carry `genesisCid`, the consumed charter's contract ID, and
+-- redemption requires matching genesis IDs, so positions of distinct initialized pools are not
+-- interchangeable even when their lineage values are equal. The full signatory set can still
+-- copy a genesis ID into a state or position it creates directly; that coalition is trusted.
+-- Within one genesis, each transition consumes the current state and creates one successor.
 --
 -- Delegation: the signatories' authority is granted when they sign the charter and flows only
--- into the bodies of `InitializePool`, `AddLiquidity` and `RemoveLiquidity`. No choice is
--- controlled by the operator, custodian or issuers, and no body moves value except against an
--- accounted deposit or a validated, burned entitlement. The signatories need take no further
--- action, so withdrawals do not depend on custodian discretion; on Canton their hosting
--- participants must still confirm each transaction.
+-- into the bodies of the choices listed below. No choice is controlled by the operator,
+-- custodian or issuers. Inside those bodies the pool's signatories' authority (including both
+-- issuers') is available, so every deposit and swap input is limited to holdings the controlling
+-- party owns by an explicit owner check; that check, not the issuer signature, carries the
+-- owner's consent. The signatories need take no further action, but on Canton their hosting
+-- participants must confirm each transaction.
 --
--- Authorization matrix (prototype templates):
--- * InitializePool: the charter's initial provider only.
--- * AddLiquidity: any provider, using holdings it owns, with the pool disclosed to it.
--- * RemoveLiquidity: the position's own provider only.
--- * Create or archive a charter, pool state or position: all lineage signatories together
---   (plus the provider for a position). Operator, governance, issuer, custodian, operator with
---   governance, operator with custodian, issuers with custodian, traders and outsiders cannot.
--- * Governance only observes pool states. Traders have no choices; swaps are Stage 1.3.
+-- Permitted choice surface (changes need security review; see `PROTOTYPE_SECURITY.md`):
+-- * PoolCharter.InitializePool: the charter's initial provider only, once.
+-- * ProtectedPool.SwapExactInput: any trader, spending a holding it owns.
+-- * ProtectedPool.AddLiquidity: any provider, spending holdings it owns.
+-- * ProtectedPool.RemoveLiquidity: the position's own provider only.
+-- * PoolPosition: no choices. Implicit `Archive` on every template needs all signatories.
+-- * Governance only observes pool states.
 --
--- Trusted: the full lineage signatory set can create arbitrary states and positions; issuers
--- still mint their instruments freely; hosting participants of all signatories must stay
--- available and independently administered.
+-- Trusted: the full core signatory set can create arbitrary states, reserves and positions
+-- (positions with a cooperating provider); issuers still mint their instruments freely; hosting
+-- participants of all signatories must stay available and independently administered.
 module CantonTreasuryAmm.Test.ProtectedPoolPrototype where
 
 import CantonTreasuryAmm.Errors
 import CantonTreasuryAmm.Math
+import CantonTreasuryAmm.Pool (validateSwap)
 import CantonTreasuryAmm.Token
 import CantonTreasuryAmm.Types
 
@@ -80,6 +91,13 @@ data RemoveResult = RemoveResult with
   stablePayoutCid : Optional (ContractId Holding)
   treasuryOut : Decimal
   stableOut : Decimal
+    deriving (Eq, Show)
+
+data SwapResult = SwapResult with
+  poolCid : ContractId ProtectedPool
+  outputHoldingCid : ContractId Holding
+  inputChangeCid : Optional (ContractId Holding)
+  amountOut : Decimal
     deriving (Eq, Show)
 
 -- Retires `atoms` of a holding the depositor owns, returning any change to it. The issuer
@@ -141,6 +159,7 @@ template PoolCharter
         stableChangeCid <- takeDeposit lineage.stableInstrument initialProvider stableHoldingCid stableAtoms
         poolCid <- create ProtectedPool with
           lineage
+          genesisCid = self
           treasuryReserve = treasuryAmount
           stableReserve = stableAmount
           totalShares = amountOf grossShares
@@ -148,6 +167,7 @@ template PoolCharter
           stateVersion = 0
         positionCid <- create PoolPosition with
           lineage
+          genesisCid = self
           provider = initialProvider
           shares = amountOf (grossShares - lockedSharesAtoms)
         pure InitializeResult with poolCid; positionCid; treasuryChangeCid; stableChangeCid
@@ -155,6 +175,7 @@ template PoolCharter
 template ProtectedPool
   with
     lineage : PoolLineage
+    genesisCid : ContractId PoolCharter
     treasuryReserve : Decimal
     stableReserve : Decimal
     totalShares : Decimal
@@ -169,6 +190,53 @@ template ProtectedPool
         && totalShares >= lockedShares
         && totalShares <= maxReserveAmount
         && lockedShares == amountOf lockedSharesAtoms
+
+    -- Pricing and its checks are the production AMM's (`swapOutputAtoms`, `validateSwap`); the
+    -- whole input, fee included, joins the input reserve. Production's reporting-only fee
+    -- counters are not modelled.
+    choice SwapExactInput : SwapResult
+      with
+        trader : Party
+        direction : SwapDirection
+        inputHoldingCid : ContractId Holding
+        inputAmount : Decimal
+        minimumAmountOut : Decimal
+        deadline : Time
+        expectedVersion : Int
+      controller trader
+      do
+        requireState (stateVersion == expectedVersion) staleStateError "Pool state version is stale"
+        now <- getTime
+        requireState (now < deadline) deadlineError "Swap deadline has expired"
+        requireDomain (inputAmount > 0.0 && minimumAmountOut >= 0.0) invalidAmountError
+          "Swap amounts must be positive or zero as required"
+        requireDomain (inputAmount <= maxReserveAmount && minimumAmountOut <= maxReserveAmount) reserveCapError
+          "Swap amount exceeds the atom cap"
+        let inputAtoms = atomsOf inputAmount
+        let treasuryReserveAtoms = atomsOf treasuryReserve
+        let stableReserveAtoms = atomsOf stableReserve
+        let (inputInstrument, outputInstrument, reserveInAtoms, reserveOutAtoms) = case direction of
+              TreasuryForStable -> (lineage.treasuryInstrument, lineage.stableInstrument, treasuryReserveAtoms, stableReserveAtoms)
+              StableForTreasury -> (lineage.stableInstrument, lineage.treasuryInstrument, stableReserveAtoms, treasuryReserveAtoms)
+        requireDomain (reserveInAtoms + inputAtoms <= maxReserveAtoms) reserveCapError "Input reserve would exceed the atom cap"
+        let outputAtoms = swapOutputAtoms reserveInAtoms reserveOutAtoms inputAtoms
+        validateSwap reserveInAtoms reserveOutAtoms inputAtoms outputAtoms (atomsOf minimumAmountOut)
+        inputChangeCid <- takeDeposit inputInstrument trader inputHoldingCid inputAtoms
+        paidCid <- payout outputInstrument trader outputAtoms
+        outputHoldingCid <- case paidCid of
+          Some cid -> pure cid
+          None -> abort "A validated swap pays a positive amount"
+        let nextInAmount = amountOf (reserveInAtoms + inputAtoms)
+        let nextOutAmount = amountOf (reserveOutAtoms - outputAtoms)
+        poolCid <- create this with
+          treasuryReserve = if direction == TreasuryForStable then nextInAmount else nextOutAmount
+          stableReserve = if direction == TreasuryForStable then nextOutAmount else nextInAmount
+          stateVersion = stateVersion + 1
+        pure SwapResult with
+          poolCid
+          outputHoldingCid
+          inputChangeCid
+          amountOut = amountOf outputAtoms
 
     choice AddLiquidity : AddResult
       with
@@ -208,6 +276,7 @@ template ProtectedPool
           stateVersion = stateVersion + 1
         positionCid <- create PoolPosition with
           lineage
+          genesisCid
           provider
           shares = amountOf mintedShareAtoms
         pure AddResult with
@@ -232,6 +301,7 @@ template ProtectedPool
         requireState (stateVersion == expectedVersion) staleStateError "Pool state version is stale"
         position <- fetch positionCid
         requireDomain (position.lineage == lineage) positionError "Position belongs to another pool lineage"
+        requireDomain (position.genesisCid == genesisCid) positionError "Position belongs to another pool instance"
         requireDomain (position.provider == provider) ownerMismatchError "Provider does not own the position"
         requireDomain (burnShares > 0.0 && minimumTreasuryOut >= 0.0 && minimumStableOut >= 0.0) invalidAmountError
           "Removal amounts must be positive or zero as required"
@@ -273,6 +343,7 @@ template ProtectedPool
 template PoolPosition
   with
     lineage : PoolLineage
+    genesisCid : ContractId PoolCharter
     provider : Party
     shares : Decimal
   where

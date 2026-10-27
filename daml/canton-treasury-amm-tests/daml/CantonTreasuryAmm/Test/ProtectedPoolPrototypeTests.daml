@@ -171,7 +171,7 @@ authenticatedPoolIssuesDepositBackedShares = do
   atomsOf genesis.totalShares === 7071067
   genesis.stateVersion === 0
   Some firstPosition <- queryContractId fixture.provider initialized.positionCid
-  firstPosition === PoolPosition with lineage; provider = fixture.provider; shares = amountOf 7071066
+  firstPosition === PoolPosition with lineage; genesisCid = charterCid; provider = fixture.provider; shares = amountOf 7071066
   initialized.treasuryChangeCid === None
   initialized.stableChangeCid === None
   providerHoldings <- query @Holding fixture.provider
@@ -203,7 +203,7 @@ authenticatedPoolIssuesDepositBackedShares = do
   secondHoldings <- query @Holding secondProvider
   map fst secondHoldings === [treasuryChangeCid]
   Some secondPosition <- queryContractId secondProvider added.positionCid
-  secondPosition === PoolPosition with lineage; provider = secondProvider; shares = added.mintedShares
+  secondPosition === PoolPosition with lineage; genesisCid = charterCid; provider = secondProvider; shares = added.mintedShares
 
   predecessor <- queryContractId custodian initialized.poolCid
   predecessor === None
@@ -352,7 +352,7 @@ coalitionCannotForgeOrRedeemEntitlements = do
   setup@PoolSetup {fixture, custodian, lineage, initialized} <- protectedPool "lineage-a"
   (_, otherLineage) <- charterPool fixture custodian "lineage-b"
   before <- snapshot setup initialized.poolCid
-  let forged = PoolPosition with lineage; provider = fixture.governance; shares = amountOf 1000000
+  let forged = PoolPosition with lineage; genesisCid = setup.charterCid; provider = fixture.governance; shares = amountOf 1000000
   coalitionForgery <- trySubmit (actAs [fixture.operator, fixture.governance]) $ createCmd forged
   assertAuthorizationError coalitionForgery
   custodianForgery <- trySubmit (actAs [custodian, fixture.operator]) $ createCmd forged with provider = fixture.operator
