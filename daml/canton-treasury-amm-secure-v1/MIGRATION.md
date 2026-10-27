@@ -6,8 +6,8 @@ no legacy reserve and promises no in-place upgrade. Every step needs its own app
 tooling review and a rehearsal on a non-production network.
 
 **Default: parallel deployment.** The legacy package (`canton-treasury-amm` 0.1.0,
-`d8cadd3c…`) stays deployed and unchanged. Secure V1 (`canton-treasury-amm-secure-v1` 0.1.0,
-`e4546c3f…`) is vetted alongside it as a separate package; see
+`d8cadd3c…`) stays deployed and unchanged. Secure V1 (`canton-treasury-amm-secure-v1` 0.2.0,
+`4abe2905…`) is vetted alongside it as a separate package; see
 [`RELEASE_READINESS.md`](RELEASE_READINESS.md#packaging-and-coexistence). Liquidity moves only
 through each LP's own legacy `RemoveLiquidity` and a fresh Secure V1 deposit. Legacy contracts
 stay bound to the legacy package; nothing converts them.
@@ -145,6 +145,8 @@ The following are not implemented:
 - an onboarding procedure agreed with the custodian and issuers (the workflow itself is in
   [`ONBOARDING.md`](ONBOARDING.md));
 - a legacy withdrawal-window procedure;
-- a Secure V1 pause (see [`SECURITY.md`](SECURITY.md#emergency-stop-and-recovery-design));
+- an operational procedure for using the Secure V1 pause (the mechanism is in
+  [`PAUSE.md`](PAUSE.md)) and for permanent signer loss (decisions listed in
+  [`PAUSE.md`](PAUSE.md#permanent-signer-loss));
 - a decision on legacy dust;
 - a rehearsal on a non-production network.

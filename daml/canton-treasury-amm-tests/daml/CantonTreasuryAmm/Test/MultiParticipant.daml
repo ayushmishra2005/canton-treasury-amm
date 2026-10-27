@@ -4,7 +4,8 @@
 --
 -- A Canton submission must come from a participant hosting every `actAs` party, so every
 -- multi-signatory step goes through the production workflows of
--- `CantonTreasuryAmm.SecureV1.Onboarding`, each signer submitting from its own participant.
+-- `CantonTreasuryAmm.SecureV1.Onboarding` and `CantonTreasuryAmm.SecureV1.Pause`, each signer
+-- submitting from its own participant.
 -- `GovernanceProxy` below is an attack fixture, not an approval mechanism.
 module CantonTreasuryAmm.Test.MultiParticipant where
 
@@ -20,9 +21,11 @@ import Daml.Script
 import CantonTreasuryAmm.Errors
 import CantonTreasuryAmm.SecureV1.Errors
 import CantonTreasuryAmm.SecureV1.Onboarding
+import CantonTreasuryAmm.SecureV1.Pause
 import CantonTreasuryAmm.SecureV1.Pool
 import CantonTreasuryAmm.SecureV1.SwapIntent
 import CantonTreasuryAmm.Test.Fixtures
+import CantonTreasuryAmm.Test.ProtectedPoolPrototypeTests qualified as Prototype
 import CantonTreasuryAmm.Test.ProtectedPoolSettlementTests qualified as Settlement
 import CantonTreasuryAmm.Test.SecureV1Attacks (assertInvisibleActive)
 import CantonTreasuryAmm.Test.SecureV1Support
@@ -899,11 +902,286 @@ mpOfflineSwap outage = do
 
 -- PHASE 8. After reconnecting the stablecoin issuer's participant, the same swap settles and the
 -- same proposal finalizes into exactly its charter.
-mpReconnectedSwap : MpLiveness -> Script ()
+mpReconnectedSwap : MpLiveness -> Script MpState
 mpReconnectedSwap liveness = do
   let outage = liveness.outage
   let market = marketOf outage.state
-  _ <- mpSwap market outage.state.poolCid liveness.inputCid 1000 1993
+  swapped <- mpSwap market outage.state.poolCid liveness.inputCid 1000 1993
   debug "LIVENESS swap after reconnecting the stablecoin issuer's participant: PASS"
   _ <- mpFinalize outage.state.parties outage.terms outage.proposalCid
   debug "LIVENESS finalization after reconnecting the stablecoin issuer's participant: PASS"
+  pure outage.state with poolCid = swapped.poolCid
+
+-- The paused pool after PHASE 9, the provider's position still to be redeemed in full, and a
+-- resume proposal every core signer has approved for exactly that paused state.
+data MpPaused = MpPaused with
+  state : MpState
+  pausedPoolCid : ContractId SecurePausedPool
+  depositPositionCid : ContractId SecureLiquidityPosition
+  resumeTerms : SecureResumeTerms
+  resumeProposalCid : ContractId SecureResumeProposal
+    deriving (Eq, Show)
+
+-- One core signer approves a pause or resume on its own participant; the successor carries the
+-- same terms and exactly the previous signatures plus the approver's.
+mpApprovePause : MpParties -> Party -> SecurePauseTerms -> ContractId SecurePauseProposal -> Script (ContractId SecurePauseProposal)
+mpApprovePause parties approver terms proposalCid = do
+  Some proposal <- queryContractId approver proposalCid
+  nextCid <- submit approver $ exerciseCmd proposalCid ApprovePause with approver; expectedTerms = terms
+  awaitActive (coreParties parties) nextCid
+  awaitArchived (coreParties parties) proposalCid
+  Some next <- queryContractId parties.operator nextCid
+  next === SecurePauseProposal with terms; approvals = proposal.approvals ++ [approver]
+  pure nextCid
+
+mpApproveResume : MpParties -> Party -> SecureResumeTerms -> ContractId SecureResumeProposal -> Script (ContractId SecureResumeProposal)
+mpApproveResume parties approver terms proposalCid = do
+  Some proposal <- queryContractId approver proposalCid
+  nextCid <- submit approver $ exerciseCmd proposalCid ApproveResume with approver; expectedTerms = terms
+  awaitActive (coreParties parties) nextCid
+  awaitArchived (coreParties parties) proposalCid
+  Some next <- queryContractId parties.operator nextCid
+  next === SecureResumeProposal with terms; approvals = proposal.approvals ++ [approver]
+  pure nextCid
+
+-- The operator proposes on its participant; the Treasury issuer, the stablecoin issuer and the
+-- custodian each approve on their own.
+mpCollectResume : MpParties -> SecureResumeTerms -> Script (ContractId SecureResumeProposal)
+mpCollectResume parties terms = do
+  proposalCid <- submit parties.operator $ createCmd SecureResumeProposal with terms; approvals = [parties.operator]
+  awaitActive (coreParties parties) proposalCid
+  mpApproveResume parties parties.treasuryIssuer terms proposalCid
+    >>= mpApproveResume parties parties.stableIssuer terms
+    >>= mpApproveResume parties parties.custodian terms
+
+-- A paused-pool withdrawal from the provider's participant, checked on every participant that
+-- sees the paused state: exact payouts, successor version, supply, unchanged fee counters and
+-- totals, and the position remainder.
+mpPausedRemove : SecureMarket -> ContractId SecurePausedPool -> ContractId SecureLiquidityPosition -> Int -> Int -> Int -> Script SecurePausedRemoveLiquidityResult
+mpPausedRemove market pausedPoolCid positionCid burnAtoms expectedTreasury expectedStable = do
+  let provider = market.fixture.provider
+  (pool, treasuryReserve, stableReserve) <- checkPausedPool market pausedPoolCid
+  Some position <- queryContractId provider positionCid
+  totals <- totalsOf market
+  treasuryHeld <- holdingAtoms provider market.lineage.treasuryInstrument
+  stableHeld <- holdingAtoms provider market.lineage.stableInstrument
+  disclosures <- pausedDisclosures market pausedPoolCid
+  result <- submit (actAs provider <> discloseMany disclosures) $ exerciseCmd pausedPoolCid RemovePausedLiquidity with
+    provider
+    positionCid
+    burnShares = amountOf burnAtoms
+    minimumTreasuryOut = amountOf expectedTreasury
+    minimumStableOut = amountOf expectedStable
+    expectedVersion = pool.stateVersion
+  awaitActive (poolReaders market) result.poolCid
+  awaitArchived (poolReaders market) pausedPoolCid
+  (result.treasuryOut, result.stableOut) === (amountOf expectedTreasury, amountOf expectedStable)
+  (next, nextTreasury, nextStable) <- checkPausedPool market result.poolCid
+  (atomsOf nextTreasury.amount, atomsOf nextStable.amount)
+    === (atomsOf treasuryReserve.amount - expectedTreasury, atomsOf stableReserve.amount - expectedStable)
+  atomsOf next.totalShares === atomsOf pool.totalShares - burnAtoms
+  (next.treasuryFeeAmount, next.stableFeeAmount, next.stateVersion)
+    === (pool.treasuryFeeAmount, pool.stableFeeAmount, pool.stateVersion + 1)
+  case result.remainingPositionCid of
+    Some remainingCid -> do
+      awaitActive [provider] remainingCid
+      Some remaining <- queryContractId provider remainingCid
+      atomsOf remaining.shares === atomsOf position.shares - burnAtoms
+    None -> atomsOf position.shares === burnAtoms
+  assertArchived provider positionCid
+  holdingAtoms provider market.lineage.treasuryInstrument >>= (=== treasuryHeld + expectedTreasury)
+  holdingAtoms provider market.lineage.stableInstrument >>= (=== stableHeld + expectedStable)
+  totalsOf market >>= (=== totals)
+  pure result
+
+-- PHASE 9. Pause, each core signer approving on its own participant. Wrong approvals first: the
+-- operator approving in the Treasury issuer's name, governance approving, an approval of other
+-- terms, finalization with three approvals; then the four independent approvals, a replayed and
+-- a repeated approval, and the pause. While paused: swaps and a deposit on the consumed active
+-- state and on the paused state as a `SecurePool` reference are rejected, and the provider's
+-- partial withdrawal settles. Ends with a fully approved resume of the current paused state.
+mpPauseLifecycle : MpState -> Script MpPaused
+mpPauseLifecycle state = do
+  let parties = state.parties
+  let market = marketOf state
+  (pool, _, _) <- checkSecurePool market state.poolCid
+  (atomsOf pool.treasuryReserveAmount, atomsOf pool.stableReserveAmount, atomsOf pool.totalShares)
+    === (5251004, 10497816, 7424550)
+  activeDisclosures <- secureDisclosures market state.poolCid
+  expiresAt <- futureDeadline
+  let terms = pauseTermsFor market state.poolCid pool.stateVersion expiresAt
+  let approveCmd approver expectedTerms proposalCid =
+        exerciseCmd proposalCid ApprovePause with approver; expectedTerms
+  proposal0 <- submit parties.operator $ createCmd SecurePauseProposal with terms; approvals = [parties.operator]
+  awaitActive (coreParties parties) proposal0
+  disclosed0 <- disclosureOf parties.operator proposal0
+  mpRejects parties market assertAuthorizationError $ trySubmit parties.operator $
+    approveCmd parties.treasuryIssuer terms proposal0
+  mpRejects parties market (assertFailureId lifecycleApproverError) $
+    trySubmit (actAs parties.governance <> discloseMany [disclosed0]) $ approveCmd parties.governance terms proposal0
+  mpRejects parties market (assertFailureId lifecycleTermsError) $ trySubmit parties.custodian $
+    approveCmd parties.custodian (terms with expectedVersion = pool.stateVersion - 1) proposal0
+  mpRejects parties market assertAuthorizationError $ trySubmit parties.governance $
+    createCmd SecurePauseProposal with terms; approvals = coreParties parties
+  proposal1 <- mpApprovePause parties parties.treasuryIssuer terms proposal0
+  proposal2 <- mpApprovePause parties parties.stableIssuer terms proposal1
+  mpRejects parties market (assertFailureId lifecycleIncompleteError) $ trySubmit parties.operator $
+    exerciseCmd proposal2 FinalizePause with finalizer = parties.operator; expectedTerms = terms
+  mpRejects parties market (Settlement.assertConsumedAmong [show proposal1]) $ trySubmit parties.stableIssuer $
+    approveCmd parties.stableIssuer terms proposal1
+  mpRejects parties market (assertFailureId lifecycleApproverError) $ trySubmit parties.stableIssuer $
+    approveCmd parties.stableIssuer terms proposal2
+  debug "PAUSE wrong, impersonated, replayed and incomplete approvals rejected: PASS"
+
+  proposal3 <- mpApprovePause parties parties.custodian terms proposal2
+  pausedCid <- submit parties.operator $ exerciseCmd proposal3 FinalizePause with finalizer = parties.operator; expectedTerms = terms
+  awaitActive (poolReaders market) pausedCid
+  awaitArchived (poolReaders market) state.poolCid
+  awaitArchived (coreParties parties) proposal3
+  forA_ (poolReaders market) $ \reader -> do
+    Some seen <- queryContractId reader pausedCid
+    seen === pausedStateOf pool
+  _ <- checkPausedPool market pausedCid
+  mpRejects parties market (Settlement.assertConsumedAmong [show proposal3]) $ trySubmit parties.operator $
+    exerciseCmd proposal3 FinalizePause with finalizer = parties.operator; expectedTerms = terms
+  debug "PAUSE independent approvals from four participants and finalization: PASS"
+
+  pausedDisclosed <- pausedDisclosures market pausedCid
+  let asActive = coerceContractId @SecurePausedPool @SecurePool pausedCid
+  deadline <- futureDeadline
+  swapInput <- issue market state.lineage.treasuryInstrument parties.trader 1000
+  depositTreasury <- issue market state.lineage.treasuryInstrument parties.provider 500000
+  depositStable <- issue market state.lineage.stableInstrument parties.provider 1000000
+  mpRejects parties market (Settlement.assertConsumedAmong [show state.poolCid]) $
+    trySubmit (actAs parties.trader <> discloseMany activeDisclosures) $
+      swapCommand state.poolCid parties.trader TreasuryForStable swapInput 1000 0 deadline pool.stateVersion
+  mpRejects parties market Prototype.assertWronglyTyped $
+    trySubmit (actAs parties.trader <> discloseMany pausedDisclosed) $
+      swapCommand asActive parties.trader TreasuryForStable swapInput 1000 0 deadline (pool.stateVersion + 1)
+  debug "PAUSE trading blocked: PASS"
+  let addCmd target version = exerciseCmd target AddLiquidity with
+        provider = parties.provider
+        treasuryHoldingCid = depositTreasury
+        stableHoldingCid = depositStable
+        maximumTreasury = amountOf 500000
+        maximumStable = amountOf 1000000
+        minimumShares = 0.0
+        expectedVersion = version
+  mpRejects parties market (Settlement.assertConsumedAmong [show state.poolCid]) $
+    trySubmit (actAs parties.provider <> discloseMany activeDisclosures) $ addCmd state.poolCid pool.stateVersion
+  mpRejects parties market Prototype.assertWronglyTyped $
+    trySubmit (actAs parties.provider <> discloseMany pausedDisclosed) $ addCmd asActive (pool.stateVersion + 1)
+  debug "PAUSE deposits blocked: PASS"
+
+  partial <- mpPausedRemove market pausedCid state.initialized.positionCid 1000000 707248 1413932
+  positions <- query @SecureLiquidityPosition parties.provider
+  [depositPositionCid] <- pure
+    [ cid | (cid, position) <- positions
+    , position.genesisCid == state.charterCid
+    , Some cid /= partial.remainingPositionCid ]
+  Some depositPosition <- queryContractId parties.provider depositPositionCid
+  atomsOf depositPosition.shares === 353483
+  debug "PAUSE provider's partial withdrawal while paused: PASS"
+
+  (paused, _, _) <- checkPausedPool market partial.poolCid
+  let resumeTerms = resumeTermsFor market partial.poolCid paused.stateVersion expiresAt
+  resumeProposalCid <- mpCollectResume parties resumeTerms
+  pure MpPaused with state; pausedPoolCid = partial.poolCid; depositPositionCid; resumeTerms; resumeProposalCid
+
+-- PHASE 10. With the stablecoin issuer's participant disconnected, the provider's full withdrawal
+-- and the finalization of the fully approved resume are attempted. Every payout re-signs the
+-- reserves, which needs the stablecoin issuer's confirmation, so neither may commit: an offline
+-- core signer blocks LP exits from a paused pool exactly as it blocks trading. Nothing changes.
+mpOfflinePausedExit : MpPaused -> Script MpPaused
+mpOfflinePausedExit pausedState = do
+  let state = pausedState.state
+  let market = marketOf state
+  let parties = state.parties
+  (paused, treasuryReserve, stableReserve) <- checkPausedPool market pausedState.pausedPoolCid
+  disclosures <- pausedDisclosures market pausedState.pausedPoolCid
+  let timedOut label result = case result of
+        Left err@UnknownError {unknownErrorMessage}
+          | "MEDIATOR_SAYS_TX_TIMED_OUT" `isInfixOf` unknownErrorMessage ->
+            debug ("LIVENESS paused " <> label <> " with the stablecoin issuer's participant disconnected rejected: " <> show err)
+        Left err -> abort ("The offline paused " <> label <> " failed for another reason: " <> show err)
+        Right _ -> abort ("A paused " <> label <> " committed while the stablecoin issuer's participant was disconnected")
+  exitResult <- trySubmit (actAs parties.provider <> discloseMany disclosures) $
+    exerciseCmd pausedState.pausedPoolCid RemovePausedLiquidity with
+      provider = parties.provider
+      positionCid = pausedState.depositPositionCid
+      burnShares = amountOf 353483
+      minimumTreasuryOut = 0.0
+      minimumStableOut = 0.0
+      expectedVersion = paused.stateVersion
+  timedOut "LP withdrawal" exitResult
+  resumeResult <- trySubmit parties.operator $ exerciseCmd pausedState.resumeProposalCid FinalizeResume with
+    finalizer = parties.operator
+    expectedTerms = pausedState.resumeTerms
+  timedOut "resume" resumeResult
+  forA_ [parties.custodian, parties.operator, parties.governance, parties.treasuryIssuer, parties.auditor] $ \reader -> do
+    Some seen <- queryContractId reader pausedState.pausedPoolCid
+    seen === paused
+    pools <- query @SecurePool reader
+    [() | (_, pool) <- pools, pool.genesisCid == state.charterCid] === []
+  Some currentTreasury <- queryContractId parties.custodian paused.treasuryReserveCid
+  Some currentStable <- queryContractId parties.custodian paused.stableReserveCid
+  (currentTreasury, currentStable) === (treasuryReserve, stableReserve)
+  position <- queryContractId parties.provider pausedState.depositPositionCid
+  assertMsg "The provider's position was consumed by a withdrawal that did not commit" (isSome position)
+  proposal <- queryContractId parties.operator pausedState.resumeProposalCid
+  assertMsg "The resume proposal was consumed by a resume that did not commit" (isSome proposal)
+  pure pausedState
+
+-- PHASE 11. After reconnecting: the same full withdrawal settles; the resume approved for the
+-- replaced paused state is rejected as consumed; a fresh four-participant resume restores the
+-- pool with every field carried over; replayed and governance approvals are rejected; a swap
+-- settles on the resumed pool and the pre-pause state stays unusable.
+mpResumeAfterOutage : MpPaused -> Script ()
+mpResumeAfterOutage pausedState = do
+  let state = pausedState.state
+  let market = marketOf state
+  let parties = state.parties
+  exit <- mpPausedRemove market pausedState.pausedPoolCid pausedState.depositPositionCid 353483 250000 499801
+  exit.remainingPositionCid === None
+  debug "LIVENESS paused LP withdrawal after reconnecting the stablecoin issuer's participant: PASS"
+  (paused, _, _) <- checkPausedPool market exit.poolCid
+  (atomsOf paused.treasuryReserveAmount, atomsOf paused.stableReserveAmount, atomsOf paused.totalShares)
+    === (4293756, 8584083, 6071067)
+  mpRejects parties market (Settlement.assertConsumedAmong [show pausedState.pausedPoolCid]) $ trySubmit parties.operator $
+    exerciseCmd pausedState.resumeProposalCid FinalizeResume with finalizer = parties.operator; expectedTerms = pausedState.resumeTerms
+  submit parties.custodian $ exerciseCmd pausedState.resumeProposalCid CancelResume with canceller = parties.custodian
+  awaitArchived (coreParties parties) pausedState.resumeProposalCid
+  debug "PAUSE resume approved for a replaced paused state rejected: PASS"
+
+  expiresAt <- futureDeadline
+  let terms = resumeTermsFor market exit.poolCid paused.stateVersion expiresAt
+  proposalCid <- mpCollectResume parties terms
+  disclosed <- disclosureOf parties.operator proposalCid
+  mpRejects parties market (assertFailureId lifecycleApproverError) $
+    trySubmit (actAs parties.governance <> discloseMany [disclosed]) $
+      exerciseCmd proposalCid ApproveResume with approver = parties.governance; expectedTerms = terms
+  mpRejects parties market (assertFailureId lifecycleApproverError) $ trySubmit parties.custodian $
+    exerciseCmd proposalCid ApproveResume with approver = parties.custodian; expectedTerms = terms
+  resumedCid <- submit parties.operator $ exerciseCmd proposalCid FinalizeResume with finalizer = parties.operator; expectedTerms = terms
+  awaitActive (poolReaders market) resumedCid
+  awaitArchived (poolReaders market) exit.poolCid
+  forA_ (poolReaders market) $ \reader -> do
+    Some seen <- queryContractId reader resumedCid
+    seen === activeStateOf paused
+  _ <- checkSecurePool market resumedCid
+  mpRejects parties market (Settlement.assertConsumedAmong [show proposalCid]) $ trySubmit parties.operator $
+    exerciseCmd proposalCid FinalizeResume with finalizer = parties.operator; expectedTerms = terms
+  debug "PAUSE resume from four participants, replayed and governance approvals rejected: PASS"
+
+  inputCid <- issue market state.lineage.treasuryInstrument parties.trader 1000
+  traded <- mpSwap market resumedCid inputCid 1000 1992
+  (next, _, _) <- checkSecurePool market traded.poolCid
+  (atomsOf next.treasuryReserveAmount, atomsOf next.stableReserveAmount, atomsOf next.totalShares)
+    === (4294756, 8582091, 6071067)
+  staleDisclosures <- secureDisclosures market traded.poolCid
+  staleInput <- issue market state.lineage.treasuryInstrument parties.trader 1000
+  deadline <- futureDeadline
+  mpRejects parties market (assertFailureId staleStateError) $
+    trySubmit (actAs parties.trader <> discloseMany staleDisclosures) $
+      swapCommand traded.poolCid parties.trader TreasuryForStable staleInput 1000 0 deadline paused.stateVersion
+  debug "PAUSE swap after resume settles and the pre-resume version is rejected: PASS"

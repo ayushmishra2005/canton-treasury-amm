@@ -13,3 +13,12 @@ onboardingApproverError = "amm/onboarding-approver"
 
 onboardingIncompleteError : Text
 onboardingIncompleteError = "amm/onboarding-incomplete"
+
+lifecycleTermsError : Text
+lifecycleTermsError = "amm/lifecycle-terms"
+
+lifecycleApproverError : Text
+lifecycleApproverError = "amm/lifecycle-approver"
+
+lifecycleIncompleteError : Text
+lifecycleIncompleteError = "amm/lifecycle-incomplete"

@@ -4,6 +4,8 @@
 # output directory. Local only: it starts its own nodes on ports 15001-15083 and connects to
 # nothing else. Run after `dpm build --all`. Exits non-zero on any failed phase.
 set -euo pipefail
+# The SDK every daml.yaml pins; outside a package directory dpm would resolve its own default.
+export DPM_SDK_VERSION=3.5.5
 
 cd "$(dirname "$0")/.."
 
@@ -18,7 +20,7 @@ echo "Logs: $out"
 [ -f "$dar" ] || { echo "Missing $dar; run dpm build --all first" >&2; exit 1; }
 java -jar "$canton_jar" --version > "$out/versions.txt"
 dpm version >> "$out/versions.txt"
-shasum -a 256 "$dar" ../canton-treasury-amm/.daml/dist/*.dar ../canton-treasury-amm-secure-v1/.daml/dist/*.dar >> "$out/versions.txt"
+shasum -a 256 "$dar" ../canton-treasury-amm/.daml/dist/canton-treasury-amm-0.1.0.dar ../canton-treasury-amm-secure-v1/.daml/dist/canton-treasury-amm-secure-v1-0.2.0.dar >> "$out/versions.txt"
 
 AMM_TEST_DAR="$PWD/$dar" java -jar "$canton_jar" daemon --no-tty \
   -c multi-participant/canton.conf \
@@ -117,5 +119,11 @@ run_script mpOfflineSwap participants-hosted.json "$out/outage.json" liveness.js
 set_stable_issuer_connection reconnect
 run_script mpReconnectedSwap participants-hosted.json "$out/liveness.json" reconnected.json
 
-grep -h "HOSTING\|SCENARIO\|IMPERSONATION\|ONBOARDING\|LIVENESS" "$out"/mp*.log
+run_script mpPauseLifecycle participants-hosted.json "$out/reconnected.json" paused.json
+set_stable_issuer_connection disconnect
+run_script mpOfflinePausedExit participants-hosted.json "$out/paused.json" paused-outage.json
+set_stable_issuer_connection reconnect
+run_script mpResumeAfterOutage participants-hosted.json "$out/paused-outage.json" resumed.json
+
+grep -h "HOSTING\|SCENARIO\|IMPERSONATION\|ONBOARDING\|LIVENESS\|PAUSE" "$out"/mp*.log
 echo "Multi-participant validation passed."

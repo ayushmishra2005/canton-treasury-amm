@@ -4,6 +4,7 @@
 -- deployable production package.
 module CantonTreasuryAmm.Test.SecureV1Adversary where
 
+import CantonTreasuryAmm.SecureV1.Pause
 import CantonTreasuryAmm.SecureV1.Pool
 import CantonTreasuryAmm.Token
 import CantonTreasuryAmm.Types
@@ -128,4 +129,93 @@ template LateFailureProbe
           minimumAmountOut = maxReserveAmount
           deadline
           expectedVersion = expectedVersion + 1
+        pure ()
+
+-- Signed by an LP alone: settles a genuine paused-pool withdrawal, then a second withdrawal from
+-- its successor with an unreachable minimum in the same transaction.
+template PausedExitProbe
+  with
+    provider : Party
+  where
+    signatory provider
+
+    nonconsuming choice ExitThenFail : ()
+      with
+        pausedPoolCid : ContractId SecurePausedPool
+        positionCid : ContractId SecureLiquidityPosition
+        burnShares : Decimal
+        expectedVersion : Int
+      controller provider
+      do
+        first <- exercise pausedPoolCid RemovePausedLiquidity with
+          provider
+          positionCid
+          burnShares
+          minimumTreasuryOut = 0.0
+          minimumStableOut = 0.0
+          expectedVersion
+        Some remainingCid <- pure first.remainingPositionCid
+        _ <- exercise first.poolCid RemovePausedLiquidity with
+          provider
+          positionCid = remainingCid
+          burnShares
+          minimumTreasuryOut = maxReserveAmount
+          minimumStableOut = 0.0
+          expectedVersion = expectedVersion + 1
+        pure ()
+
+-- Signed by a core finalizer and an LP: finalizes a fully approved pause, then attempts a paused
+-- withdrawal with an unreachable minimum in the same transaction.
+template PauseThenFailProbe
+  with
+    finalizer : Party
+    provider : Party
+  where
+    signatory finalizer, provider
+
+    nonconsuming choice PauseThenFail : ()
+      with
+        proposalCid : ContractId SecurePauseProposal
+        terms : SecurePauseTerms
+        positionCid : ContractId SecureLiquidityPosition
+        burnShares : Decimal
+      controller finalizer
+      do
+        pausedPoolCid <- exercise proposalCid FinalizePause with finalizer; expectedTerms = terms
+        _ <- exercise pausedPoolCid RemovePausedLiquidity with
+          provider
+          positionCid
+          burnShares
+          minimumTreasuryOut = maxReserveAmount
+          minimumStableOut = 0.0
+          expectedVersion = terms.expectedVersion + 1
+        pure ()
+
+-- Signed by a core finalizer and a trader: finalizes a fully approved resume, then attempts a
+-- swap with an unreachable minimum in the same transaction.
+template ResumeThenFailProbe
+  with
+    finalizer : Party
+    trader : Party
+  where
+    signatory finalizer, trader
+
+    nonconsuming choice ResumeThenFail : ()
+      with
+        proposalCid : ContractId SecureResumeProposal
+        terms : SecureResumeTerms
+        inputHoldingCid : ContractId Holding
+        inputAmount : Decimal
+        deadline : Time
+      controller finalizer
+      do
+        poolCid <- exercise proposalCid FinalizeResume with finalizer; expectedTerms = terms
+        _ <- exercise poolCid SwapExactInput with
+          trader
+          direction = TreasuryForStable
+          inputHoldingCid
+          inputAmount
+          minimumAmountOut = maxReserveAmount
+          deadline
+          expectedVersion = terms.expectedVersion + 1
         pure ()

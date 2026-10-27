@@ -1,0 +1,266 @@
+-- Pause and resume for Secure V1 pools. A paused pool is a separate template, `SecurePausedPool`,
+-- with exactly the active state's fields, signatories and observers. Its only economic choice is
+-- `RemovePausedLiquidity`, which runs the same validation and redemption code as the active
+-- `RemoveLiquidity`; it has no swap, deposit or intent path, so trading and new liquidity are
+-- impossible by type while paused, and the consumed active state cannot be replayed.
+--
+-- Transitions need every core signer. `SecurePauseProposal` and `SecureResumeProposal` collect
+-- the four signatures one participant at a time, as in `CantonTreasuryAmm.SecureV1.Onboarding`,
+-- for terms that fix the lineage, the genesis, the exact state contract, its expected version
+-- and an expiry. Finalization archives that state and creates its counterpart with identical
+-- reserves, amounts, supply, locked share, fee counters and observers, and the version plus one.
+-- No reserve moves, no position changes and no LP share is minted or burnt by a transition.
+--
+-- Liveness: pause needs every core signer, and so does every withdrawal while paused, because
+-- each payout re-signs the reserves. Pause does not help when a core signer is unavailable, and
+-- the full core coalition remains trusted: together it can still archive or create any pool
+-- state or reserve directly. `SECURE_V1.md` records the limits.
+module CantonTreasuryAmm.SecureV1.Pause where
+
+import DA.List (sort, unique)
+
+import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.SecureV1.Errors
+import CantonTreasuryAmm.SecureV1.Pool
+import CantonTreasuryAmm.Token
+import CantonTreasuryAmm.Types
+
+data SecurePausedRemoveLiquidityResult = SecurePausedRemoveLiquidityResult with
+    poolCid : ContractId SecurePausedPool
+    remainingPositionCid : Optional (ContractId SecureLiquidityPosition)
+    treasuryOutputHoldingCid : Optional (ContractId Holding)
+    stableOutputHoldingCid : Optional (ContractId Holding)
+    treasuryOut : Decimal
+    stableOut : Decimal
+  deriving (Eq, Show)
+
+template SecurePausedPool
+  with
+    lineage : SecureLineage
+    genesisCid : ContractId SecurePoolCharter
+    auditors : [Party]
+    treasuryReserveCid : ContractId SecureReserveHolding
+    stableReserveCid : ContractId SecureReserveHolding
+    treasuryReserveAmount : Decimal
+    stableReserveAmount : Decimal
+    totalShares : Decimal
+    lockedShares : Decimal
+    treasuryFeeAmount : Decimal
+    stableFeeAmount : Decimal
+    stateVersion : Int
+  where
+    signatory coreSignatories lineage
+    observer lineage.governance, auditors
+    ensure
+      isPositiveCapped treasuryReserveAmount
+        && isPositiveCapped stableReserveAmount
+        && totalShares >= lockedShares
+        && totalShares <= maxReserveAmount
+        && lockedShares == amountOf lockedSharesAtoms
+        && isNonNegativeCapped treasuryFeeAmount
+        && isNonNegativeCapped stableFeeAmount
+        && secureLineageIsIndependent lineage
+
+    -- The active `RemoveLiquidity`, against the paused state: same checks, same pro-rata
+    -- rounding, same position handling, and the successor stays paused.
+    choice RemovePausedLiquidity : SecurePausedRemoveLiquidityResult
+      with
+        provider : Party
+        positionCid : ContractId SecureLiquidityPosition
+        burnShares : Decimal
+        minimumTreasuryOut : Decimal
+        minimumStableOut : Decimal
+        expectedVersion : Int
+      controller provider
+      do
+        let accounts = pausedAccountsOf this
+        (treasuryReserve, stableReserve) <- validatePoolAccounts accounts expectedVersion
+        redemption <- redeemPosition accounts treasuryReserve stableReserve provider positionCid
+          burnShares minimumTreasuryOut minimumStableOut
+        poolCid <- create this with
+          treasuryReserveCid = redemption.nextTreasuryReserveCid
+          stableReserveCid = redemption.nextStableReserveCid
+          treasuryReserveAmount = redemption.nextTreasuryReserveAmount
+          stableReserveAmount = redemption.nextStableReserveAmount
+          totalShares = redemption.nextTotalShares
+          stateVersion = stateVersion + 1
+        pure SecurePausedRemoveLiquidityResult with
+          poolCid
+          remainingPositionCid = redemption.remainingPositionCid
+          treasuryOutputHoldingCid = redemption.treasuryOutputHoldingCid
+          stableOutputHoldingCid = redemption.stableOutputHoldingCid
+          treasuryOut = redemption.treasuryOut
+          stableOut = redemption.stableOut
+
+pausedAccountsOf : SecurePausedPool -> SecurePoolAccounts
+pausedAccountsOf pool = SecurePoolAccounts with
+  lineage = pool.lineage
+  genesisCid = pool.genesisCid
+  treasuryReserveCid = pool.treasuryReserveCid
+  stableReserveCid = pool.stableReserveCid
+  treasuryReserveAmount = pool.treasuryReserveAmount
+  stableReserveAmount = pool.stableReserveAmount
+  totalShares = pool.totalShares
+  lockedShares = pool.lockedShares
+  stateVersion = pool.stateVersion
+
+-- Everything a core signer approves for a pause: this genesis's active state `poolCid` at
+-- exactly `expectedVersion`. Any settlement in between consumes `poolCid` and voids the
+-- proposal.
+data SecurePauseTerms = SecurePauseTerms with
+    lineage : SecureLineage
+    genesisCid : ContractId SecurePoolCharter
+    poolCid : ContractId SecurePool
+    expectedVersion : Int
+    expiresAt : Time
+  deriving (Eq, Show)
+
+data SecureResumeTerms = SecureResumeTerms with
+    lineage : SecureLineage
+    genesisCid : ContractId SecurePoolCharter
+    pausedPoolCid : ContractId SecurePausedPool
+    expectedVersion : Int
+    expiresAt : Time
+  deriving (Eq, Show)
+
+-- Signed by exactly the core signers that have approved, the proposer first.
+lifecycleApprovalsValid : SecureLineage -> [Party] -> Bool
+lifecycleApprovalsValid lineage approvals =
+  secureLineageIsIndependent lineage
+    && not (null approvals)
+    && unique approvals
+    && all (`elem` coreSignatories lineage) approvals
+
+requireLifecycleApproval : SecureLineage -> [Party] -> Party -> Time -> Bool -> Update ()
+requireLifecycleApproval lineage approvals approver expiresAt termsMatch = do
+  requireDomain termsMatch lifecycleTermsError "Lifecycle terms differ from the approved terms"
+  requireDomain (approver `elem` coreSignatories lineage && approver `notElem` approvals)
+    lifecycleApproverError "Approver is not a core signer that has yet to approve"
+  requireUnexpired expiresAt
+
+requireLifecycleFinalization : SecureLineage -> [Party] -> Party -> Time -> Bool -> Update ()
+requireLifecycleFinalization lineage approvals finalizer expiresAt termsMatch = do
+  requireDomain termsMatch lifecycleTermsError "Lifecycle terms differ from the finalized terms"
+  requireDomain (finalizer `elem` coreSignatories lineage)
+    lifecycleApproverError "Only a core signer can finalize"
+  requireState (sort approvals == sort (coreSignatories lineage))
+    lifecycleIncompleteError "Every core signer must approve before finalization"
+  requireUnexpired expiresAt
+
+requireLifecycleCanceller : SecureLineage -> Party -> Update ()
+requireLifecycleCanceller lineage canceller =
+  requireDomain (canceller `elem` coreSignatories lineage)
+    lifecycleApproverError "Only a core signer can cancel the proposal"
+
+requireUnexpired : Time -> Update ()
+requireUnexpired expiresAt = do
+  now <- getTime
+  requireState (now < expiresAt) deadlineError "Proposal has expired"
+
+requireStateOf : SecureLineage -> ContractId SecurePoolCharter -> SecurePoolAccounts -> Update ()
+requireStateOf lineage genesisCid accounts =
+  requireState (accounts.lineage == lineage && accounts.genesisCid == genesisCid)
+    poolMismatchError "Pool state belongs to another pool"
+
+template SecurePauseProposal
+  with
+    terms : SecurePauseTerms
+    approvals : [Party]
+  where
+    signatory approvals
+    observer coreSignatories terms.lineage
+    ensure lifecycleApprovalsValid terms.lineage approvals
+
+    choice ApprovePause : ContractId SecurePauseProposal
+      with
+        approver : Party
+        expectedTerms : SecurePauseTerms
+      controller approver
+      do
+        requireLifecycleApproval terms.lineage approvals approver terms.expiresAt (expectedTerms == terms)
+        create this with approvals = approvals ++ [approver]
+
+    -- Runs with all four core signers' authority. It validates the bound active state and its
+    -- live reserves, archives that state and creates the paused state with identical accounting.
+    choice FinalizePause : ContractId SecurePausedPool
+      with
+        finalizer : Party
+        expectedTerms : SecurePauseTerms
+      controller finalizer
+      do
+        requireLifecycleFinalization terms.lineage approvals finalizer terms.expiresAt (expectedTerms == terms)
+        pool <- fetch terms.poolCid
+        requireStateOf terms.lineage terms.genesisCid (accountsOf pool)
+        _ <- validateSecurePool pool terms.expectedVersion
+        archive terms.poolCid
+        create SecurePausedPool with
+          lineage = pool.lineage
+          genesisCid = pool.genesisCid
+          auditors = pool.auditors
+          treasuryReserveCid = pool.treasuryReserveCid
+          stableReserveCid = pool.stableReserveCid
+          treasuryReserveAmount = pool.treasuryReserveAmount
+          stableReserveAmount = pool.stableReserveAmount
+          totalShares = pool.totalShares
+          lockedShares = pool.lockedShares
+          treasuryFeeAmount = pool.treasuryFeeAmount
+          stableFeeAmount = pool.stableFeeAmount
+          stateVersion = pool.stateVersion + 1
+
+    choice CancelPause : ()
+      with
+        canceller : Party
+      controller canceller
+      do
+        requireLifecycleCanceller terms.lineage canceller
+
+template SecureResumeProposal
+  with
+    terms : SecureResumeTerms
+    approvals : [Party]
+  where
+    signatory approvals
+    observer coreSignatories terms.lineage
+    ensure lifecycleApprovalsValid terms.lineage approvals
+
+    choice ApproveResume : ContractId SecureResumeProposal
+      with
+        approver : Party
+        expectedTerms : SecureResumeTerms
+      controller approver
+      do
+        requireLifecycleApproval terms.lineage approvals approver terms.expiresAt (expectedTerms == terms)
+        create this with approvals = approvals ++ [approver]
+
+    choice FinalizeResume : ContractId SecurePool
+      with
+        finalizer : Party
+        expectedTerms : SecureResumeTerms
+      controller finalizer
+      do
+        requireLifecycleFinalization terms.lineage approvals finalizer terms.expiresAt (expectedTerms == terms)
+        paused <- fetch terms.pausedPoolCid
+        let accounts = pausedAccountsOf paused
+        requireStateOf terms.lineage terms.genesisCid accounts
+        _ <- validatePoolAccounts accounts terms.expectedVersion
+        archive terms.pausedPoolCid
+        create SecurePool with
+          lineage = paused.lineage
+          genesisCid = paused.genesisCid
+          auditors = paused.auditors
+          treasuryReserveCid = paused.treasuryReserveCid
+          stableReserveCid = paused.stableReserveCid
+          treasuryReserveAmount = paused.treasuryReserveAmount
+          stableReserveAmount = paused.stableReserveAmount
+          totalShares = paused.totalShares
+          lockedShares = paused.lockedShares
+          treasuryFeeAmount = paused.treasuryFeeAmount
+          stableFeeAmount = paused.stableFeeAmount
+          stateVersion = paused.stateVersion + 1
+
+    choice CancelResume : ()
+      with
+        canceller : Party
+      controller canceller
+      do
+        requireLifecycleCanceller terms.lineage canceller

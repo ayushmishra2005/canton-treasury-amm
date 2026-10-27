@@ -3,6 +3,8 @@
 # package ran and passed, so a skipped, renamed or silently dropped test cannot go unnoticed.
 # Writes the full test log to the path in $1 (default: a temporary file).
 set -euo pipefail
+# The SDK every daml.yaml pins; outside a package directory dpm would resolve its own default.
+export DPM_SDK_VERSION=3.5.5
 
 cd "$(dirname "$0")/.."
 log=${1:-$(mktemp)}

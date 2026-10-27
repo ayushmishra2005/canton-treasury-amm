@@ -118,7 +118,7 @@ reference must check for an existing proposal or charter before approving.
 
 - **Package upload and vetting.** Every participant hosting a core signer, governance, the
   initial provider, a trader or an auditor must upload and vet the reviewed Secure V1 DAR
-  (`canton-treasury-amm-secure-v1` 0.1.0, package ID in [`RELEASE_READINESS.md`](RELEASE_READINESS.md))
+  (`canton-treasury-amm-secure-v1` 0.2.0, package ID in [`RELEASE_READINESS.md`](RELEASE_READINESS.md))
   and the legacy DAR it depends on. A participant that has not vetted it cannot confirm, and the
   step that needs it fails.
 - **Synchronizer.** All participants are connected to the same synchronizer, and every party in

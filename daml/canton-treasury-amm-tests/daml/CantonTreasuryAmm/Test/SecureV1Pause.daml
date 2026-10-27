@@ -1,0 +1,804 @@
+-- Pause, paused-pool LP exits and resume for the Secure V1 production pool. Legitimate
+-- transitions go through `settlePause`, `settlePausedRemove` and `settleResume`, which check
+-- the complete ledger before and after; every rejected attempt is wrapped in `rejectsWith`, so
+-- it also proves that no pool state, paused state, proposal, reserve, position, holding or total
+-- changed. Lifecycle approvals are collected one signer per submission, as from separate
+-- participants; `MultiParticipant.daml` repeats the workflow on a real Canton topology.
+module CantonTreasuryAmm.Test.SecureV1Pause where
+
+import DA.Action (unless)
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import DA.Functor (void)
+import DA.Time (hours)
+import Daml.Script
+
+import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.LiquidityPosition (LiquidityPosition (..))
+import CantonTreasuryAmm.SecureV1.Errors
+import CantonTreasuryAmm.SecureV1.Pause
+import CantonTreasuryAmm.SecureV1.Pool
+import CantonTreasuryAmm.SecureV1.SwapIntent
+import CantonTreasuryAmm.Test.Fixtures
+import CantonTreasuryAmm.Test.ProtectedCustodyPrototype qualified as Custody
+import CantonTreasuryAmm.Test.ProtectedPoolPrototypeTests qualified as Prototype
+import CantonTreasuryAmm.Test.ProtectedPoolSettlementTests qualified as Settlement
+import CantonTreasuryAmm.Test.SecureV1Adversary
+import CantonTreasuryAmm.Test.SecureV1Attacks (addCommand, assertInvisibleActive, openSibling)
+import CantonTreasuryAmm.Test.SecureV1Lifecycle (sees)
+import CantonTreasuryAmm.Test.SecureV1Onboarding (assertPreconditionFailed)
+import CantonTreasuryAmm.Test.SecureV1Support
+import CantonTreasuryAmm.Test.SecureV1SwapIntent (controllersOf, createSecureFactory, executeAs, settleIntent, submitIntent)
+import CantonTreasuryAmm.Types
+
+pausedRemoveCommand : ContractId SecurePausedPool -> Party -> ContractId SecureLiquidityPosition -> Int -> Int -> Commands SecurePausedRemoveLiquidityResult
+pausedRemoveCommand pausedPoolCid provider positionCid burnAtoms expectedVersion =
+  exerciseCmd pausedPoolCid RemovePausedLiquidity with
+    provider
+    positionCid
+    burnShares = amountOf burnAtoms
+    minimumTreasuryOut = 0.0
+    minimumStableOut = 0.0
+    expectedVersion
+
+voidResult : Script (Either SubmitError a) -> Script (Either SubmitError ())
+voidResult = fmap void
+
+data Accounting = Accounting with
+    treasury : Int
+    stable : Int
+    shares : Int
+    locked : Int
+    treasuryFee : Int
+    stableFee : Int
+    version : Int
+  deriving (Eq, Show)
+
+accountingOf : SecurePoolAccounts -> Decimal -> Decimal -> Accounting
+accountingOf accounts treasuryFeeAmount stableFeeAmount = Accounting with
+  treasury = atomsOf accounts.treasuryReserveAmount
+  stable = atomsOf accounts.stableReserveAmount
+  shares = atomsOf accounts.totalShares
+  locked = atomsOf accounts.lockedShares
+  treasuryFee = atomsOf treasuryFeeAmount
+  stableFee = atomsOf stableFeeAmount
+  version = accounts.stateVersion
+
+activeAccounting : SecureMarket -> ContractId SecurePool -> Script Accounting
+activeAccounting market poolCid = do
+  (pool, _, _) <- checkSecurePool market poolCid
+  pure (accountingOf (accountsOf pool) pool.treasuryFeeAmount pool.stableFeeAmount)
+
+pausedAccounting : SecureMarket -> ContractId SecurePausedPool -> Script Accounting
+pausedAccounting market pausedPoolCid = do
+  (pool, _, _) <- checkPausedPool market pausedPoolCid
+  pure (accountingOf (pausedAccountsOf pool) pool.treasuryFeeAmount pool.stableFeeAmount)
+
+-- What `shareAtoms` redeem from `accounting` at the pool's floor rounding.
+claimOf : Int -> Accounting -> (Int, Int)
+claimOf shareAtoms accounting =
+  (shareAtoms * accounting.treasury / accounting.shares, shareAtoms * accounting.stable / accounting.shares)
+
+-- Two genuine LPs and accrued fees: the provider's 5,000,000 / 10,000,000 initialization
+-- (7,071,066 shares and the locked share), the second provider's 500,000 / 1,000,000 deposit
+-- (707,106 shares) and a 10,000-atom Treasury swap paying 19,903 stablecoin with a 30-atom fee.
+twoProviderMarket : Text -> Script (SecureMarket, ContractId SecurePool, ContractId SecureLiquidityPosition)
+twoProviderMarket charterReference = do
+  market <- standardSecureMarket charterReference
+  let fixture = market.fixture
+  treasuryCid <- issueTreasury fixture market.secondProvider (amountOf 500000)
+  stableCid <- issueStable fixture market.secondProvider (amountOf 1000000)
+  added <- settleAdd market market.secondProvider market.initialized.poolCid treasuryCid stableCid 500000 1000000 707106 500000 1000000
+  inputCid <- issueTreasury fixture fixture.trader (amountOf 10000)
+  swapped <- settleSwap market fixture.trader added.poolCid TreasuryForStable inputCid 10000 19903
+  activeAccounting market swapped.poolCid >>= (=== Accounting with
+    treasury = 5510000; stable = 10980097; shares = 7778173; locked = 1; treasuryFee = 30; stableFee = 0; version = 2)
+  pure (market, swapped.poolCid, added.positionCid)
+
+-- SCENARIO 1. Two LPs, fees, pause, a partial and a full exit while paused, resume, trade.
+-- Expected: the pause carries every field over with the version plus one; the first LP's
+-- 1,000,000-share partial exit pays 708,392 / 1,411,655 and the second LP's full 707,106-share
+-- exit pays 500,908 / 998,189, exactly as `RemoveLiquidity` would; supply, reserves and
+-- positions reconcile after each step; fee counters stay 30 / 0 throughout; the first LP's
+-- remaining claim does not fall; burning into the locked share is rejected; resume carries every
+-- field over; the resumed pool settles a 1,000-atom swap for 1,986.
+pausedPoolSettlesTwoProviderExitsExactly : Script ()
+pausedPoolSettlesTwoProviderExitsExactly = do
+  (market, poolCid, secondPositionCid) <- twoProviderMarket "pause-01"
+  let fixture = market.fixture
+  pausedCid <- settlePause market poolCid
+  pausedAccounting market pausedCid >>= (=== Accounting with
+    treasury = 5510000; stable = 10980097; shares = 7778173; locked = 1; treasuryFee = 30; stableFee = 0; version = 3)
+
+  first <- settlePausedRemove market fixture.provider pausedCid market.initialized.positionCid 1000000 708392 1411655
+  Some firstRemainderCid <- pure first.remainingPositionCid
+  afterFirst <- pausedAccounting market first.poolCid
+  afterFirst === Accounting with
+    treasury = 4801608; stable = 9568442; shares = 6778173; locked = 1; treasuryFee = 30; stableFee = 0; version = 4
+  let claimBefore = claimOf 6071066 afterFirst
+
+  second <- settlePausedRemove market market.secondProvider first.poolCid secondPositionCid 707106 500908 998189
+  second.remainingPositionCid === None
+  afterSecond <- pausedAccounting market second.poolCid
+  afterSecond === Accounting with
+    treasury = 4300700; stable = 8570253; shares = 6071067; locked = 1; treasuryFee = 30; stableFee = 0; version = 5
+  let claimAfter = claimOf 6071066 afterSecond
+  claimAfter === (4300699, 8570251)
+  assertMsg "The remaining LP's claim must not fall" (fst claimAfter >= fst claimBefore && snd claimAfter >= snd claimBefore)
+
+  disclosures <- pausedDisclosures market second.poolCid
+  rejectsWith market (assertFailureId positionError) $
+    trySubmit (actAs fixture.provider <> discloseMany disclosures) $
+      pausedRemoveCommand second.poolCid fixture.provider firstRemainderCid 6071067 5
+
+  resumedCid <- settleResume market second.poolCid
+  activeAccounting market resumedCid >>= (=== afterSecond with version = 6)
+  inputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  traded <- settleSwap market fixture.trader resumedCid TreasuryForStable inputCid 1000 1986
+  activeAccounting market traded.poolCid >>= (=== Accounting with
+    treasury = 4301700; stable = 8568267; shares = 6071067; locked = 1; treasuryFee = 33; stableFee = 0; version = 7)
+
+-- SCENARIO 2. The only LP exits completely while paused. Expected: 7,071,066 shares pay
+-- 5,000,999 / 9,998,005; the paused state keeps the locked share and the 1 / 2 atoms it backs;
+-- the empty pool resumes with every field carried over.
+fullPausedExitLeavesOnlyTheLockedShare : Script ()
+fullPausedExitLeavesOnlyTheLockedShare = do
+  market <- standardSecureMarket "pause-02"
+  let fixture = market.fixture
+  inputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  swapped <- settleSwap market fixture.trader market.initialized.poolCid TreasuryForStable inputCid 1000 1993
+  pausedCid <- settlePause market swapped.poolCid
+  exit <- settlePausedRemove market fixture.provider pausedCid market.initialized.positionCid 7071066 5000999 9998005
+  exit.remainingPositionCid === None
+  drained <- pausedAccounting market exit.poolCid
+  drained === Accounting with treasury = 1; stable = 2; shares = 1; locked = 1; treasuryFee = 3; stableFee = 0; version = 3
+  resumedCid <- settleResume market exit.poolCid
+  activeAccounting market resumedCid >>= (=== drained with version = 4)
+
+-- SCENARIO 3. While paused: swaps in both directions, a deposit and an active-pool withdrawal,
+-- against the consumed active state (with disclosures taken before the pause) and against the
+-- paused state passed as a `SecurePool` reference. Expected: `ContractNotFound` naming only the
+-- consumed active state, and `WronglyTypedContract` for the paused state, which has no swap,
+-- deposit or active withdrawal choice; nothing changes.
+pausedPoolRejectsTradingAndDeposits : Script ()
+pausedPoolRejectsTradingAndDeposits = do
+  (market, poolCid, _) <- twoProviderMarket "pause-03"
+  let fixture = market.fixture
+  (pool, _, _) <- checkSecurePool market poolCid
+  staleDisclosures <- secureDisclosures market poolCid
+  pausedCid <- settlePause market poolCid
+  pausedDisclosed <- pausedDisclosures market pausedCid
+  let asActive = coerceContractId @SecurePausedPool @SecurePool pausedCid
+  deadline <- futureDeadline
+  treasuryInput <- issueTreasury fixture fixture.trader (amountOf 1000)
+  stableInput <- issueStable fixture fixture.trader (amountOf 1000)
+  depositT <- issueTreasury fixture market.secondProvider (amountOf 500000)
+  depositS <- issueStable fixture market.secondProvider (amountOf 1000000)
+  forA_ [(poolCid, staleDisclosures, Settlement.assertConsumedAmong [show poolCid]), (asActive, pausedDisclosed, Prototype.assertWronglyTyped)] $
+    \(target, disclosures, expected) -> do
+      let as party = actAs party <> discloseMany disclosures
+      rejectsWith market expected $ voidResult $ trySubmit (as fixture.trader) $
+        swapCommand target fixture.trader TreasuryForStable treasuryInput 1000 0 deadline pool.stateVersion
+      rejectsWith market expected $ voidResult $ trySubmit (as fixture.trader) $
+        swapCommand target fixture.trader StableForTreasury stableInput 1000 0 deadline pool.stateVersion
+      rejectsWith market expected $ voidResult $ trySubmit (as market.secondProvider) $
+        addCommand target market.secondProvider depositT depositS pool.stateVersion
+      rejectsWith market expected $ voidResult $ trySubmit (as fixture.provider) $
+        exerciseCmd target RemoveLiquidity with
+          provider = fixture.provider
+          positionCid = market.initialized.positionCid
+          burnShares = amountOf 1000
+          minimumTreasuryOut = 0.0
+          minimumStableOut = 0.0
+          expectedVersion = pool.stateVersion
+  _ <- checkPausedPool market pausedCid
+  pure ()
+
+-- ATTACK A. Actors: every one of the 29 non-empty subsets of the custodian, operator,
+-- governance and both issuers that lacks a core signer, with the active state and its reserves
+-- disclosed; the 14 proper subsets of the core collecting approvals; governance and the auditor.
+-- Attempts: create a pause proposal already carrying all four approvals; create the paused
+-- state directly; archive the active state; finalize a proposal approved by a proper subset of
+-- the core; propose or approve as governance or the auditor; approve twice. Expected:
+-- `AuthorizationError` for the first three, `amm/lifecycle-incomplete` for the finalization,
+-- the template precondition for a non-core proposer, `amm/lifecycle-approver` for non-core and
+-- repeated approvals; nothing changes, and the complete four-signer workflow then pauses.
+pauseNeedsEveryCoreSigner : Script ()
+pauseNeedsEveryCoreSigner = do
+  (market, poolCid, _) <- twoProviderMarket "pause-a"
+  let fixture = market.fixture
+  let core = coreOf market
+  (pool, _, _) <- checkSecurePool market poolCid
+  disclosures <- secureDisclosures market poolCid
+  expiresAt <- futureDeadline
+  let terms = pauseTermsFor market poolCid pool.stateVersion expiresAt
+  let candidates = filter (not . null) (Settlement.subsetsOf (privilegedOf market))
+  let partial = filter (not . coversCore market) candidates
+  length partial === 29
+  forA_ partial $ \subset -> do
+    rejectsWith market assertAuthorizationError $
+      trySubmit (actAs subset) $ createCmd SecurePauseProposal with terms; approvals = core
+    rejectsWith market assertAuthorizationError $
+      trySubmit (actAs subset) $ createCmd (pausedStateOf pool)
+    rejectsWith market assertAuthorizationError $
+      trySubmit (actAs subset <> discloseMany disclosures) $ archiveCmd poolCid
+
+  let coreSubsets = filter (\subset -> not (null subset) && length subset < 4) (Settlement.subsetsOf core)
+  length coreSubsets === 14
+  forA_ coreSubsets $ \subset -> do
+    (proposer, approvers) <- case subset of
+      first :: rest -> pure (first, rest)
+      [] -> abort "Core subsets are non-empty"
+    proposalCid <- collectPauseApprovals proposer approvers terms
+    rejectsWith market (assertFailureId lifecycleIncompleteError) $
+      trySubmit proposer $ exerciseCmd proposalCid FinalizePause with finalizer = proposer; expectedTerms = terms
+    submit proposer $ exerciseCmd proposalCid CancelPause with canceller = proposer
+
+  forA_ [fixture.governance, fixture.auditor] $ \outsider ->
+    rejectsWith market assertPreconditionFailed $
+      trySubmit outsider $ createCmd SecurePauseProposal with terms; approvals = [outsider]
+  proposalCid <- collectPauseApprovals fixture.operator [] terms
+  proposalDisclosed <- disclosureOf fixture.operator proposalCid
+  forA_ [fixture.governance, fixture.auditor, fixture.operator] $ \approver ->
+    rejectsWith market (assertFailureId lifecycleApproverError) $
+      trySubmit (actAs approver <> discloseMany [proposalDisclosed]) $
+        exerciseCmd proposalCid ApprovePause with approver; expectedTerms = terms
+  submit fixture.operator $ exerciseCmd proposalCid CancelPause with canceller = fixture.operator
+  _ <- settlePause market poolCid
+  pure ()
+
+-- ATTACK B. Actors: as in attack A, against the paused state. Attempts: create a resume
+-- proposal carrying all four approvals, the active state directly, or archive the paused state,
+-- for each subset lacking a core signer; finalize resume proposals missing each core signer in
+-- turn (missing the stablecoin issuer, the custodian, ...) and one approved by the operator
+-- alone; approve, propose or finalize as governance. Expected: `AuthorizationError`,
+-- `amm/lifecycle-incomplete`, the template precondition and `amm/lifecycle-approver`
+-- respectively; nothing changes, and the complete four-signer workflow then resumes.
+resumeNeedsEveryCoreSigner : Script ()
+resumeNeedsEveryCoreSigner = do
+  (market, poolCid, _) <- twoProviderMarket "pause-b"
+  let fixture = market.fixture
+  let core = coreOf market
+  pausedCid <- settlePause market poolCid
+  (paused, _, _) <- checkPausedPool market pausedCid
+  disclosures <- pausedDisclosures market pausedCid
+  expiresAt <- futureDeadline
+  let terms = resumeTermsFor market pausedCid paused.stateVersion expiresAt
+  forA_ (filter (not . coversCore market) (filter (not . null) (Settlement.subsetsOf (privilegedOf market)))) $ \subset -> do
+    rejectsWith market assertAuthorizationError $
+      trySubmit (actAs subset) $ createCmd SecureResumeProposal with terms; approvals = core
+    rejectsWith market assertAuthorizationError $
+      trySubmit (actAs subset) $ createCmd (activeStateOf paused)
+    rejectsWith market assertAuthorizationError $
+      trySubmit (actAs subset <> discloseMany disclosures) $ archiveCmd pausedCid
+
+  forA_ core $ \missing -> do
+    let present = filter (/= missing) core
+    (proposer, approvers) <- case present of
+      first :: rest -> pure (first, rest)
+      [] -> abort "Three core signers remain"
+    proposalCid <- collectResumeApprovals proposer approvers terms
+    forA_ present $ \finalizer ->
+      rejectsWith market (assertFailureId lifecycleIncompleteError) $
+        trySubmit finalizer $ exerciseCmd proposalCid FinalizeResume with finalizer; expectedTerms = terms
+    submit proposer $ exerciseCmd proposalCid CancelResume with canceller = proposer
+  operatorOnly <- collectResumeApprovals fixture.operator [] terms
+  rejectsWith market (assertFailureId lifecycleIncompleteError) $
+    trySubmit fixture.operator $ exerciseCmd operatorOnly FinalizeResume with finalizer = fixture.operator; expectedTerms = terms
+
+  rejectsWith market assertPreconditionFailed $
+    trySubmit fixture.governance $ createCmd SecureResumeProposal with terms; approvals = [fixture.governance]
+  operatorDisclosed <- disclosureOf fixture.operator operatorOnly
+  rejectsWith market (assertFailureId lifecycleApproverError) $
+    trySubmit (actAs fixture.governance <> discloseMany [operatorDisclosed]) $
+      exerciseCmd operatorOnly ApproveResume with approver = fixture.governance; expectedTerms = terms
+  complete <- collectResumeApprovals fixture.operator (otherCoreOf market) terms
+  completeDisclosed <- disclosureOf fixture.operator complete
+  rejectsWith market (assertFailureId lifecycleApproverError) $
+    trySubmit (actAs fixture.governance <> discloseMany (completeDisclosed :: disclosures)) $
+      exerciseCmd complete FinalizeResume with finalizer = fixture.governance; expectedTerms = terms
+  forA_ [operatorOnly, complete] $ \cid ->
+    submit market.custodian $ exerciseCmd cid CancelResume with canceller = market.custodian
+  _ <- settleResume market pausedCid
+  pure ()
+
+-- ATTACK C. Actors: the core signers, a trader and the provider replaying consumed or stale
+-- lifecycle data. Attempts: finalize a fully approved pause bound to the wrong version; finalize
+-- the same pause proposal twice, and a second fully approved proposal for the already paused
+-- state; trade on the active state with disclosures taken before the pause; withdraw from the
+-- paused state with the pre-pause version; finalize a resume bound to a paused state a
+-- withdrawal has since replaced; withdraw from that replaced paused state; use stale reserve
+-- disclosures with the current paused state; withdraw from the paused state after resume; trade
+-- on the original and the resumed state with pre-pause versions; pause the resumed state with a
+-- proposal bound to its pre-pause version. Expected: `amm/stale-state` for wrong versions,
+-- `ContractNotFound` naming only consumed contracts for replays, `ContractNotFound` naming only
+-- the active but invisible current reserves for stale reserve data; nothing changes.
+lifecycleStatesCannotBeReplayed : Script ()
+lifecycleStatesCannotBeReplayed = do
+  (market, poolCid, _) <- twoProviderMarket "pause-c"
+  let fixture = market.fixture
+  let operator = fixture.operator
+  (pool, _, _) <- checkSecurePool market poolCid
+  activeDisclosures <- secureDisclosures market poolCid
+  expiresAt <- futureDeadline
+  let terms = pauseTermsFor market poolCid pool.stateVersion expiresAt
+  let staleTerms = terms with expectedVersion = pool.stateVersion - 1
+  staleCid <- collectPauseApprovals operator (otherCoreOf market) staleTerms
+  rejectsWith market (assertFailureId staleStateError) $
+    trySubmit operator $ exerciseCmd staleCid FinalizePause with finalizer = operator; expectedTerms = staleTerms
+  firstCid <- collectPauseApprovals operator (otherCoreOf market) terms
+  secondCid <- collectPauseApprovals market.custodian [operator, fixture.treasuryIssuer, fixture.stableIssuer] terms
+  pausedCid <- submit operator $ exerciseCmd firstCid FinalizePause with finalizer = operator; expectedTerms = terms
+  rejectsWith market (Settlement.assertConsumedAmong [show firstCid]) $
+    trySubmit operator $ exerciseCmd firstCid FinalizePause with finalizer = operator; expectedTerms = terms
+  rejectsWith market (Settlement.assertConsumedAmong [show poolCid]) $
+    trySubmit market.custodian $ exerciseCmd secondCid FinalizePause with finalizer = market.custodian; expectedTerms = terms
+  deadline <- futureDeadline
+  inputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  rejectsWith market (Settlement.assertConsumedAmong [show poolCid]) $
+    trySubmit (actAs fixture.trader <> discloseMany activeDisclosures) $
+      swapCommand poolCid fixture.trader TreasuryForStable inputCid 1000 0 deadline pool.stateVersion
+
+  (paused, _, _) <- checkPausedPool market pausedCid
+  pausedDisclosed <- pausedDisclosures market pausedCid
+  rejectsWith market (assertFailureId staleStateError) $
+    trySubmit (actAs fixture.provider <> discloseMany pausedDisclosed) $
+      pausedRemoveCommand pausedCid fixture.provider market.initialized.positionCid 1000 pool.stateVersion
+  let resumeTerms = resumeTermsFor market pausedCid paused.stateVersion expiresAt
+  resumeCid <- collectResumeApprovals operator (otherCoreOf market) resumeTerms
+  exit <- settlePausedRemove market fixture.provider pausedCid market.initialized.positionCid 1000000 708392 1411655
+  Some remainderCid <- pure exit.remainingPositionCid
+  let replacedByExit = map show [pausedCid] ++ map show [paused.treasuryReserveCid, paused.stableReserveCid]
+  rejectsWith market (Settlement.assertConsumedAmong replacedByExit) $
+    trySubmit operator $ exerciseCmd resumeCid FinalizeResume with finalizer = operator; expectedTerms = resumeTerms
+  rejectsWith market (Settlement.assertConsumedAmong replacedByExit) $
+    trySubmit (actAs fixture.provider <> discloseMany pausedDisclosed) $
+      pausedRemoveCommand pausedCid fixture.provider remainderCid 1000 paused.stateVersion
+  (current, _, _) <- checkPausedPool market exit.poolCid
+  currentDisclosure <- disclosureOf market.custodian exit.poolCid
+  rejectsWith market (assertInvisibleActive market (map show [current.treasuryReserveCid, current.stableReserveCid])) $
+    trySubmit (actAs fixture.provider <> discloseMany (currentDisclosure :: drop 1 pausedDisclosed)) $
+      pausedRemoveCommand exit.poolCid fixture.provider remainderCid 1000 current.stateVersion
+  submit operator $ exerciseCmd resumeCid CancelResume with canceller = operator
+
+  exitDisclosures <- pausedDisclosures market exit.poolCid
+  resumedCid <- settleResume market exit.poolCid
+  rejectsWith market (Settlement.assertConsumedAmong [show exit.poolCid]) $
+    trySubmit (actAs fixture.provider <> discloseMany exitDisclosures) $
+      pausedRemoveCommand exit.poolCid fixture.provider remainderCid 1000 current.stateVersion
+  rejectsWith market (Settlement.assertConsumedAmong [show poolCid]) $
+    trySubmit (actAs fixture.trader <> discloseMany activeDisclosures) $
+      swapCommand poolCid fixture.trader TreasuryForStable inputCid 1000 0 deadline pool.stateVersion
+  resumedDisclosures <- secureDisclosures market resumedCid
+  forA_ [pool.stateVersion, paused.stateVersion, current.stateVersion] $ \staleVersion ->
+    rejectsWith market (assertFailureId staleStateError) $
+      trySubmit (actAs fixture.trader <> discloseMany resumedDisclosures) $
+        swapCommand resumedCid fixture.trader TreasuryForStable inputCid 1000 0 deadline staleVersion
+  let rePause = pauseTermsFor market resumedCid pool.stateVersion expiresAt
+  rePauseCid <- collectPauseApprovals operator (otherCoreOf market) rePause
+  rejectsWith market (assertFailureId staleStateError) $
+    trySubmit operator $ exerciseCmd rePauseCid FinalizePause with finalizer = operator; expectedTerms = rePause
+  submit operator $ exerciseCmd staleCid CancelPause with canceller = operator
+  submit operator $ exerciseCmd rePauseCid CancelPause with canceller = operator
+  _ <- checkSecurePool market resumedCid
+  pure ()
+
+-- ATTACK D. Actors: the same four core signers over three pools: this one, a sibling with the
+-- same lineage (so the same signers and charter reference, another genesis), and a pool of
+-- another lineage. Attempts: approve or finalize this pool's proposal with the sibling's terms;
+-- finalize fully approved proposals naming this genesis with the sibling's or the other
+-- lineage's state; resume this genesis with the sibling's paused state; approve or finalize
+-- after expiry. Expected: `amm/lifecycle-terms`, `amm/pool-mismatch` and `amm/deadline`; the
+-- genuine proposal pauses only this pool.
+lifecycleApprovalsAreBoundToOnePool : Script ()
+lifecycleApprovalsAreBoundToOnePool = do
+  market <- standardSecureMarket "pause-d"
+  sibling <- openSibling market "pause-d"
+  other <- openSibling market "pause-d-other"
+  sibling.lineage === market.lineage
+  let operator = market.fixture.operator
+  expiresAt <- futureDeadline
+  let terms = pauseTermsFor market market.initialized.poolCid 0 expiresAt
+  let siblingTerms = pauseTermsFor sibling sibling.initialized.poolCid 0 expiresAt
+  proposalCid <- collectPauseApprovals operator [] terms
+  rejectsWith market (assertFailureId lifecycleTermsError) $
+    trySubmit market.custodian $ exerciseCmd proposalCid ApprovePause with approver = market.custodian; expectedTerms = siblingTerms
+  completeCid <- collectPauseApprovalsOn proposalCid (otherCoreOf market) terms
+  rejectsWith market (assertFailureId lifecycleTermsError) $
+    trySubmit operator $ exerciseCmd completeCid FinalizePause with finalizer = operator; expectedTerms = siblingTerms
+  forA_ [sibling.initialized.poolCid, other.initialized.poolCid] $ \foreignCid -> do
+    let crossed = terms with poolCid = foreignCid
+    crossedCid <- collectPauseApprovals operator (otherCoreOf market) crossed
+    rejectsWith market (assertFailureId poolMismatchError) $
+      trySubmit operator $ exerciseCmd crossedCid FinalizePause with finalizer = operator; expectedTerms = crossed
+    submit operator $ exerciseCmd crossedCid CancelPause with canceller = operator
+  pausedCid <- submit operator $ exerciseCmd completeCid FinalizePause with finalizer = operator; expectedTerms = terms
+  _ <- checkPausedPool market pausedCid
+  _ <- checkSecurePool sibling sibling.initialized.poolCid
+  _ <- checkSecurePool other other.initialized.poolCid
+
+  siblingPausedCid <- settlePause sibling sibling.initialized.poolCid
+  let crossedResume = resumeTermsFor market siblingPausedCid 1 expiresAt
+  crossedResumeCid <- collectResumeApprovals operator (otherCoreOf market) crossedResume
+  rejectsWith market (assertFailureId poolMismatchError) $
+    trySubmit operator $ exerciseCmd crossedResumeCid FinalizeResume with finalizer = operator; expectedTerms = crossedResume
+  let resumeTerms = resumeTermsFor market pausedCid 1 expiresAt
+  partialCid <- collectResumeApprovals operator [market.custodian, market.fixture.treasuryIssuer] resumeTerms
+  completeResumeCid <- collectResumeApprovals operator (otherCoreOf market) resumeTerms
+  passTime (hours 2)
+  rejectsWith market (assertFailureId deadlineError) $
+    trySubmit market.fixture.stableIssuer $
+      exerciseCmd partialCid ApproveResume with approver = market.fixture.stableIssuer; expectedTerms = resumeTerms
+  rejectsWith market (assertFailureId deadlineError) $
+    trySubmit operator $ exerciseCmd completeResumeCid FinalizeResume with finalizer = operator; expectedTerms = resumeTerms
+  _ <- checkPausedPool market pausedCid
+  _ <- checkPausedPool sibling siblingPausedCid
+  pure ()
+
+collectPauseApprovalsOn : ContractId SecurePauseProposal -> [Party] -> SecurePauseTerms -> Script (ContractId SecurePauseProposal)
+collectPauseApprovalsOn proposalCid approvers terms = case approvers of
+  [] -> pure proposalCid
+  approver :: rest -> do
+    nextCid <- submit approver $ exerciseCmd proposalCid ApprovePause with approver; expectedTerms = terms
+    collectPauseApprovalsOn nextCid rest terms
+
+-- ATTACK E. Actors: the operator and governance (the Phase 0 position minters), the second LP
+-- and partial core coalitions. Attempts against the paused state: redeem a legacy
+-- `LiquidityPosition` forged by the operator and governance; mint a secure position without
+-- every core signer; redeem the first LP's position as the second LP; redeem a position of a
+-- sibling genesis with the same lineage. Expected: `WronglyTypedContract`, `AuthorizationError`,
+-- `amm/owner-mismatch` and `amm/position`; nothing changes.
+forgedPositionsCannotRedeemFromAPausedPool : Script ()
+forgedPositionsCannotRedeemFromAPausedPool = do
+  (market, poolCid, _) <- twoProviderMarket "pause-e"
+  let fixture = market.fixture
+  let provider2 = market.secondProvider
+  sibling <- openSibling market "pause-e"
+  pausedCid <- settlePause market poolCid
+  (paused, _, _) <- checkPausedPool market pausedCid
+  disclosures <- pausedDisclosures market pausedCid
+  legacyCid <- submit (actAs [fixture.operator, fixture.governance]) $ createCmd LiquidityPosition with
+    poolId = poolIdOf fixture "pause-e"
+    provider = provider2
+    shares = amountOf 1000000
+    auditors = [fixture.auditor]
+  rejectsWith market Prototype.assertWronglyTyped $
+    trySubmit (actAs provider2 <> discloseMany disclosures) $
+      pausedRemoveCommand pausedCid provider2 (coerceContractId legacyCid) 1000000 paused.stateVersion
+  let forged = SecureLiquidityPosition with
+        lineage = market.lineage
+        genesisCid = market.charterCid
+        provider = provider2
+        shares = amountOf 1000000
+        auditors = [fixture.auditor]
+  forA_ [[provider2, fixture.operator, fixture.governance], [provider2, market.custodian, fixture.operator, fixture.treasuryIssuer]] $ \parties ->
+    rejectsWith market assertAuthorizationError $ trySubmit (actAs parties) $ createCmd forged
+  positionDisclosed <- disclosureOf fixture.provider market.initialized.positionCid
+  rejectsWith market (assertFailureId ownerMismatchError) $
+    trySubmit (actAs provider2 <> discloseMany (positionDisclosed :: disclosures)) $
+      pausedRemoveCommand pausedCid provider2 market.initialized.positionCid 1000000 paused.stateVersion
+  rejectsWith market (assertFailureId positionError) $
+    trySubmit (actAs fixture.provider <> discloseMany disclosures) $
+      pausedRemoveCommand pausedCid fixture.provider sibling.initialized.positionCid 1000 paused.stateVersion
+  _ <- checkPausedPool market pausedCid
+  pure ()
+
+-- ATTACK F. Actors: the operator and custodian with the Stage 1.1 custody controls, three core
+-- signers with a generic mandate, a counterfeit pool signed by three core signers, and an LP
+-- burner signed by the LP and three core signers. Attempts against the paused reserves and
+-- positions: release under a custody mandate, an approved release request, a joint release, a
+-- coalition sweep; draw from and retire a reserve; drain through the counterfeit; burn the
+-- position outside the pool. Expected: `WronglyTypedContract` for the custody paths (they act
+-- only on `ProtectedReserve`) and `AuthorizationError` for the rest; nothing changes.
+custodyPathsCannotMovePausedReserves : Script ()
+custodyPathsCannotMovePausedReserves = do
+  (market, poolCid, _) <- twoProviderMarket "pause-f"
+  let fixture = market.fixture
+  let custodian = market.custodian
+  pausedCid <- settlePause market poolCid
+  (paused, _, _) <- checkPausedPool market pausedCid
+  disclosures <- pausedDisclosures market pausedCid
+  positionDisclosed <- disclosureOf fixture.provider market.initialized.positionCid
+  let disclosed parties = actAs parties <> discloseMany (positionDisclosed :: disclosures)
+  let asReserve = coerceContractId @SecureReserveHolding @Custody.ProtectedReserve paused.treasuryReserveCid
+  mandateCid <- submit custodian $ createCmd Custody.ReleaseMandate with
+    custodian
+    operator = fixture.operator
+    instrument = fixture.treasuryInstrument
+    beneficiary = fixture.operator
+    remainingAllowance = paused.treasuryReserveAmount
+  rejectsWith market Prototype.assertWronglyTyped $ trySubmit (disclosed [fixture.operator]) $
+    exerciseCmd mandateCid Custody.ReleaseUnderMandate with reserveCid = asReserve; releaseAmount = paused.treasuryReserveAmount
+  requestCid <- submit fixture.operator $ createCmd Custody.ReleaseRequest with
+    operator = fixture.operator
+    custodian
+    reserveCid = asReserve
+    recipient = fixture.operator
+    releaseAmount = paused.treasuryReserveAmount
+  rejectsWith market Prototype.assertWronglyTyped $ trySubmit (disclosed [custodian]) $
+    exerciseCmd requestCid Custody.ApproveRelease
+  rejectsWith market Prototype.assertWronglyTyped $ trySubmit (disclosed [custodian, fixture.operator]) $
+    exerciseCmd asReserve Custody.Release with recipient = fixture.operator; releaseAmount = paused.treasuryReserveAmount
+  controllerCid <- submit (actAs [fixture.operator, fixture.governance]) $ createCmd Custody.CoalitionReserveController with
+    operator = fixture.operator
+    governance = fixture.governance
+    reserveCid = asReserve
+  rejectsWith market Prototype.assertWronglyTyped $ trySubmit (disclosed [fixture.operator]) $
+    exerciseCmd controllerCid Custody.Sweep with recipient = fixture.operator; releaseAmount = paused.treasuryReserveAmount
+
+  let threeCore = [custodian, fixture.operator, fixture.treasuryIssuer]
+  genericCid <- submit (actAs threeCore) $ createCmd SecureReserveMandate with grantors = threeCore; holder = fixture.other
+  forA_ [paused.treasuryReserveCid, paused.stableReserveCid] $ \reserveCid -> do
+    rejectsWith market assertAuthorizationError $ trySubmit (disclosed [fixture.other]) $
+      exerciseCmd genericCid DrawReserve with reserveCid; recipient = fixture.other; payoutAtoms = 1000000
+    rejectsWith market assertAuthorizationError $ trySubmit (disclosed [fixture.other]) $
+      exerciseCmd genericCid RetireReserve with reserveCid
+    counterfeitCid <- submit (actAs threeCore) $ createCmd CounterfeitSecurePool with forgers = threeCore; reserveCid
+    rejectsWith market assertAuthorizationError $ trySubmit (disclosed threeCore) $
+      exerciseCmd counterfeitCid CounterfeitDrain with recipient = fixture.operator; payoutAtoms = 1000000
+  let burners = [fixture.provider, custodian, fixture.operator, fixture.stableIssuer]
+  burnerCid <- submit (actAs burners) $ createCmd PositionBurner with grantors = burners; holder = fixture.operator
+  rejectsWith market assertAuthorizationError $ trySubmit (disclosed [fixture.operator]) $
+    exerciseCmd burnerCid BurnOutsidePool with positionCid = market.initialized.positionCid
+  _ <- checkPausedPool market pausedCid
+  pure ()
+
+-- ATTACK G. Actor: the full core set fabricates paused states of this genesis that reference a
+-- reserve of another lineage, the two reserves swapped, or an inflated amount, each recording the
+-- referenced reserve's exact amount where it points elsewhere, and an active state referencing
+-- another lineage's reserve. Attempts: withdraw from each forged paused state as the LP; resume
+-- each through a fully approved resume; pause the forged active state through a fully approved
+-- pause. Expected: `amm/reserve-mismatch` from the shared reserve validation every time;
+-- nothing changes. Fabricating these states needs the trusted coalition, so this is defence in
+-- depth that keeps a lifecycle transition from adopting reserves that are not this pool's.
+foreignReservesCannotBackALifecycleTransition : Script ()
+foreignReservesCannotBackALifecycleTransition = do
+  (market, poolCid, _) <- twoProviderMarket "pause-g"
+  let fixture = market.fixture
+  let core = coreOf market
+  let operator = fixture.operator
+  other <- openSibling market "pause-g-other"
+  Some otherPool <- queryContractId market.custodian other.initialized.poolCid
+  pausedCid <- settlePause market poolCid
+  (paused, _, _) <- checkPausedPool market pausedCid
+  expiresAt <- futureDeadline
+  let forgeries =
+        [ paused with
+            treasuryReserveCid = otherPool.treasuryReserveCid
+            treasuryReserveAmount = otherPool.treasuryReserveAmount
+        , paused with
+            treasuryReserveCid = paused.stableReserveCid
+            stableReserveCid = paused.treasuryReserveCid
+            treasuryReserveAmount = paused.stableReserveAmount
+            stableReserveAmount = paused.treasuryReserveAmount
+        , paused with treasuryReserveAmount = paused.treasuryReserveAmount + 1.0
+        ]
+  forA_ forgeries $ \forgery -> do
+    forgedCid <- submit (actAs core) $ createCmd forgery
+    forgedDisclosure <- disclosureOf market.custodian forgedCid
+    reserveDisclosures <- mapA (disclosureOf market.custodian) [forgery.treasuryReserveCid, forgery.stableReserveCid]
+    rejectsWith market (assertFailureId reserveMismatchError) $
+      trySubmit (actAs fixture.provider <> discloseMany (forgedDisclosure :: reserveDisclosures)) $
+        pausedRemoveCommand forgedCid fixture.provider market.initialized.positionCid 1000 forgery.stateVersion
+    let resumeTerms = resumeTermsFor market forgedCid forgery.stateVersion expiresAt
+    resumeCid <- collectResumeApprovals operator (otherCoreOf market) resumeTerms
+    rejectsWith market (assertFailureId reserveMismatchError) $
+      trySubmit operator $ exerciseCmd resumeCid FinalizeResume with finalizer = operator; expectedTerms = resumeTerms
+    submit operator $ exerciseCmd resumeCid CancelResume with canceller = operator
+    submit (actAs core) $ archiveCmd forgedCid
+  forgedActiveCid <- submit (actAs core) $ createCmd (activeStateOf paused) with
+    treasuryReserveCid = otherPool.treasuryReserveCid
+    treasuryReserveAmount = otherPool.treasuryReserveAmount
+  let pauseTerms = pauseTermsFor market forgedActiveCid (paused.stateVersion + 1) expiresAt
+  pauseCid <- collectPauseApprovals operator (otherCoreOf market) pauseTerms
+  rejectsWith market (assertFailureId reserveMismatchError) $
+    trySubmit operator $ exerciseCmd pauseCid FinalizePause with finalizer = operator; expectedTerms = pauseTerms
+  submit operator $ exerciseCmd pauseCid CancelPause with canceller = operator
+  submit (actAs core) $ archiveCmd forgedActiveCid
+  _ <- checkPausedPool market pausedCid
+  _ <- checkSecurePool other other.initialized.poolCid
+  pure ()
+
+-- ATTACK H. Fee integrity across the lifecycle. Flow: a swap in each direction (fee counters
+-- 3 / 3), pause, a paused withdrawal, resume, a further Treasury swap. Expected: pause, the
+-- withdrawal and resume leave both counters at 3 / 3; the next swap adds exactly its own fee
+-- (6 / 3); no transition credits, resets or moves fee value.
+feeCountersSurvivePauseAndResume : Script ()
+feeCountersSurvivePauseAndResume = do
+  market <- standardSecureMarket "pause-h"
+  let fixture = market.fixture
+  treasuryInput <- issueTreasury fixture fixture.trader (amountOf 1000)
+  first <- settleSwap market fixture.trader market.initialized.poolCid TreasuryForStable treasuryInput 1000 1993
+  stableInput <- issueStable fixture fixture.trader (amountOf 1000)
+  second <- settleSwap market fixture.trader first.poolCid StableForTreasury stableInput 1000 498
+  let fees accounting = (accounting.treasuryFee, accounting.stableFee)
+  (fees <$> activeAccounting market second.poolCid) >>= (=== (3, 3))
+  pausedCid <- settlePause market second.poolCid
+  (fees <$> pausedAccounting market pausedCid) >>= (=== (3, 3))
+  exit <- settlePausedRemove market fixture.provider pausedCid market.initialized.positionCid 1000 707 1414
+  (fees <$> pausedAccounting market exit.poolCid) >>= (=== (3, 3))
+  resumedCid <- settleResume market exit.poolCid
+  (fees <$> activeAccounting market resumedCid) >>= (=== (3, 3))
+  laterInput <- issueTreasury fixture fixture.trader (amountOf 1000)
+  later <- settleSwap market fixture.trader resumedCid TreasuryForStable laterInput 1000 1993
+  (fees <$> activeAccounting market later.poolCid) >>= (=== (6, 3))
+
+-- ATTACK I. Actors: an authorized trader with an intent, and the operator and governance.
+-- Attempts: execute an intent submitted before the pause; execute an intent aimed at the paused
+-- state through a `SecurePool` reference; execute the pre-pause intent after resume. Expected:
+-- `ContractNotFound` naming only the consumed active state, `WronglyTypedContract`, and the same
+-- `ContractNotFound` after resume, since an intent is bound to one state; the trader can cancel
+-- both intents while paused or after; a new intent against the resumed state settles normally.
+swapIntentsCannotTradeAgainstAPausedPool : Script ()
+swapIntentsCannotTradeAgainstAPausedPool = do
+  market <- standardSecureMarket "pause-i"
+  let fixture = market.fixture
+  factoryCid <- createSecureFactory market [fixture.trader]
+  deadline <- futureDeadline
+  staleIntent <- submitIntent market factoryCid market.initialized.poolCid TreasuryForStable 1000 0 deadline
+  pausedCid <- settlePause market market.initialized.poolCid
+  inputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  rejectsWith market (Settlement.assertConsumedAmong [show market.initialized.poolCid]) $
+    executeAs market (controllersOf market) staleIntent inputCid
+  pausedIntent <- submit fixture.trader $ exerciseCmd factoryCid SubmitSwapIntent with
+    trader = fixture.trader
+    poolCid = coerceContractId @SecurePausedPool @SecurePool pausedCid
+    direction = TreasuryForStable
+    inputAmount = amountOf 1000
+    minimumAmountOut = 0.0
+    deadline
+    expectedPoolVersion = 1
+  rejectsWith market Prototype.assertWronglyTyped $ executeAs market (controllersOf market) pausedIntent inputCid
+  submit fixture.trader $ exerciseCmd pausedIntent Cancel
+  assertArchived fixture.trader pausedIntent
+  resumedCid <- settleResume market pausedCid
+  rejectsWith market (Settlement.assertConsumedAmong [show market.initialized.poolCid]) $
+    executeAs market (controllersOf market) staleIntent inputCid
+  submit fixture.trader $ exerciseCmd staleIntent Cancel
+  assertArchived fixture.trader staleIntent
+  freshIntent <- submitIntent market factoryCid resumedCid TreasuryForStable 1000 1993 deadline
+  _ <- settleIntent market freshIntent resumedCid TreasuryForStable inputCid 1000 1993
+  pure ()
+
+-- ATTACK J. Late failures. Actors: the operator with an LP or a trader, through probes that
+-- complete a genuine transition and then fail in the same transaction: a fully approved pause
+-- followed by a paused withdrawal with an unreachable minimum; a paused withdrawal followed by a
+-- second one with an unreachable minimum; a fully approved resume followed by a swap with an
+-- unreachable minimum. Expected: `amm/slippage`, and the whole transaction rolls back: the
+-- proposal, state, reserves, positions and holdings are exactly as before, and each transition
+-- then settles normally.
+lateFailuresRollBackLifecycleTransitions : Script ()
+lateFailuresRollBackLifecycleTransitions = do
+  (market, poolCid, _) <- twoProviderMarket "pause-j"
+  let fixture = market.fixture
+  let operator = fixture.operator
+  (pool, _, _) <- checkSecurePool market poolCid
+  expiresAt <- futureDeadline
+  let terms = pauseTermsFor market poolCid pool.stateVersion expiresAt
+  proposalCid <- collectPauseApprovals operator (otherCoreOf market) terms
+  pauseProbe <- submit (actAs [operator, fixture.provider]) $
+    createCmd PauseThenFailProbe with finalizer = operator; provider = fixture.provider
+  rejectsWith market (assertFailureId slippageError) $
+    trySubmit operator $ exerciseCmd pauseProbe PauseThenFail with
+      proposalCid
+      terms
+      positionCid = market.initialized.positionCid
+      burnShares = amountOf 1000
+  pausedCid <- submit operator $ exerciseCmd proposalCid FinalizePause with finalizer = operator; expectedTerms = terms
+  (paused, _, _) <- checkPausedPool market pausedCid
+  paused === pausedStateOf pool
+
+  exitProbe <- submit fixture.provider $ createCmd PausedExitProbe with provider = fixture.provider
+  disclosures <- pausedDisclosures market pausedCid
+  rejectsWith market (assertFailureId slippageError) $
+    trySubmit (actAs fixture.provider <> discloseMany disclosures) $
+      exerciseCmd exitProbe ExitThenFail with
+        pausedPoolCid = pausedCid
+        positionCid = market.initialized.positionCid
+        burnShares = amountOf 1000
+        expectedVersion = paused.stateVersion
+
+  let resumeTerms = resumeTermsFor market pausedCid paused.stateVersion expiresAt
+  resumeCid <- collectResumeApprovals operator (otherCoreOf market) resumeTerms
+  resumeProbe <- submit (actAs [operator, fixture.trader]) $
+    createCmd ResumeThenFailProbe with finalizer = operator; trader = fixture.trader
+  inputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  inputDisclosed <- disclosureOf fixture.trader inputCid
+  deadline <- futureDeadline
+  rejectsWith market (assertFailureId slippageError) $
+    trySubmit (actAs operator <> discloseMany [inputDisclosed]) $
+      exerciseCmd resumeProbe ResumeThenFail with
+        proposalCid = resumeCid
+        terms = resumeTerms
+        inputHoldingCid = inputCid
+        inputAmount = amountOf 1000
+        deadline
+  submit operator $ exerciseCmd resumeCid CancelResume with canceller = operator
+  exit <- settlePausedRemove market fixture.provider pausedCid market.initialized.positionCid 1000000 708392 1411655
+  resumedCid <- settleResume market exit.poolCid
+  _ <- settleSwap market fixture.trader resumedCid TreasuryForStable inputCid 1000 1986
+  pure ()
+
+-- ATTACK K, TRUST LIMIT. Actor: the full core set (custodian, operator, both issuers).
+-- Demonstrated, not prevented: without any proposal it can archive the active state and create
+-- the paused state directly, and archive the paused state and both reserves together, which
+-- destroys the reserve value and strands every LP position (the LP's withdrawal then fails on
+-- the missing state). Pause is not a recovery from that: nothing in this package can restore an
+-- archived reserve. Still prevented with that coalition: paying the LP's redemption to anyone
+-- else, and redeeming without the LP (`AuthorizationError`).
+fullCoreCoalitionRemainsTrustedWhilePaused : Script ()
+fullCoreCoalitionRemainsTrustedWhilePaused = do
+  (market, poolCid, _) <- twoProviderMarket "pause-k"
+  let fixture = market.fixture
+  let core = coreOf market
+  (pool, _, _) <- checkSecurePool market poolCid
+  pausedCid <- submit (actAs core) $ archiveCmd poolCid *> createCmd (pausedStateOf pool)
+  (paused, _, _) <- checkPausedPool market pausedCid
+  disclosures <- pausedDisclosures market pausedCid
+  rejectsWith market assertAuthorizationError $
+    trySubmit (actAs (fixture.governance :: core) <> discloseMany disclosures) $
+      pausedRemoveCommand pausedCid fixture.provider market.initialized.positionCid 1000000 paused.stateVersion
+  totalsBefore <- totalsOf market
+  submit (actAs core) $
+    archiveCmd paused.treasuryReserveCid *> archiveCmd paused.stableReserveCid *> archiveCmd pausedCid
+  totalsOf market >>= (=== Totals with
+    treasury = totalsBefore.treasury - atomsOf paused.treasuryReserveAmount
+    stable = totalsBefore.stable - atomsOf paused.stableReserveAmount)
+  rejectsWith market (Settlement.assertConsumedAmong [show pausedCid]) $
+    trySubmit (actAs fixture.provider <> discloseMany disclosures) $
+      pausedRemoveCommand pausedCid fixture.provider market.initialized.positionCid 1000000 paused.stateVersion
+  genesisStates market >>= (=== ([], []))
+
+-- PRIVACY. Visibility of each role while active, paused and resumed. Expected: governance and
+-- the auditor see the state, both reserves and both positions; each LP sees only its own
+-- position and not the state or reserves (it settles with disclosures); the trader sees none of
+-- them and no LP identity; lifecycle proposals are visible to the core signers only. The
+-- auditor and governance cannot approve a pause or withdraw anyone's position.
+lifecycleVisibilityByRole : Script ()
+lifecycleVisibilityByRole = do
+  (market, poolCid, secondPositionCid) <- twoProviderMarket "pause-v"
+  let fixture = market.fixture
+  let positions = [market.initialized.positionCid, secondPositionCid]
+  let checkViews stateSeen reserveCids = do
+        forA_ [fixture.governance, fixture.auditor] $ \observer -> do
+          stateSeen observer >>= (=== True)
+          mapA (sees observer) reserveCids >>= (=== [True, True])
+          mapA (sees observer) positions >>= (=== [True, True])
+        forA_ [fixture.provider, market.secondProvider, fixture.trader] $ \outsider -> do
+          stateSeen outsider >>= (=== False)
+          mapA (sees outsider) reserveCids >>= (=== [False, False])
+        mapA (sees fixture.provider) positions >>= (=== [True, False])
+        mapA (sees market.secondProvider) positions >>= (=== [False, True])
+        mapA (sees fixture.trader) positions >>= (=== [False, False])
+  (pool, _, _) <- checkSecurePool market poolCid
+  checkViews (`sees` poolCid) [pool.treasuryReserveCid, pool.stableReserveCid]
+
+  expiresAt <- futureDeadline
+  let terms = pauseTermsFor market poolCid pool.stateVersion expiresAt
+  proposalCid <- collectPauseApprovals fixture.operator (otherCoreOf market) terms
+  mapA (`sees` proposalCid) (coreOf market) >>= (=== [True, True, True, True])
+  mapA (`sees` proposalCid) [fixture.governance, fixture.auditor, fixture.trader, fixture.provider, market.secondProvider]
+    >>= (=== [False, False, False, False, False])
+  pausedCid <- submit fixture.operator $ exerciseCmd proposalCid FinalizePause with finalizer = fixture.operator; expectedTerms = terms
+  (paused, _, _) <- checkPausedPool market pausedCid
+  checkViews (`sees` pausedCid) [paused.treasuryReserveCid, paused.stableReserveCid]
+
+  disclosures <- pausedDisclosures market pausedCid
+  positionDisclosed <- disclosureOf fixture.provider market.initialized.positionCid
+  forA_ [fixture.governance, fixture.auditor] $ \observer ->
+    rejectsWith market (assertFailureId ownerMismatchError) $
+      trySubmit (actAs observer <> discloseMany (positionDisclosed :: disclosures)) $
+        pausedRemoveCommand pausedCid observer market.initialized.positionCid 1000 paused.stateVersion
+  let resumeTerms = resumeTermsFor market pausedCid paused.stateVersion expiresAt
+  resumeCid <- collectResumeApprovals fixture.operator [] resumeTerms
+  resumeDisclosed <- disclosureOf fixture.operator resumeCid
+  forA_ [fixture.governance, fixture.auditor] $ \observer ->
+    rejectsWith market (assertFailureId lifecycleApproverError) $
+      trySubmit (actAs observer <> discloseMany [resumeDisclosed]) $
+        exerciseCmd resumeCid ApproveResume with approver = observer; expectedTerms = resumeTerms
+  submit fixture.operator $ exerciseCmd resumeCid CancelResume with canceller = fixture.operator
+
+  resumedCid <- settleResume market pausedCid
+  (resumed, _, _) <- checkSecurePool market resumedCid
+  checkViews (`sees` resumedCid) [resumed.treasuryReserveCid, resumed.stableReserveCid]
+  unless (resumed.auditors == [fixture.auditor]) $ abort "Auditors changed across the lifecycle"

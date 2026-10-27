@@ -6,6 +6,8 @@
 # before its expected list below is updated. It cannot judge an edited body of an existing
 # choice. Run after `dpm build --all`.
 set -euo pipefail
+# The SDK every daml.yaml pins; outside a package directory dpm would resolve its own default.
+export DPM_SDK_VERSION=3.5.5
 
 cd "$(dirname "$0")/../.."
 
@@ -55,10 +57,13 @@ CantonTreasuryAmm.Token:Holding
 CantonTreasuryAmm.Token:TokenInstrument'
 
 inventory "Secure V1 production package" \
-  canton-treasury-amm-secure-v1/.daml/dist/canton-treasury-amm-secure-v1-0.1.0.dar \
+  canton-treasury-amm-secure-v1/.daml/dist/canton-treasury-amm-secure-v1-0.2.0.dar \
   'CantonTreasuryAmm.SecureV1.Onboarding:SecurePoolProposal
 CantonTreasuryAmm.SecureV1.Onboarding:SecureSwapIntentExecutionApproval
 CantonTreasuryAmm.SecureV1.Onboarding:SecureSwapIntentFactoryProposal
+CantonTreasuryAmm.SecureV1.Pause:SecurePauseProposal
+CantonTreasuryAmm.SecureV1.Pause:SecurePausedPool
+CantonTreasuryAmm.SecureV1.Pause:SecureResumeProposal
 CantonTreasuryAmm.SecureV1.Pool:SecureLiquidityPosition
 CantonTreasuryAmm.SecureV1.Pool:SecurePool
 CantonTreasuryAmm.SecureV1.Pool:SecurePoolCharter
@@ -102,7 +107,7 @@ ReserveHolding consuming Disburse
 ReserveHolding implements Splice.Api.Token.HoldingV1:Holding'
 
 check "Secure V1 production pool" \
-  canton-treasury-amm-secure-v1/.daml/dist/canton-treasury-amm-secure-v1-0.1.0.dar \
+  canton-treasury-amm-secure-v1/.daml/dist/canton-treasury-amm-secure-v1-0.2.0.dar \
   'CantonTreasuryAmm\.SecureV1\.Pool' \
   'SecureLiquidityPosition consuming Archive
 SecurePool consuming AddLiquidity
@@ -115,7 +120,7 @@ SecureReserveHolding consuming Archive
 SecureReserveHolding implements Splice.Api.Token.HoldingV1:Holding'
 
 check "Secure V1 production swap intent" \
-  canton-treasury-amm-secure-v1/.daml/dist/canton-treasury-amm-secure-v1-0.1.0.dar \
+  canton-treasury-amm-secure-v1/.daml/dist/canton-treasury-amm-secure-v1-0.2.0.dar \
   'CantonTreasuryAmm\.SecureV1\.SwapIntent' \
   'SecureSwapIntent consuming Archive
 SecureSwapIntent consuming Cancel
@@ -124,7 +129,7 @@ SecureSwapIntentFactory consuming Archive
 SecureSwapIntentFactory non-consuming SubmitSwapIntent'
 
 check "Secure V1 production onboarding" \
-  canton-treasury-amm-secure-v1/.daml/dist/canton-treasury-amm-secure-v1-0.1.0.dar \
+  canton-treasury-amm-secure-v1/.daml/dist/canton-treasury-amm-secure-v1-0.2.0.dar \
   'CantonTreasuryAmm\.SecureV1\.Onboarding' \
   'SecurePoolProposal consuming ApprovePoolProposal
 SecurePoolProposal consuming Archive
@@ -136,5 +141,19 @@ SecureSwapIntentExecutionApproval consuming ExecuteApprovedIntent
 SecureSwapIntentFactoryProposal consuming AcceptFactoryProposal
 SecureSwapIntentFactoryProposal consuming Archive
 SecureSwapIntentFactoryProposal consuming CancelFactoryProposal'
+
+check "Secure V1 production pause" \
+  canton-treasury-amm-secure-v1/.daml/dist/canton-treasury-amm-secure-v1-0.2.0.dar \
+  'CantonTreasuryAmm\.SecureV1\.Pause' \
+  'SecurePauseProposal consuming ApprovePause
+SecurePauseProposal consuming Archive
+SecurePauseProposal consuming CancelPause
+SecurePauseProposal consuming FinalizePause
+SecurePausedPool consuming Archive
+SecurePausedPool consuming RemovePausedLiquidity
+SecureResumeProposal consuming ApproveResume
+SecureResumeProposal consuming Archive
+SecureResumeProposal consuming CancelResume
+SecureResumeProposal consuming FinalizeResume'
 
 exit $status

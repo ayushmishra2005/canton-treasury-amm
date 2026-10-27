@@ -220,6 +220,26 @@ was identified.
 - **Governance.** Governance signs only the factory and execution approvals. It is never a
   signer of a proposal or a charter and gains no reserve authority.
 
+### Pause source review (Stage 3.2)
+
+This review covered `SecureV1/Pause.daml` and the `Pool.daml` refactor at package ID
+`4abe290579f46ac9…` (version 0.2.0). `Onboarding.daml` and `SwapIntent.daml` are unchanged. No
+critical, high or medium finding was identified.
+
+- **Shared redemption.** `RemoveLiquidity` and `RemovePausedLiquidity` both run
+  `validatePoolAccounts` and then `redeemPosition`. The checks happen in the same order as the
+  Stage 3.1 `RemoveLiquidity`, so active and paused exits cannot diverge.
+- **Whose authority each body carries.** `FinalizePause` and `FinalizeResume` run with the
+  proposal's signers, which must equal the four core signers. Each fetches and validates the
+  bound state and its reserves, archives that one state, and creates one counterpart with
+  identical fields and the version plus one. Neither body creates or archives a reserve,
+  position or holding. `RemovePausedLiquidity` pays only the controlling provider.
+- **Exact terms and replay.** Approvals and finalizations compare the full terms record.
+  Approvals, finalizations and cancellations are consuming. Finalization consumes the bound
+  state, and every transition increases the version.
+- **Signers.** The proposal precondition admits only distinct core signers from an
+  independent lineage. Governance and the auditors are observers of the paused state only.
+
 ## Residual trust
 
 ### What the full core can do
@@ -229,15 +249,19 @@ Acting together, the custodian, the operator and both issuers can:
 - create a second active state for an existing genesis;
 - mint themselves a position and redeem it from genuine reserves;
 - co-burn a position together with its provider, which reconciliation reports as supply drift;
-- archive the reserves, the pool state and the charter.
+- archive the reserves, the pool state and the charter;
+- pause or resume a pool directly, without a proposal, and archive a paused state with its
+  reserves.
 
-`SecureV1Attacks:fullCoreCoalitionRemainsTrusted` demonstrates each of these. Even then, two
+`SecureV1Attacks:fullCoreCoalitionRemainsTrusted` and
+`SecureV1Pause:fullCoreCoalitionRemainsTrustedWhilePaused` demonstrate each of these. Even then, two
 things stay out of reach: the core cannot spend a trader's holding without the trader, and it
 cannot redeem a position beyond the supply minus the locked share.
 
 ### Destroyable assets and archivable contracts
 
-The full core can archive every `SecureReserveHolding`, `SecurePool` and `SecurePoolCharter`.
+The full core can archive every `SecureReserveHolding`, `SecurePool`, `SecurePausedPool` and
+`SecurePoolCharter`.
 Together with the provider, it can also archive any `SecureLiquidityPosition`. Archiving a
 reserve destroys its on-ledger value and freezes the pool, because every later choice fails to
 fetch the reserve. Each issuer alone can also archive any ordinary `Holding` of its
@@ -265,7 +289,10 @@ On Canton, every pool transaction needs a confirmation from each core party's pa
   `mpReconnectedSwap`). Finalizing a fully approved pool proposal failed the same way during
   the outage, left the proposal unchanged, and succeeded after reconnection. That shows one
   participant, one outage and one recovery. It does not prove every outage or censorship
-  property.
+  property. With a paused pool, an LP withdrawal and the finalization of a fully approved
+  resume failed the same way during a second outage and settled after reconnection
+  (`mpOfflinePausedExit`, `mpResumeAfterOutage`): pause does not keep LP exits available when a
+  signer is offline.
 - **An issuer refuses to confirm.** The effect is the same as unavailability, but indefinite and
   selective: the issuer can block any swap or LP exit. LPs cannot exit without the issuer.
   There is no on-ledger remedy by design, because any bypass would let a smaller coalition move
@@ -286,7 +313,9 @@ On Canton, every pool transaction needs a confirmation from each core party's pa
 All four core signers must confirm:
 - creating a charter, through the `SecurePoolProposal` workflow (see [`ONBOARDING.md`](ONBOARDING.md));
 - every `InitializePool`, `SwapExactInput`, `AddLiquidity`, `RemoveLiquidity` and intent `Execute`;
-- every archive of a reserve, pool state or charter.
+- every pause and resume, through `SecurePauseProposal` and `SecureResumeProposal` (see
+  [`PAUSE.md`](PAUSE.md)), and every `RemovePausedLiquidity`;
+- every archive of a reserve, pool state, paused state or charter.
 
 Archiving a position additionally needs its provider.
 
@@ -303,34 +332,31 @@ against a compromised key or participant of any signer.
 
 ### Emergency stop and recovery design
 
-Secure V1 has no pause. Full-core archival is destructive and is not a safe pause. It destroys
-reserve value and makes every position unredeemable until the full core restores the contracts.
-It is a deployment risk, not an emergency procedure.
+Since Stage 3.2, Secure V1 has a reversible pause (`CantonTreasuryAmm.SecureV1.Pause`; see
+[`PAUSE.md`](PAUSE.md)):
+- **Pause.** A `SecurePauseProposal` collects all four core signatures, one participant at a
+  time. It is bound to the lineage, the genesis, the exact active state, its version and an
+  expiry. Finalizing it archives that state and creates a `SecurePausedPool` with identical
+  reserves, amounts, supply, locked share, fee counters and auditors, and the version plus one.
+  `SecureResumeProposal` reverses this in the same way.
+- **While paused.** The paused template has no swap, deposit or intent path. Its only economic
+  choice, `RemovePausedLiquidity`, is the LP's own exit and runs the same validation and
+  redemption code as `RemoveLiquidity`. No withdrawal by any core member, no sweep and no
+  recipient argument exist.
+- **Authority.** No strict subset of the core, and not governance, can pause, resume or act on
+  a paused pool's reserves. A full-core pause adds no power the full core lacked, and it
+  replaces the destructive freeze of full-core archival with a reversible stop.
+- **What pause does not do.**
+  - It does not help when a core signer is unavailable or refusing: paused exits, pause and
+    resume all need every core participant (shown on the multi-participant network).
+  - It cannot restore an archived reserve or pool state.
+  - Full-core archival remains destructive and is not a safe stop.
+- **Permanent signer loss.** This freezes the pool for good. The off-ledger recovery decisions
+  are listed in [`PAUSE.md`](PAUSE.md#permanent-signer-loss). None is implemented, and none is
+  authorized.
 
-A safe pause would need a schema change, which is not implemented here. The proposed design is
-as follows:
-- A full-core-controlled `Pause` choice on `SecurePool` that archives the active state. It
-  creates a `PausedSecurePool` with the same fields, the same reserves and the same version.
-- `PausedSecurePool` would have exactly two choices:
-  - `Resume`, controlled by the full core, which recreates the active state.
-  - The existing `RemoveLiquidity` logic, so LPs can still exit pro rata through authenticated
-    positions, the lineage and genesis checks, the locked-share guard and the same rounding.
-- No swaps or deposits while paused. No withdrawal by any core member, no sweep and no
-  recipient argument.
-
-Security analysis:
-- The full core can already archive and recreate anything, so a full-core pause adds no new
-  power. It replaces a destructive freeze with a reversible one.
-- A pause controlled by a smaller set (for example any single core signer) would remove the
-  liveness dependency for stopping, but it gives that party a griefing tool. It would be
-  acceptable only if the exit-only path stays available to LPs. It must not include any
-  withdrawal power.
-- Exit-only mode still needs every core participant to confirm. It does not help when a signer
-  is unavailable or refusing, and no design can without weakening the four-core model.
-- Adding the template changes the package and its choice surface. It needs a new package
-  version, an upgrade-compatibility check, a semantic review and attack tests (pause by each
-  strict subset, swap and deposit while paused, exit accounting while paused, resume by each
-  strict subset). It is therefore deferred for an explicit decision.
+A single-party emergency pause was not added. It would give that party a griefing tool and
+would still not let LPs exit without every core signer.
 
 ## Compatibility
 

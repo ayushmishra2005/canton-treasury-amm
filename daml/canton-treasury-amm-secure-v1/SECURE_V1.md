@@ -3,7 +3,7 @@
 `CantonTreasuryAmm.SecureV1.Pool` and `CantonTreasuryAmm.SecureV1.SwapIntent` are a parallel
 implementation of the AMM in which pool reserves are protected contracts rather than
 operator-owned holdings. They are the Stage 2.1 "model B" prototype, productionized. They live
-in their own package, `canton-treasury-amm-secure-v1` 0.1.0, which data-depends on the legacy
+in their own package, `canton-treasury-amm-secure-v1` 0.2.0, which data-depends on the legacy
 `canton-treasury-amm` 0.1.0 DAR (package ID `d8cadd3c…`) for `Holding`, `Math`, `Errors`,
 `Types` and `Pool.validateSwap`. The legacy package is byte-identical to its Phase 0 build. Its
 `Pool`, `LiquidityPosition` and `SwapIntent` templates remain the legacy MVP model, which is not
@@ -18,6 +18,8 @@ implemented. Related documents in this package:
 - [`MIGRATION.md`](MIGRATION.md): the legacy-to-Secure V1 cutover design.
 - [`ONBOARDING.md`](ONBOARDING.md): how charters, factories and intent executions are approved
   when every signer is hosted on its own participant.
+- [`PAUSE.md`](PAUSE.md): pause and resume, LP exits while paused, liveness limits and permanent
+  signer loss.
 
 ## Architecture and trust
 
@@ -32,10 +34,20 @@ implemented. Related documents in this package:
 | `SecurePoolProposal` | the operator and each core signer that has approved | core | `ApprovePoolProposal` (the approving core signer), `FinalizePoolProposal` (operator), `CancelPoolProposal` (any core signer) |
 | `SecureSwapIntentFactoryProposal` | operator | governance | `AcceptFactoryProposal` (governance), `CancelFactoryProposal` (operator or governance) |
 | `SecureSwapIntentExecutionApproval` | governance | operator | `ExecuteApprovedIntent` (operator), `CancelExecutionApproval` (operator or governance) |
+| `SecurePausedPool` | core | governance, pool auditors | `RemovePausedLiquidity` (provider) |
+| `SecurePauseProposal` | each core signer that has approved | core | `ApprovePause` (the approving core signer), `FinalizePause` (any core signer, after all four approved), `CancelPause` (any core signer) |
+| `SecureResumeProposal` | each core signer that has approved | core | `ApproveResume`, `FinalizeResume`, `CancelResume` (as for pause) |
 
-The last three templates (`CantonTreasuryAmm.SecureV1.Onboarding`) only collect approvals. They
-hold no assets, and each creates exactly one charter or factory, or runs one intent's
-`Execute`. See [`ONBOARDING.md`](ONBOARDING.md).
+The three proposal and approval templates of `CantonTreasuryAmm.SecureV1.Onboarding` only
+collect approvals. They hold no assets, and each creates exactly one charter or factory, or
+runs one intent's `Execute`. See [`ONBOARDING.md`](ONBOARDING.md).
+
+`CantonTreasuryAmm.SecureV1.Pause` adds the paused state and its two proposals. A pause
+proposal approved by all four core signers replaces the active `SecurePool` with a
+`SecurePausedPool` carrying identical reserves, supply, locked share, fee counters and
+auditors, and the version plus one. A resume proposal reverses it. The paused state has no swap
+or deposit path; `RemovePausedLiquidity` runs the same redemption code as `RemoveLiquidity`.
+See [`PAUSE.md`](PAUSE.md).
 
 - **Reserves have no choices.** Every reserve is archived and recreated only inside a pool
   choice. Those choices run with the core's authority (the pool's signatories) and enforce the
@@ -85,10 +97,11 @@ reserve cap is 10^17 atoms.
   and leaves the fee counters unchanged.
 - `RemoveLiquidity` is controlled by the position's provider. It applies the locked-share guard
   and the burn ≤ position check, archives the position and creates any remainder, pays the
-  provider, and leaves the fee counters unchanged.
+  provider, and leaves the fee counters unchanged. `RemovePausedLiquidity` on a paused pool
+  shares this code.
 
-Every operation consumes the pool state and creates exactly one successor with
-`stateVersion + 1`.
+Every operation, pause and resume included, consumes the pool state and creates exactly one
+successor with `stateVersion + 1`.
 
 ## Fee accounting equivalence
 
@@ -98,7 +111,7 @@ Every operation consumes the pool state and creates exactly one successor with
   (Treasury-for-stablecoin credits `treasuryFeeAmount`; stablecoin-for-Treasury credits
   `stableFeeAmount`).
 - They saturate at the reserve cap.
-- Add and remove leave them unchanged.
+- Add and remove, pause, paused removal and resume leave them unchanged.
 - Every successor carries them.
 
 The tests compare the secure and legacy pools after every step, field by field: both reserves,
@@ -171,7 +184,7 @@ residual.
 | `ContractNotFound` (consumed) | Replay of an archived contract. A Canton participant may report `LOCAL_VERDICT_INACTIVE_CONTRACTS` instead. |
 | `ContractNotFound` (visibility) | An active contract the submitter cannot see. Asserted separately: stale reserve disclosures cannot stand in for the live reserves. |
 | `WronglyTypedContract` | A Secure V1 contract passed to Stage 1.1 custody controls or to a legacy `Holding` choice. |
-| `FailureStatusError` | A domain rejection with a stable `amm/...` error ID. |
+| `FailureStatusError` | A domain rejection with a stable `amm/...` error ID. Pause and resume add `amm/lifecycle-terms` (terms differ from the caller's), `amm/lifecycle-approver` (not a core signer, or already approved) and `amm/lifecycle-incomplete` (fewer than four approvals). |
 
 On the local multi-participant Canton network, the same cases surface as Canton error codes:
 
@@ -194,13 +207,17 @@ On the local multi-participant Canton network, the same cases surface as Canton 
 - `SecureV1Onboarding`: pool proposals, factory proposals and execution approvals, including
   every incomplete approval set, forged and misattributed approvals, changed terms, replay,
   cancellation, expiry, competing proposals and second pools.
+- `SecureV1Pause`: pause, two-LP partial and full exits while paused, resume and the first
+  swap after it; rejected trading, deposits and intents; every partial coalition; replay,
+  cross-pool and expired approvals; forged positions; custody paths; foreign reserves; fee
+  counters; late-failure rollback; full-core trust; visibility by role.
 - `MultiParticipant`: the multi-participant Canton scenarios. Its scripts take arguments, so
   `dpm test` does not run them; `scripts/run-multi-participant.sh` runs them on a local
   eight-participant network (see [`RELEASE_READINESS.md`](RELEASE_READINESS.md)).
 
 Shared invariant and settlement checks live in `SecureV1Support`; test-only adversary
 templates are in `SecureV1Adversary`. After every transition, the checks cover:
-- exactly one active state per genesis;
+- exactly one active or one paused state per genesis;
 - reserve set and amounts;
 - instrument totals (ordinary holdings plus reserves);
 - the input instrument's fee counter, computed independently, with the other counter

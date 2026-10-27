@@ -6,11 +6,12 @@
 -- Authorization: every charter, pool state and reserve is signed by the custodian, the operator
 -- and both instrument issuers (the core signers), which must be distinct from each other and
 -- from governance; positions are also signed by their provider. Reserves have no choices of
--- their own. They change only inside the pool choices below, which archive each consumed reserve
--- and create its successor with the pool's own signatory authority, so value leaves a reserve
--- only through a pool transition that accounts for it. No strict subset of the core can move,
--- archive or create a reserve, pool state or position. The full core coalition can, and is
--- trusted; the custodian is assumed independent.
+-- their own. They change only inside the pool choices below and the paused pool's withdrawal in
+-- `CantonTreasuryAmm.SecureV1.Pause`, which archive each consumed reserve and create its
+-- successor with the pool's own signatory authority, so value leaves a reserve only through a
+-- pool transition that accounts for it. Pause and resume move no reserve. No strict subset of the
+-- core can move, archive or create a reserve, pool state or position. The full core coalition
+-- can, and is trusted; the custodian is assumed independent.
 --
 -- Asset model: reserves are `SecureReserveHolding`s, which the issuers must adopt and co-sign.
 -- An ordinary `Holding` cannot be a protected reserve (its issuer alone can archive it and its
@@ -89,7 +90,8 @@ data SecureRemoveLiquidityResult = SecureRemoveLiquidityResult with
 
 -- A live, protected pool reserve. It has no choices: only a contract carrying all four core
 -- signatures can archive or create one, and the only such contracts here are the charter and
--- the pool state. `auditors` are the holding auditors of the deposits it absorbed, exactly as a
+-- the active and paused pool states (the pause and resume proposals carry all four signatures but
+-- only archive and recreate a pool state, never a reserve). `auditors` are the holding auditors of the deposits it absorbed, exactly as a
 -- legacy operator-owned reserve `Holding` carries them; they observe but cannot act.
 template SecureReserveHolding
   with
@@ -350,46 +352,22 @@ template SecurePool
       controller provider
       do
         (treasuryReserve, stableReserve) <- validateSecurePool this expectedVersion
-        position <- fetch positionCid
-        requireDomain (position.lineage == lineage && position.genesisCid == genesisCid) positionError "Liquidity position belongs to another pool"
-        requireDomain (position.provider == provider) ownerMismatchError "Provider does not own the liquidity position"
-        requireDomain (burnShares > 0.0 && minimumTreasuryOut >= 0.0 && minimumStableOut >= 0.0) invalidAmountError "Removal amounts must be positive or zero as required"
-        requireDomain (burnShares <= maxReserveAmount && minimumTreasuryOut <= maxReserveAmount && minimumStableOut <= maxReserveAmount) reserveCapError "Removal amount exceeds the atom cap"
-        let burnShareAtoms = atomsOf burnShares
-        let totalShareAtoms = atomsOf totalShares
-        let lockedShareAtoms = atomsOf lockedShares
-        requireState (burnShareAtoms <= totalShareAtoms - lockedShareAtoms) positionError "Burn would consume locked shares"
-        let treasuryReserveAtoms = atomsOf treasuryReserveAmount
-        let stableReserveAtoms = atomsOf stableReserveAmount
-        treasuryOutputAtoms <- narrowAtoms (wideMulFloor burnShareAtoms treasuryReserveAtoms totalShareAtoms)
-        stableOutputAtoms <- narrowAtoms (wideMulFloor burnShareAtoms stableReserveAtoms totalShareAtoms)
-        requireState (treasuryOutputAtoms > 0 || stableOutputAtoms > 0) insufficientLiquidityError "Burn produces no output"
-        requireDomain (treasuryOutputAtoms >= atomsOf minimumTreasuryOut && stableOutputAtoms >= atomsOf minimumStableOut) slippageError "Liquidity output is below its minimum"
-        let positionShareAtoms = atomsOf position.shares
-        requireState (burnShareAtoms <= positionShareAtoms) positionError "Burn amount exceeds the position"
-        archive positionCid
-        remainingPositionCid <-
-          if burnShareAtoms == positionShareAtoms
-            then pure None
-            else Some <$> create position with shares = amountOf (positionShareAtoms - burnShareAtoms)
-        (treasuryOutputHoldingCid, nextTreasuryReserveCid) <-
-          disburseIfPositive treasuryReserveCid treasuryReserve provider treasuryOutputAtoms
-        (stableOutputHoldingCid, nextStableReserveCid) <-
-          disburseIfPositive stableReserveCid stableReserve provider stableOutputAtoms
+        redemption <- redeemPosition (accountsOf this) treasuryReserve stableReserve provider positionCid
+          burnShares minimumTreasuryOut minimumStableOut
         poolCid <- create this with
-          treasuryReserveCid = nextTreasuryReserveCid
-          stableReserveCid = nextStableReserveCid
-          treasuryReserveAmount = amountOf (treasuryReserveAtoms - treasuryOutputAtoms)
-          stableReserveAmount = amountOf (stableReserveAtoms - stableOutputAtoms)
-          totalShares = amountOf (totalShareAtoms - burnShareAtoms)
+          treasuryReserveCid = redemption.nextTreasuryReserveCid
+          stableReserveCid = redemption.nextStableReserveCid
+          treasuryReserveAmount = redemption.nextTreasuryReserveAmount
+          stableReserveAmount = redemption.nextStableReserveAmount
+          totalShares = redemption.nextTotalShares
           stateVersion = stateVersion + 1
         pure SecureRemoveLiquidityResult with
           poolCid
-          remainingPositionCid
-          treasuryOutputHoldingCid
-          stableOutputHoldingCid
-          treasuryOut = amountOf treasuryOutputAtoms
-          stableOut = amountOf stableOutputAtoms
+          remainingPositionCid = redemption.remainingPositionCid
+          treasuryOutputHoldingCid = redemption.treasuryOutputHoldingCid
+          stableOutputHoldingCid = redemption.stableOutputHoldingCid
+          treasuryOut = redemption.treasuryOut
+          stableOut = redemption.stableOut
 
 -- An LP entitlement with no choices. It changes only inside `RemoveLiquidity`, which pays its
 -- share of both reserves; its implicit `Archive` needs the provider and all four core signers.
@@ -405,22 +383,112 @@ template SecureLiquidityPosition
     observer lineage.governance, auditors
     ensure isPositiveCapped shares && secureLineageIsIndependent lineage
 
+-- The reserve and LP accounting a pool state records, shared by the active state and the paused
+-- state (`CantonTreasuryAmm.SecureV1.Pause`), which carry the same fields.
+data SecurePoolAccounts = SecurePoolAccounts with
+    lineage : SecureLineage
+    genesisCid : ContractId SecurePoolCharter
+    treasuryReserveCid : ContractId SecureReserveHolding
+    stableReserveCid : ContractId SecureReserveHolding
+    treasuryReserveAmount : Decimal
+    stableReserveAmount : Decimal
+    totalShares : Decimal
+    lockedShares : Decimal
+    stateVersion : Int
+  deriving (Eq, Show)
+
+accountsOf : SecurePool -> SecurePoolAccounts
+accountsOf pool = SecurePoolAccounts with
+  lineage = pool.lineage
+  genesisCid = pool.genesisCid
+  treasuryReserveCid = pool.treasuryReserveCid
+  stableReserveCid = pool.stableReserveCid
+  treasuryReserveAmount = pool.treasuryReserveAmount
+  stableReserveAmount = pool.stableReserveAmount
+  totalShares = pool.totalShares
+  lockedShares = pool.lockedShares
+  stateVersion = pool.stateVersion
+
 -- Checks the expected version, that both referenced reserves are live reserves of this pool's
 -- lineage, genesis and instrument, and that the recorded amounts equal them.
 validateSecurePool : SecurePool -> Int -> Update (SecureReserveHolding, SecureReserveHolding)
-validateSecurePool pool expectedVersion = do
-  requireState (pool.stateVersion == expectedVersion) staleStateError "Pool state version is stale"
-  treasuryReserve <- fetch pool.treasuryReserveCid
-  stableReserve <- fetch pool.stableReserveCid
-  requireState (reserveBelongsTo pool pool.lineage.treasuryInstrument treasuryReserve) reserveMismatchError "Treasury reserve does not belong to this pool"
-  requireState (reserveBelongsTo pool pool.lineage.stableInstrument stableReserve) reserveMismatchError "Stablecoin reserve does not belong to this pool"
-  requireState (treasuryReserve.amount == pool.treasuryReserveAmount) reserveMismatchError "Treasury reserve amount does not match the pool"
-  requireState (stableReserve.amount == pool.stableReserveAmount) reserveMismatchError "Stablecoin reserve amount does not match the pool"
+validateSecurePool pool = validatePoolAccounts (accountsOf pool)
+
+validatePoolAccounts : SecurePoolAccounts -> Int -> Update (SecureReserveHolding, SecureReserveHolding)
+validatePoolAccounts accounts expectedVersion = do
+  requireState (accounts.stateVersion == expectedVersion) staleStateError "Pool state version is stale"
+  treasuryReserve <- fetch accounts.treasuryReserveCid
+  stableReserve <- fetch accounts.stableReserveCid
+  requireState (reserveBelongsToAccounts accounts accounts.lineage.treasuryInstrument treasuryReserve) reserveMismatchError "Treasury reserve does not belong to this pool"
+  requireState (reserveBelongsToAccounts accounts accounts.lineage.stableInstrument stableReserve) reserveMismatchError "Stablecoin reserve does not belong to this pool"
+  requireState (treasuryReserve.amount == accounts.treasuryReserveAmount) reserveMismatchError "Treasury reserve amount does not match the pool"
+  requireState (stableReserve.amount == accounts.stableReserveAmount) reserveMismatchError "Stablecoin reserve amount does not match the pool"
   pure (treasuryReserve, stableReserve)
 
 reserveBelongsTo : SecurePool -> InstrumentId -> SecureReserveHolding -> Bool
-reserveBelongsTo pool instrument reserve =
-  reserve.lineage == pool.lineage && reserve.genesisCid == pool.genesisCid && reserve.instrument == instrument
+reserveBelongsTo pool = reserveBelongsToAccounts (accountsOf pool)
+
+reserveBelongsToAccounts : SecurePoolAccounts -> InstrumentId -> SecureReserveHolding -> Bool
+reserveBelongsToAccounts accounts instrument reserve =
+  reserve.lineage == accounts.lineage && reserve.genesisCid == accounts.genesisCid && reserve.instrument == instrument
+
+data SecureRedemption = SecureRedemption with
+    remainingPositionCid : Optional (ContractId SecureLiquidityPosition)
+    treasuryOutputHoldingCid : Optional (ContractId Holding)
+    stableOutputHoldingCid : Optional (ContractId Holding)
+    treasuryOut : Decimal
+    stableOut : Decimal
+    nextTreasuryReserveCid : ContractId SecureReserveHolding
+    nextStableReserveCid : ContractId SecureReserveHolding
+    nextTreasuryReserveAmount : Decimal
+    nextStableReserveAmount : Decimal
+    nextTotalShares : Decimal
+  deriving (Eq, Show)
+
+-- Redeems `burnShares` of the provider's position of this pool for its pro-rata share of both
+-- validated reserves, rounding the payouts down: the locked share is never burnt, the position
+-- is archived and any remainder recreated, and the provider is paid from the reserves. The
+-- caller creates the successor pool state from the result; this is the only redemption path of
+-- both the active and the paused state.
+redeemPosition : SecurePoolAccounts -> SecureReserveHolding -> SecureReserveHolding -> Party -> ContractId SecureLiquidityPosition -> Decimal -> Decimal -> Decimal -> Update SecureRedemption
+redeemPosition accounts treasuryReserve stableReserve provider positionCid burnShares minimumTreasuryOut minimumStableOut = do
+  position <- fetch positionCid
+  requireDomain (position.lineage == accounts.lineage && position.genesisCid == accounts.genesisCid) positionError "Liquidity position belongs to another pool"
+  requireDomain (position.provider == provider) ownerMismatchError "Provider does not own the liquidity position"
+  requireDomain (burnShares > 0.0 && minimumTreasuryOut >= 0.0 && minimumStableOut >= 0.0) invalidAmountError "Removal amounts must be positive or zero as required"
+  requireDomain (burnShares <= maxReserveAmount && minimumTreasuryOut <= maxReserveAmount && minimumStableOut <= maxReserveAmount) reserveCapError "Removal amount exceeds the atom cap"
+  let burnShareAtoms = atomsOf burnShares
+  let totalShareAtoms = atomsOf accounts.totalShares
+  let lockedShareAtoms = atomsOf accounts.lockedShares
+  requireState (burnShareAtoms <= totalShareAtoms - lockedShareAtoms) positionError "Burn would consume locked shares"
+  let treasuryReserveAtoms = atomsOf accounts.treasuryReserveAmount
+  let stableReserveAtoms = atomsOf accounts.stableReserveAmount
+  treasuryOutputAtoms <- narrowAtoms (wideMulFloor burnShareAtoms treasuryReserveAtoms totalShareAtoms)
+  stableOutputAtoms <- narrowAtoms (wideMulFloor burnShareAtoms stableReserveAtoms totalShareAtoms)
+  requireState (treasuryOutputAtoms > 0 || stableOutputAtoms > 0) insufficientLiquidityError "Burn produces no output"
+  requireDomain (treasuryOutputAtoms >= atomsOf minimumTreasuryOut && stableOutputAtoms >= atomsOf minimumStableOut) slippageError "Liquidity output is below its minimum"
+  let positionShareAtoms = atomsOf position.shares
+  requireState (burnShareAtoms <= positionShareAtoms) positionError "Burn amount exceeds the position"
+  archive positionCid
+  remainingPositionCid <-
+    if burnShareAtoms == positionShareAtoms
+      then pure None
+      else Some <$> create position with shares = amountOf (positionShareAtoms - burnShareAtoms)
+  (treasuryOutputHoldingCid, nextTreasuryReserveCid) <-
+    disburseIfPositive accounts.treasuryReserveCid treasuryReserve provider treasuryOutputAtoms
+  (stableOutputHoldingCid, nextStableReserveCid) <-
+    disburseIfPositive accounts.stableReserveCid stableReserve provider stableOutputAtoms
+  pure SecureRedemption with
+    remainingPositionCid
+    treasuryOutputHoldingCid
+    stableOutputHoldingCid
+    treasuryOut = amountOf treasuryOutputAtoms
+    stableOut = amountOf stableOutputAtoms
+    nextTreasuryReserveCid
+    nextStableReserveCid
+    nextTreasuryReserveAmount = amountOf (treasuryReserveAtoms - treasuryOutputAtoms)
+    nextStableReserveAmount = amountOf (stableReserveAtoms - stableOutputAtoms)
+    nextTotalShares = amountOf (totalShareAtoms - burnShareAtoms)
 
 -- A deposit must be the depositor's own holding of the reserve's instrument and disclose to the
 -- same auditors, the condition the legacy pool's reserve `Merge` imposes.
