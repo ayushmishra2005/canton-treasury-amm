@@ -1,12 +1,14 @@
 module CantonTreasuryAmm.Test.Pool where
 
-import DA.Assert ((===))
+import DA.Assert ((===), (=/=))
+import DA.List (sort)
 import Daml.Script
 
 import CantonTreasuryAmm.Errors
 import CantonTreasuryAmm.LiquidityPosition
 import CantonTreasuryAmm.Pool
 import CantonTreasuryAmm.Test.Fixtures
+import CantonTreasuryAmm.Token
 import CantonTreasuryAmm.Types
 
 setupInitializesOnceAndOnlyByProvider : Script ()
@@ -93,3 +95,92 @@ staleVersionRejectsWithoutChangingPool = do
   assertFailureId staleStateError result
   after <- assertActivePool fixture initialized.poolCid
   after === before
+
+-- Characterizes CURRENT VULNERABLE BEHAVIOUR; it passes because the weakness exists.
+-- Attacker: the operator and governance acting together. Required authority: both, as the
+-- signatories of `Pool`. Nothing ties a Pool to a unique lineage or to exclusive reserve use.
+-- Initial state: a legitimately initialized pool at version 0.
+-- Attack: the coalition creates a byte-identical second Pool over the same PoolId and reserve
+-- CIDs, and a trader settles a legitimate swap through the duplicate.
+-- Assets affected: both shared reserves, consumed by the duplicate's settlement. Pool/LP state
+-- affected: two active accounting states exist for one pool identity; afterwards the original
+-- is active but references consumed reserves.
+-- Verified outcome: both Pools pass `validatePoolState` while the reserves are live, so the
+-- duplicate settles normally. A later swap on the original fails at the engine level on the
+-- consumed Treasury reserve (`ContractNotFound`, not `amm/stale-state`, as its version still
+-- matches), so the same reserves cannot be settled twice and the trader's input is untouched.
+-- Limitation: the duplicate copies the genuine payload; it does not show a duplicate with
+-- divergent amounts (rejected by `validatePoolState`) or LP positions minted against it.
+jointSignatoriesCanCreateCompetingPoolsOverSameReserves : Script ()
+jointSignatoriesCanCreateCompetingPoolsOverSameReserves = do
+  Initialized {fixture, initialized} <- standardPool
+  original <- assertActivePool fixture initialized.poolCid
+  let treasuryReserveCid = original.treasuryReserveHoldingCid
+  let stableReserveCid = original.stableReserveHoldingCid
+  Some positionBefore <- queryContractId fixture.provider initialized.positionCid
+  treasuryTotalBefore <- instrumentTotalAtoms fixture fixture.treasuryInstrument
+  stableTotalBefore <- instrumentTotalAtoms fixture fixture.stableInstrument
+
+  duplicateCid <- submit (actAs [fixture.operator, fixture.governance]) $ createCmd original
+  duplicate <- assertActivePool fixture duplicateCid
+  _ <- assertActivePool fixture initialized.poolCid
+  duplicateCid =/= initialized.poolCid
+  duplicate === original
+  duplicate.treasuryReserveHoldingCid === treasuryReserveCid
+  duplicate.stableReserveHoldingCid === stableReserveCid
+  pools <- query @Pool fixture.operator
+  length (filter (\(_, pool) -> pool.poolId == original.poolId) pools) === 2
+
+  firstInputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  settled <- submitDirectSwap fixture duplicateCid fixture.trader TreasuryForStable
+    firstInputCid (amountOf 1000) 0.0
+  atomsOf settled.amountOut === 1993
+  Some output <- queryContractId fixture.trader settled.outputHoldingCid
+  output.instrument === fixture.stableInstrument
+  atomsOf output.amount === 1993
+  duplicateAfter <- queryContractId fixture.operator duplicateCid
+  duplicateAfter === None
+  successor <- assertActivePool fixture settled.poolCid
+  successor.stateVersion === original.stateVersion + 1
+  atomsOf successor.treasuryReserveAmount === 5001000
+  atomsOf successor.stableReserveAmount === 9998007
+  assertPoolReservesMatch fixture settled.poolCid
+  treasuryReserveAfter <- queryContractId fixture.operator treasuryReserveCid
+  treasuryReserveAfter === None
+  stableReserveAfter <- queryContractId fixture.operator stableReserveCid
+  stableReserveAfter === None
+  originalAfterSettlement <- assertActivePool fixture initialized.poolCid
+  originalAfterSettlement === original
+
+  secondInputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  Some secondInputBefore <- queryContractId fixture.trader secondInputCid
+  originalDisclosure <- disclosureOf fixture.operator initialized.poolCid
+  deadline <- futureDeadline
+  let swapOnOriginal = exerciseCmd initialized.poolCid SwapExactInput with
+        trader = fixture.trader
+        direction = TreasuryForStable
+        inputHoldingCid = secondInputCid
+        inputAmount = amountOf 1000
+        minimumAmountOut = 0.0
+        deadline
+        expectedVersion = original.stateVersion
+  disclosedAttempt <- trySubmit (actAs fixture.trader <> discloseMany [originalDisclosure]) swapOnOriginal
+  assertConsumedContract treasuryReserveCid disclosedAttempt
+  -- Reading as the operator rules out the trader merely lacking visibility of the reserve.
+  operatorVisibleAttempt <- trySubmit (actAs fixture.trader <> readAs fixture.operator) swapOnOriginal
+  assertConsumedContract treasuryReserveCid operatorVisibleAttempt
+
+  originalAfterAttempt <- assertActivePool fixture initialized.poolCid
+  originalAfterAttempt === original
+  successorAfterAttempt <- assertActivePool fixture settled.poolCid
+  successorAfterAttempt === successor
+  Some secondInputAfter <- queryContractId fixture.trader secondInputCid
+  secondInputAfter === secondInputBefore
+  traderHoldings <- query @Holding fixture.trader
+  sort (map fst traderHoldings) === sort [settled.outputHoldingCid, secondInputCid]
+  Some positionAfter <- queryContractId fixture.provider initialized.positionCid
+  positionAfter === positionBefore
+  treasuryTotalAfter <- instrumentTotalAtoms fixture fixture.treasuryInstrument
+  treasuryTotalAfter === treasuryTotalBefore + 2000
+  stableTotalAfter <- instrumentTotalAtoms fixture fixture.stableInstrument
+  stableTotalAfter === stableTotalBefore

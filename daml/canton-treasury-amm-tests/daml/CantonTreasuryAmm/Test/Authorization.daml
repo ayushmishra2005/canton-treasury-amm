@@ -418,9 +418,117 @@ issuerCanArchiveReserveAndFreezePool = do
   stableTotalAfter <- instrumentTotalAtoms fixture fixture.stableInstrument
   stableTotalAfter === stableTotalBefore
 
-assertConsumedContract : ContractId t -> Either SubmitError a -> Script ()
-assertConsumedContract consumedCid result = case result of
-  Left ContractNotFound {unknownContractIds}
-    | show consumedCid `elem` NonEmpty.toList unknownContractIds -> pure ()
-  Left otherError -> abort ("Expected ContractNotFound for the consumed contract, got " <> show otherError)
-  Right _ -> abort "Expected the swap to fail on a consumed reserve"
+-- Characterizes CURRENT VULNERABLE BEHAVIOUR; it passes because the weakness exists.
+-- Attacker: the operator and governance acting together. Required authority: both, as the
+-- signatories of `LiquidityPosition`. The attacker-controlled provider (`other`) only needs its
+-- own authority for `RemoveLiquidity`, which is controlled by the position's `provider`.
+-- Initial state: a legitimate pool with the genuine provider's position.
+-- Attack: the coalition creates a position naming the genuine PoolId without any deposit, and
+-- the attacker redeems it against the genuine active Pool.
+-- Assets affected: both reserves, paid out to the attacker. Pool/LP state affected: the
+-- successor Pool's reserves and recorded supply fall, while the genuine position is untouched.
+-- Verified outcome: the genuine Pool accepts the forged position because `RemoveLiquidity` only
+-- checks the position's PoolId and provider, which the coalition chose. The recorded supply then
+-- drops below the genuine provider's outstanding shares, so its claim is no longer redeemable in
+-- full. Operator-only and governance-only creation are rejected for missing authority.
+-- Limitation: shows one forged redemption on the IDE ledger by the full signatory coalition. It
+-- does not show forgery by fewer parties (outsider creation is covered by
+-- `nonProviderAndForeignPositionsCannotRemove`) or any recovery path.
+colludingPoolSignatoriesCanRedeemForgedLiquidityPosition : Script ()
+colludingPoolSignatoriesCanRedeemForgedLiquidityPosition = do
+  Initialized {fixture, initialized} <- standardPool
+  poolBefore <- assertActivePool fixture initialized.poolCid
+  let treasuryReserveCid = poolBefore.treasuryReserveHoldingCid
+  let stableReserveCid = poolBefore.stableReserveHoldingCid
+  Some genuinePosition <- queryContractId fixture.provider initialized.positionCid
+  atomsOf poolBefore.treasuryReserveAmount === 5000000
+  atomsOf poolBefore.stableReserveAmount === 10000000
+  atomsOf poolBefore.totalShares === 7071067
+  atomsOf poolBefore.lockedShares === lockedSharesAtoms
+  atomsOf genuinePosition.shares === atomsOf poolBefore.totalShares - lockedSharesAtoms
+  attackerHoldingsBefore <- query @Holding fixture.other
+  attackerHoldingsBefore === []
+  treasuryTotalBefore <- instrumentTotalAtoms fixture fixture.treasuryInstrument
+  stableTotalBefore <- instrumentTotalAtoms fixture fixture.stableInstrument
+
+  let forgedShares = amountOf 1000000
+  let forged = LiquidityPosition with
+        poolId = poolBefore.poolId
+        provider = fixture.other
+        shares = forgedShares
+        auditors = []
+  operatorOnly <- trySubmit fixture.operator $ createCmd forged
+  assertAuthorizationError operatorOnly
+  governanceOnly <- trySubmit fixture.governance $ createCmd forged
+  assertAuthorizationError governanceOnly
+  attackerPositionsBefore <- query @LiquidityPosition fixture.other
+  attackerPositionsBefore === []
+
+  forgedCid <- submit (actAs [fixture.operator, fixture.governance]) $ createCmd forged
+  Some forgedPosition <- queryContractId fixture.other forgedCid
+  forgedPosition === forged
+  poolAfterForgery <- assertActivePool fixture initialized.poolCid
+  poolAfterForgery === poolBefore
+  treasuryTotalAfterForgery <- instrumentTotalAtoms fixture fixture.treasuryInstrument
+  treasuryTotalAfterForgery === treasuryTotalBefore
+  stableTotalAfterForgery <- instrumentTotalAtoms fixture fixture.stableInstrument
+  stableTotalAfterForgery === stableTotalBefore
+
+  -- floor(1000000 * 5000000 / 7071067) and floor(1000000 * 10000000 / 7071067).
+  let expectedTreasuryOut = 707106
+  let expectedStableOut = 1414213
+  redemption <- submitRemoveLiquidity fixture initialized.poolCid fixture.other forgedCid
+    forgedShares 0.0 0.0
+  atomsOf redemption.treasuryOut === expectedTreasuryOut
+  atomsOf redemption.stableOut === expectedStableOut
+  redemption.remainingPositionCid === None
+  forgedAfter <- queryContractId fixture.other forgedCid
+  forgedAfter === None
+
+  Some treasuryPaidCid <- pure redemption.treasuryOutputHoldingCid
+  Some stablePaidCid <- pure redemption.stableOutputHoldingCid
+  Some treasuryPaid <- queryContractId fixture.other treasuryPaidCid
+  Some stablePaid <- queryContractId fixture.other stablePaidCid
+  treasuryPaid.instrument === fixture.treasuryInstrument
+  stablePaid.instrument === fixture.stableInstrument
+  treasuryPaid.owner === fixture.other
+  stablePaid.owner === fixture.other
+  atomsOf treasuryPaid.amount === expectedTreasuryOut
+  atomsOf stablePaid.amount === expectedStableOut
+  attackerHoldings <- query @Holding fixture.other
+  length attackerHoldings === 2
+
+  predecessorAfter <- queryContractId fixture.operator initialized.poolCid
+  predecessorAfter === None
+  oldTreasuryReserve <- queryContractId fixture.operator treasuryReserveCid
+  oldTreasuryReserve === None
+  oldStableReserve <- queryContractId fixture.operator stableReserveCid
+  oldStableReserve === None
+  successor <- assertActivePool fixture redemption.poolCid
+  successor.poolId === poolBefore.poolId
+  successor.stateVersion === poolBefore.stateVersion + 1
+  atomsOf successor.treasuryReserveAmount === atomsOf poolBefore.treasuryReserveAmount - expectedTreasuryOut
+  atomsOf successor.stableReserveAmount === atomsOf poolBefore.stableReserveAmount - expectedStableOut
+  atomsOf successor.totalShares === atomsOf poolBefore.totalShares - atomsOf forgedShares
+  assertPoolReservesMatch fixture redemption.poolCid
+  treasuryTotalAfter <- instrumentTotalAtoms fixture fixture.treasuryInstrument
+  treasuryTotalAfter === treasuryTotalBefore
+  stableTotalAfter <- instrumentTotalAtoms fixture fixture.stableInstrument
+  stableTotalAfter === stableTotalBefore
+
+  Some genuineAfter <- queryContractId fixture.provider initialized.positionCid
+  genuineAfter === genuinePosition
+  assert (atomsOf genuineAfter.shares > atomsOf successor.totalShares - atomsOf successor.lockedShares)
+  disclosures <- poolDisclosures fixture redemption.poolCid
+  fullExit <- trySubmit (actAs fixture.provider <> discloseMany disclosures) $
+    exerciseCmd redemption.poolCid RemoveLiquidity with
+      provider = fixture.provider
+      positionCid = initialized.positionCid
+      burnShares = genuineAfter.shares
+      minimumTreasuryOut = 0.0
+      minimumStableOut = 0.0
+      expectedVersion = successor.stateVersion
+  assertFailureId positionError fullExit
+  _ <- assertActivePool fixture redemption.poolCid
+  Some _ <- queryContractId fixture.provider initialized.positionCid
+  pure ()

@@ -1,6 +1,7 @@
 module CantonTreasuryAmm.Test.Fixtures where
 
 import DA.Assert ((===))
+import DA.NonEmpty qualified as NonEmpty
 import DA.Time (addRelTime, hours)
 import Daml.Script
 
@@ -174,6 +175,13 @@ assertAuthorizationError result = case result of
   Left AuthorizationError {} -> pure ()
   Left otherError -> abort ("Expected AuthorizationError, got " <> show otherError)
   Right _ -> abort "Expected authorization failure"
+
+assertConsumedContract : ContractId t -> Either SubmitError a -> Script ()
+assertConsumedContract consumedCid result = case result of
+  Left ContractNotFound {unknownContractIds}
+    | show consumedCid `elem` NonEmpty.toList unknownContractIds -> pure ()
+  Left otherError -> abort ("Expected ContractNotFound for the consumed contract, got " <> show otherError)
+  Right _ -> abort "Expected the operation to fail on a consumed contract"
 
 assertActivePool : Fixture -> ContractId Pool -> Script Pool
 assertActivePool fixture poolCid = do

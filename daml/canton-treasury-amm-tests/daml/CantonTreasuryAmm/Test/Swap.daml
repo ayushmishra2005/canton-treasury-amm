@@ -144,3 +144,69 @@ zeroOutputSwapRejectsWithoutStateChange = do
   after === before
   Some _ <- queryContractId fixture.trader inputHoldingCid
   pure ()
+
+-- A successful swap consumes the predecessor Pool. Version 0 is then wrong for the active
+-- successor, a domain failure (`amm/stale-state`), yet correct for the consumed predecessor,
+-- whose exercise is a contract-lifecycle failure (`ContractNotFound` naming that CID). The two
+-- must never be reported as the same category.
+-- Actor: an ordinary trader. Required authority: the trader alone; the predecessor is reached
+-- through a diagnostic `readAs operator` lookup and through a stale explicit disclosure.
+-- Verified outcome: the lookup fails naming the predecessor Pool CID. The stale disclosure fails
+-- naming the predecessor's consumed reserve, as the IDE ledger does not check the activeness of
+-- disclosed contracts. Neither failure consumes the trader's input or changes the successor,
+-- which stays active at version 1 with reconciled reserves and then settles a correct swap.
+-- Limitation: lifecycle errors are asserted through the public `unknownContractIds`, and the
+-- stale-disclosure path is IDE-ledger behaviour; a Canton participant may reject it earlier.
+staleVersionAndConsumedPoolFailDifferently : Script ()
+staleVersionAndConsumedPoolFailDifferently = do
+  Initialized {fixture, initialized} <- standardPool
+  predecessor <- assertActivePool fixture initialized.poolCid
+  predecessorDisclosure <- disclosureOf fixture.operator initialized.poolCid
+  firstInputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  settled <- submitDirectSwap fixture initialized.poolCid fixture.trader TreasuryForStable
+    firstInputCid (amountOf 1000) 0.0
+  consumed <- queryContractId fixture.operator initialized.poolCid
+  consumed === None
+  successor <- assertActivePool fixture settled.poolCid
+  successor.stateVersion === predecessor.stateVersion + 1
+
+  inputHoldingCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  Some inputBefore <- queryContractId fixture.trader inputHoldingCid
+  deadline <- futureDeadline
+  let swapAt poolCid = exerciseCmd poolCid SwapExactInput with
+        trader = fixture.trader
+        direction = TreasuryForStable
+        inputHoldingCid
+        inputAmount = amountOf 1000
+        minimumAmountOut = 0.0
+        deadline
+        expectedVersion = predecessor.stateVersion
+
+  successorDisclosures <- poolDisclosures fixture settled.poolCid
+  staleOnActive <- trySubmit (actAs fixture.trader <> discloseMany successorDisclosures)
+    (swapAt settled.poolCid)
+  assertFailureId staleStateError staleOnActive
+
+  consumedVisible <- trySubmit (actAs fixture.trader <> readAs fixture.operator)
+    (swapAt initialized.poolCid)
+  assertConsumedContract initialized.poolCid consumedVisible
+  -- The IDE ledger runs a stale disclosure of the archived Pool without an activeness check, so
+  -- the failure surfaces at the predecessor's consumed Treasury reserve instead of the Pool.
+  consumedDisclosed <- trySubmit (actAs fixture.trader <> discloseMany [predecessorDisclosure])
+    (swapAt initialized.poolCid)
+  assertConsumedContract predecessor.treasuryReserveHoldingCid consumedDisclosed
+
+  successorAfter <- assertActivePool fixture settled.poolCid
+  successorAfter === successor
+  atomsOf successorAfter.treasuryReserveAmount === 5001000
+  atomsOf successorAfter.stableReserveAmount === 9998007
+  assertPoolReservesMatch fixture settled.poolCid
+  Some inputAfter <- queryContractId fixture.trader inputHoldingCid
+  inputAfter === inputBefore
+
+  next <- submitDirectSwap fixture settled.poolCid fixture.trader TreasuryForStable
+    inputHoldingCid (amountOf 1000) 0.0
+  assert (atomsOf next.amountOut > 0)
+  nextPool <- assertActivePool fixture next.poolCid
+  nextPool.stateVersion === successor.stateVersion + 1
+  assertPoolReservesMatch fixture next.poolCid

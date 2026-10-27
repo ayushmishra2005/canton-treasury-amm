@@ -4,8 +4,10 @@ import DA.Assert ((===))
 import Daml.Script
 
 import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.LiquidityPosition
 import CantonTreasuryAmm.Pool
 import CantonTreasuryAmm.Test.Fixtures
+import CantonTreasuryAmm.Token
 import CantonTreasuryAmm.Types
 
 subsequentLiquidityUsesBindingLegAndCeiling : Script ()
@@ -188,3 +190,64 @@ liquidityOperationsRequireExplicitDisclosure = do
   _ <- submitRemoveLiquidity fixture added.poolCid fixture.provider added.positionCid
     added.mintedShares 0.0 0.0
   pure ()
+
+-- Characterizes CURRENT BEHAVIOUR of `BurnPosition` exercised outside `RemoveLiquidity`.
+-- Actor: the genuine provider, burning its own position. Required authority: the provider
+-- alone, as the choice controller; no Pool choice, disclosure, operator or governance is needed.
+-- Initial state: a legitimate pool whose only circulating shares are the provider's position.
+-- Action: a partial direct burn, then a direct burn of the remainder.
+-- Assets affected: none move; no payout occurs. Pool/LP state affected: outstanding positions
+-- shrink while the Pool's recorded `totalShares` stays unchanged.
+-- Verified outcome: the provider forfeits its claim without compensation and the Pool's supply
+-- no longer reconciles with outstanding positions. The reserves backing the burned shares stay
+-- in the pool with no position able to redeem them. This is a self-inflicted loss and a
+-- supply-accounting inconsistency, not theft by an unrelated party.
+-- Limitation: does not show how later LPs mint or redeem against the unreconciled supply, or
+-- who could eventually capture the stranded value, nor any interaction with forged positions.
+directPositionBurnLeavesPoolSupplyUnchanged : Script ()
+directPositionBurnLeavesPoolSupplyUnchanged = do
+  Initialized {fixture, initialized} <- standardPool
+  poolBefore <- assertActivePool fixture initialized.poolCid
+  Some positionBefore <- queryContractId fixture.provider initialized.positionCid
+  let providerShareAtoms = atomsOf positionBefore.shares
+  providerShareAtoms === atomsOf poolBefore.totalShares - lockedSharesAtoms
+  Some treasuryReserveBefore <- queryContractId fixture.operator poolBefore.treasuryReserveHoldingCid
+  Some stableReserveBefore <- queryContractId fixture.operator poolBefore.stableReserveHoldingCid
+  providerHoldingsBefore <- query @Holding fixture.provider
+  treasuryTotalBefore <- instrumentTotalAtoms fixture fixture.treasuryInstrument
+  stableTotalBefore <- instrumentTotalAtoms fixture fixture.stableInstrument
+
+  let partialBurnAtoms = providerShareAtoms / 2
+  partial <- submit fixture.provider $ exerciseCmd initialized.positionCid BurnPosition with
+    expectedPoolId = poolBefore.poolId
+    burnAmount = amountOf partialBurnAtoms
+  burnedPosition <- queryContractId fixture.provider initialized.positionCid
+  burnedPosition === None
+  Some remainingCid <- pure partial.remainingPositionCid
+  Some remaining <- queryContractId fixture.provider remainingCid
+  atomsOf remaining.shares === providerShareAtoms - partialBurnAtoms
+  poolAfterPartial <- assertActivePool fixture initialized.poolCid
+  poolAfterPartial === poolBefore
+  assert (atomsOf remaining.shares + lockedSharesAtoms < atomsOf poolAfterPartial.totalShares)
+
+  full <- submit fixture.provider $ exerciseCmd remainingCid BurnPosition with
+    expectedPoolId = poolBefore.poolId
+    burnAmount = remaining.shares
+  full.remainingPositionCid === None
+  positions <- query @LiquidityPosition fixture.provider
+  positions === []
+
+  poolAfter <- assertActivePool fixture initialized.poolCid
+  poolAfter === poolBefore
+  atomsOf poolAfter.totalShares === providerShareAtoms + lockedSharesAtoms
+  Some treasuryReserveAfter <- queryContractId fixture.operator poolBefore.treasuryReserveHoldingCid
+  treasuryReserveAfter === treasuryReserveBefore
+  Some stableReserveAfter <- queryContractId fixture.operator poolBefore.stableReserveHoldingCid
+  stableReserveAfter === stableReserveBefore
+  assertPoolReservesMatch fixture initialized.poolCid
+  providerHoldingsAfter <- query @Holding fixture.provider
+  providerHoldingsAfter === providerHoldingsBefore
+  treasuryTotalAfter <- instrumentTotalAtoms fixture fixture.treasuryInstrument
+  treasuryTotalAfter === treasuryTotalBefore
+  stableTotalAfter <- instrumentTotalAtoms fixture fixture.stableInstrument
+  stableTotalAfter === stableTotalBefore
