@@ -1,0 +1,303 @@
+-- PROTOTYPE ONLY. Experimental security model for authenticated pool state and LP entitlements,
+-- kept in the test package; it is not a deployed or production design and does not swap.
+--
+-- Why pool reserves are not Stage 1.1 `ProtectedReserve`s: DAML authority belongs to parties,
+-- not contracts. `Release` accepts custodian and operator authority from any source, and the
+-- custodian-signed `ReleaseMandate` supplies exactly that for every matching reserve. A pool that
+-- referenced protected reserves could be drained by a mandate while its accounting still named
+-- them. Here the authenticated pool state is itself the reserve record, and it has no release
+-- choice: value leaves only through `RemoveLiquidity`, coupled to burning a genuine position.
+--
+-- Lineage and authentication: a `PoolCharter`, every `ProtectedPool` state and every
+-- `PoolPosition` are signed by the lineage signatories, the custodian, the operator and both
+-- instrument issuers; positions are also signed by their provider. A copied `PoolLineage` value
+-- authenticates nothing: what cannot be forged is the signature set, so any strict subset of
+-- those parties, such as operator and governance, cannot create, copy or archive pool state or
+-- positions. The charter is consumed by `InitializePool`, and each transition consumes the
+-- current state and creates exactly one successor, so a lineage has one active state unless the
+-- full signatory set deliberately creates another.
+--
+-- Delegation: the signatories' authority is granted when they sign the charter and flows only
+-- into the bodies of `InitializePool`, `AddLiquidity` and `RemoveLiquidity`. No choice is
+-- controlled by the operator, custodian or issuers, and no body moves value except against an
+-- accounted deposit or a validated, burned entitlement. The signatories need take no further
+-- action, so withdrawals do not depend on custodian discretion; on Canton their hosting
+-- participants must still confirm each transaction.
+--
+-- Authorization matrix (prototype templates):
+-- * InitializePool: the charter's initial provider only.
+-- * AddLiquidity: any provider, using holdings it owns, with the pool disclosed to it.
+-- * RemoveLiquidity: the position's own provider only.
+-- * Create or archive a charter, pool state or position: all lineage signatories together
+--   (plus the provider for a position). Operator, governance, issuer, custodian, operator with
+--   governance, operator with custodian, issuers with custodian, traders and outsiders cannot.
+-- * Governance only observes pool states. Traders have no choices; swaps are Stage 1.3.
+--
+-- Trusted: the full lineage signatory set can create arbitrary states and positions; issuers
+-- still mint their instruments freely; hosting participants of all signatories must stay
+-- available and independently administered.
+module CantonTreasuryAmm.Test.ProtectedPoolPrototype where
+
+import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.Math
+import CantonTreasuryAmm.Token
+import CantonTreasuryAmm.Types
+
+data PoolLineage = PoolLineage with
+  custodian : Party
+  operator : Party
+  governance : Party
+  treasuryInstrument : InstrumentId
+  stableInstrument : InstrumentId
+  charterReference : Text
+    deriving (Eq, Show)
+
+lineageSignatories : PoolLineage -> [Party]
+lineageSignatories lineage =
+  [lineage.custodian, lineage.operator, lineage.treasuryInstrument.issuer, lineage.stableInstrument.issuer]
+
+data InitializeResult = InitializeResult with
+  poolCid : ContractId ProtectedPool
+  positionCid : ContractId PoolPosition
+  treasuryChangeCid : Optional (ContractId Holding)
+  stableChangeCid : Optional (ContractId Holding)
+    deriving (Eq, Show)
+
+data AddResult = AddResult with
+  poolCid : ContractId ProtectedPool
+  positionCid : ContractId PoolPosition
+  treasuryChangeCid : Optional (ContractId Holding)
+  stableChangeCid : Optional (ContractId Holding)
+  mintedShares : Decimal
+  usedTreasury : Decimal
+  usedStable : Decimal
+    deriving (Eq, Show)
+
+data RemoveResult = RemoveResult with
+  poolCid : ContractId ProtectedPool
+  remainingPositionCid : Optional (ContractId PoolPosition)
+  treasuryPayoutCid : Optional (ContractId Holding)
+  stablePayoutCid : Optional (ContractId Holding)
+  treasuryOut : Decimal
+  stableOut : Decimal
+    deriving (Eq, Show)
+
+-- Retires `atoms` of a holding the depositor owns, returning any change to it. The issuer
+-- authority this needs comes from the pool signatories, so the owner check is what limits it
+-- to the controlling depositor's own holdings. Legs are taken one at a time, so a bad second
+-- leg fails after the first has been consumed and the whole transaction rolls back.
+takeDeposit : InstrumentId -> Party -> ContractId Holding -> Int -> Update (Optional (ContractId Holding))
+takeDeposit instrument depositor holdingCid atoms = do
+  holding <- fetch holdingCid
+  requireDomain (holding.instrument == instrument) instrumentMismatchError "Deposit uses the wrong instrument"
+  requireDomain (holding.owner == depositor) ownerMismatchError "Depositor does not own the holding"
+  let balanceAtoms = atomsOf holding.amount
+  requireState (atoms <= balanceAtoms) insufficientBalanceError "Deposit exceeds the holding balance"
+  archive holdingCid
+  if atoms == balanceAtoms
+    then pure None
+    else Some <$> create Holding with
+      instrument
+      owner = depositor
+      amount = amountOf (balanceAtoms - atoms)
+      auditors = holding.auditors
+
+payout : InstrumentId -> Party -> Int -> Update (Optional (ContractId Holding))
+payout instrument recipient atoms =
+  if atoms == 0
+    then pure None
+    else Some <$> create Holding with
+      instrument
+      owner = recipient
+      amount = amountOf atoms
+      auditors = []
+
+template PoolCharter
+  with
+    lineage : PoolLineage
+    initialProvider : Party
+  where
+    signatory lineageSignatories lineage
+    observer initialProvider, lineage.governance
+    ensure lineage.treasuryInstrument /= lineage.stableInstrument
+
+    choice InitializePool : InitializeResult
+      with
+        treasuryHoldingCid : ContractId Holding
+        stableHoldingCid : ContractId Holding
+        treasuryAmount : Decimal
+        stableAmount : Decimal
+      controller initialProvider
+      do
+        requireDomain (treasuryAmount > 0.0 && stableAmount > 0.0) invalidAmountError "Initial deposits must be positive"
+        requireDomain (treasuryAmount <= maxReserveAmount && stableAmount <= maxReserveAmount) reserveCapError
+          "Initial reserve exceeds the atom cap"
+        let treasuryAtoms = atomsOf treasuryAmount
+        let stableAtoms = atomsOf stableAmount
+        let grossShares = floorSqrtWide (wide treasuryAtoms * wide stableAtoms)
+        requireDomain (grossShares >= minimumInitialSharesAtoms) initialLiquidityError
+          "Initial liquidity is below the minimum share threshold"
+        treasuryChangeCid <- takeDeposit lineage.treasuryInstrument initialProvider treasuryHoldingCid treasuryAtoms
+        stableChangeCid <- takeDeposit lineage.stableInstrument initialProvider stableHoldingCid stableAtoms
+        poolCid <- create ProtectedPool with
+          lineage
+          treasuryReserve = treasuryAmount
+          stableReserve = stableAmount
+          totalShares = amountOf grossShares
+          lockedShares = amountOf lockedSharesAtoms
+          stateVersion = 0
+        positionCid <- create PoolPosition with
+          lineage
+          provider = initialProvider
+          shares = amountOf (grossShares - lockedSharesAtoms)
+        pure InitializeResult with poolCid; positionCid; treasuryChangeCid; stableChangeCid
+
+template ProtectedPool
+  with
+    lineage : PoolLineage
+    treasuryReserve : Decimal
+    stableReserve : Decimal
+    totalShares : Decimal
+    lockedShares : Decimal
+    stateVersion : Int
+  where
+    signatory lineageSignatories lineage
+    observer lineage.governance
+    ensure
+      isPositiveCapped treasuryReserve
+        && isPositiveCapped stableReserve
+        && totalShares >= lockedShares
+        && totalShares <= maxReserveAmount
+        && lockedShares == amountOf lockedSharesAtoms
+
+    choice AddLiquidity : AddResult
+      with
+        provider : Party
+        treasuryHoldingCid : ContractId Holding
+        stableHoldingCid : ContractId Holding
+        maximumTreasury : Decimal
+        maximumStable : Decimal
+        minimumShares : Decimal
+        expectedVersion : Int
+      controller provider
+      do
+        requireState (stateVersion == expectedVersion) staleStateError "Pool state version is stale"
+        requireDomain (maximumTreasury > 0.0 && maximumStable > 0.0 && minimumShares >= 0.0) invalidAmountError
+          "Liquidity amounts must be positive or zero as required"
+        requireDomain (maximumTreasury <= maxReserveAmount && maximumStable <= maxReserveAmount && minimumShares <= maxReserveAmount)
+          reserveCapError "Liquidity amount exceeds the atom cap"
+        let treasuryReserveAtoms = atomsOf treasuryReserve
+        let stableReserveAtoms = atomsOf stableReserve
+        let totalShareAtoms = atomsOf totalShares
+        treasuryLimitedShares <- narrowAtoms (wideMulFloor (atomsOf maximumTreasury) totalShareAtoms treasuryReserveAtoms)
+        stableLimitedShares <- narrowAtoms (wideMulFloor (atomsOf maximumStable) totalShareAtoms stableReserveAtoms)
+        let mintedShareAtoms = min treasuryLimitedShares stableLimitedShares
+        requireState (mintedShareAtoms > 0) insufficientLiquidityError "Contribution mints no shares"
+        requireDomain (mintedShareAtoms >= atomsOf minimumShares) slippageError "Minted shares are below the provider minimum"
+        usedTreasuryAtoms <- narrowAtoms (wideMulCeil mintedShareAtoms treasuryReserveAtoms totalShareAtoms)
+        usedStableAtoms <- narrowAtoms (wideMulCeil mintedShareAtoms stableReserveAtoms totalShareAtoms)
+        requireDomain (treasuryReserveAtoms + usedTreasuryAtoms <= maxReserveAtoms && stableReserveAtoms + usedStableAtoms <= maxReserveAtoms)
+          reserveCapError "Reserve would exceed the atom cap"
+        requireDomain (totalShareAtoms + mintedShareAtoms <= maxReserveAtoms) reserveCapError "LP supply would exceed the atom cap"
+        treasuryChangeCid <- takeDeposit lineage.treasuryInstrument provider treasuryHoldingCid usedTreasuryAtoms
+        stableChangeCid <- takeDeposit lineage.stableInstrument provider stableHoldingCid usedStableAtoms
+        poolCid <- create this with
+          treasuryReserve = amountOf (treasuryReserveAtoms + usedTreasuryAtoms)
+          stableReserve = amountOf (stableReserveAtoms + usedStableAtoms)
+          totalShares = amountOf (totalShareAtoms + mintedShareAtoms)
+          stateVersion = stateVersion + 1
+        positionCid <- create PoolPosition with
+          lineage
+          provider
+          shares = amountOf mintedShareAtoms
+        pure AddResult with
+          poolCid
+          positionCid
+          treasuryChangeCid
+          stableChangeCid
+          mintedShares = amountOf mintedShareAtoms
+          usedTreasury = amountOf usedTreasuryAtoms
+          usedStable = amountOf usedStableAtoms
+
+    choice RemoveLiquidity : RemoveResult
+      with
+        provider : Party
+        positionCid : ContractId PoolPosition
+        burnShares : Decimal
+        minimumTreasuryOut : Decimal
+        minimumStableOut : Decimal
+        expectedVersion : Int
+      controller provider
+      do
+        requireState (stateVersion == expectedVersion) staleStateError "Pool state version is stale"
+        position <- fetch positionCid
+        requireDomain (position.lineage == lineage) positionError "Position belongs to another pool lineage"
+        requireDomain (position.provider == provider) ownerMismatchError "Provider does not own the position"
+        requireDomain (burnShares > 0.0 && minimumTreasuryOut >= 0.0 && minimumStableOut >= 0.0) invalidAmountError
+          "Removal amounts must be positive or zero as required"
+        let burnShareAtoms = atomsOf burnShares
+        let positionShareAtoms = atomsOf position.shares
+        let totalShareAtoms = atomsOf totalShares
+        requireState (burnShareAtoms <= positionShareAtoms) positionError "Burn exceeds the position"
+        requireState (burnShareAtoms <= totalShareAtoms - atomsOf lockedShares) positionError "Burn would consume locked shares"
+        let treasuryReserveAtoms = atomsOf treasuryReserve
+        let stableReserveAtoms = atomsOf stableReserve
+        treasuryOutAtoms <- narrowAtoms (wideMulFloor burnShareAtoms treasuryReserveAtoms totalShareAtoms)
+        stableOutAtoms <- narrowAtoms (wideMulFloor burnShareAtoms stableReserveAtoms totalShareAtoms)
+        requireState (treasuryOutAtoms > 0 || stableOutAtoms > 0) insufficientLiquidityError "Burn produces no output"
+        requireDomain (treasuryOutAtoms >= atomsOf minimumTreasuryOut && stableOutAtoms >= atomsOf minimumStableOut)
+          slippageError "Liquidity output is below its minimum"
+        archive positionCid
+        remainingPositionCid <-
+          if burnShareAtoms == positionShareAtoms
+            then pure None
+            else Some <$> create position with shares = amountOf (positionShareAtoms - burnShareAtoms)
+        treasuryPayoutCid <- payout lineage.treasuryInstrument provider treasuryOutAtoms
+        stablePayoutCid <- payout lineage.stableInstrument provider stableOutAtoms
+        poolCid <- create this with
+          treasuryReserve = amountOf (treasuryReserveAtoms - treasuryOutAtoms)
+          stableReserve = amountOf (stableReserveAtoms - stableOutAtoms)
+          totalShares = amountOf (totalShareAtoms - burnShareAtoms)
+          stateVersion = stateVersion + 1
+        pure RemoveResult with
+          poolCid
+          remainingPositionCid
+          treasuryPayoutCid
+          stablePayoutCid
+          treasuryOut = amountOf treasuryOutAtoms
+          stableOut = amountOf stableOutAtoms
+
+-- An LP entitlement. It has no choices: it changes only inside `RemoveLiquidity`, which burns it
+-- against the pool's supply, and its implicit `Archive` needs every lineage signatory and the
+-- provider, so neither the provider nor any privileged subset can destroy it unaccounted.
+template PoolPosition
+  with
+    lineage : PoolLineage
+    provider : Party
+    shares : Decimal
+  where
+    signatory provider :: lineageSignatories lineage
+    ensure isPositiveCapped shares
+
+-- Stands for any pool-like contract the operator and governance can write and sign: same
+-- lineage fields, reserves and supply as the genuine state, plus a payout choice. Paying out an
+-- issuer's instrument needs that issuer's authority, which the coalition cannot supply.
+template CounterfeitPool
+  with
+    lineage : PoolLineage
+    treasuryReserve : Decimal
+    stableReserve : Decimal
+    totalShares : Decimal
+  where
+    signatory lineage.operator, lineage.governance
+
+    choice CounterfeitWithdraw : ContractId Holding
+      with
+        recipient : Party
+      controller lineage.operator
+      do
+        create Holding with
+          instrument = lineage.treasuryInstrument
+          owner = recipient
+          amount = treasuryReserve
+          auditors = []
