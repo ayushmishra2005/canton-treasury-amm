@@ -56,7 +56,10 @@ CantonTreasuryAmm.Token:TokenInstrument'
 
 inventory "Secure V1 production package" \
   canton-treasury-amm-secure-v1/.daml/dist/canton-treasury-amm-secure-v1-0.1.0.dar \
-  'CantonTreasuryAmm.SecureV1.Pool:SecureLiquidityPosition
+  'CantonTreasuryAmm.SecureV1.Onboarding:SecurePoolProposal
+CantonTreasuryAmm.SecureV1.Onboarding:SecureSwapIntentExecutionApproval
+CantonTreasuryAmm.SecureV1.Onboarding:SecureSwapIntentFactoryProposal
+CantonTreasuryAmm.SecureV1.Pool:SecureLiquidityPosition
 CantonTreasuryAmm.SecureV1.Pool:SecurePool
 CantonTreasuryAmm.SecureV1.Pool:SecurePoolCharter
 CantonTreasuryAmm.SecureV1.Pool:SecureReserveHolding
@@ -119,5 +122,19 @@ SecureSwapIntent consuming Cancel
 SecureSwapIntent consuming Execute
 SecureSwapIntentFactory consuming Archive
 SecureSwapIntentFactory non-consuming SubmitSwapIntent'
+
+check "Secure V1 production onboarding" \
+  canton-treasury-amm-secure-v1/.daml/dist/canton-treasury-amm-secure-v1-0.1.0.dar \
+  'CantonTreasuryAmm\.SecureV1\.Onboarding' \
+  'SecurePoolProposal consuming ApprovePoolProposal
+SecurePoolProposal consuming Archive
+SecurePoolProposal consuming CancelPoolProposal
+SecurePoolProposal consuming FinalizePoolProposal
+SecureSwapIntentExecutionApproval consuming Archive
+SecureSwapIntentExecutionApproval consuming CancelExecutionApproval
+SecureSwapIntentExecutionApproval consuming ExecuteApprovedIntent
+SecureSwapIntentFactoryProposal consuming AcceptFactoryProposal
+SecureSwapIntentFactoryProposal consuming Archive
+SecureSwapIntentFactoryProposal consuming CancelFactoryProposal'
 
 exit $status

@@ -110,11 +110,12 @@ echo "Single-submission charter refused by the script runner: no participant hos
 run_script mpScenarios participants-hosted.json "$out/parties.json" state.json
 run_script mpImpersonation participants-impersonation.json "$out/state.json" impersonation.json
 cat "$out/impersonation.json"; echo
+run_script mpOnboardingAttacks participants-hosted.json "$out/state.json" outage.json
 
 set_stable_issuer_connection disconnect
-run_script mpOfflineSwap participants-hosted.json "$out/state.json" liveness.json
+run_script mpOfflineSwap participants-hosted.json "$out/outage.json" liveness.json
 set_stable_issuer_connection reconnect
 run_script mpReconnectedSwap participants-hosted.json "$out/liveness.json" reconnected.json
 
-grep -h "HOSTING\|SCENARIO\|IMPERSONATION\|LIVENESS" "$out"/mp*.log
+grep -h "HOSTING\|SCENARIO\|IMPERSONATION\|ONBOARDING\|LIVENESS" "$out"/mp*.log
 echo "Multi-participant validation passed."

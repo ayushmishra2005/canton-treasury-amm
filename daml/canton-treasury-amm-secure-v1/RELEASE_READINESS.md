@@ -29,7 +29,7 @@ Two options were evaluated:
 | Property | Evidence |
 | --- | --- |
 | Legacy package ID unchanged | `d8cadd3c038655678a71e052616b054a07ad53600e2feb719456f629c2772aa6` before and after; the DAR is byte-identical to the Phase 0 build (SHA-256 `42d50138…`) |
-| Secure V1 identity | `canton-treasury-amm-secure-v1` 0.1.0, `7f69816410e1c5e0ea68f839999abdbebd6ea33fe3b05b5861d5c75ae99f20dc` |
+| Secure V1 identity | `canton-treasury-amm-secure-v1` 0.1.0, `e4546c3f60ef59f07edb4ad1c61676ed46fe66eb8c998a1277aa29bc43b958c8` since Stage 3.1 (Stage 2.3: `7f69816410e1c5e0ea68f839999abdbebd6ea33fe3b05b5861d5c75ae99f20dc`) |
 | Dependencies resolve | The Secure V1 DAR depends on exactly the legacy `d8cadd3c…` and the two vendored Token Standard DARs; no `daml-script` |
 | Coexistence | `dpm upgrade-check --both` passes for the legacy and Secure V1 DARs |
 | Legacy independently addressable | On a local Canton 3.5.12 sandbox, both DARs were uploaded through the JSON API and both packages appear as vetted. A script created legacy contracts and Secure V1 contracts side by side, and the active contracts carry template IDs from their own package: legacy `Pool`, `Holding` and `TokenInstrument` under `d8cadd3c…`; `SecurePool` and `SecureReserveHolding` under `7f698164…` |
@@ -38,6 +38,21 @@ Two options were evaluated:
 `scripts/check-packages.sh` enforces these identities and runs the upgrade check in CI. Any
 change to either package's source, including a comment, changes its ID and fails that check
 until it is reviewed.
+
+**Stage 3.1 package ID change.** The onboarding module
+(`CantonTreasuryAmm.SecureV1.Onboarding`) and its three error IDs changed the Secure V1 package
+ID from `7f698164…` to `e4546c3f…`, still as `canton-treasury-amm-secure-v1` 0.1.0. The Pool and
+SwapIntent sources are unchanged. Consequences:
+- The legacy package is unaffected: it is still `d8cadd3c…`, and `dpm upgrade-check --both` on
+  the legacy and new Secure V1 DARs passes.
+- `dpm upgrade-check --both` on the Stage 2.3 Secure V1 DAR (rebuilt from commit `c4de013`,
+  which reproduces `7f698164…`) and the new one fails with `KNOWN_PACKAGE_VERSION`: two packages
+  with the same name and version. A participant that had vetted `7f698164…` would not vet the
+  new package. That DAR was only ever uploaded to the local test networks of Stage 2.2 and 2.3,
+  so the version stays 0.1.0, and the `7f698164…` DAR is superseded and must not be
+  distributed.
+- The Secure V1 sandbox coexistence evidence above (Stage 2.3) was recorded for `7f698164…` and
+  has not been repeated for `e4546c3f…`.
 
 **External coordination still required.**
 - Every participant hosting a core party, governance, an auditor, a trader or a provider must
@@ -113,32 +128,29 @@ The script runs these phases in order, from `CantonTreasuryAmm.Test.MultiPartici
 | --- | --- |
 | `mpAllocate`, `mpVerifyHosting` | Each role is hosted only on its own participant, read from every participant's own party list, so independence is checked rather than inferred from distinct party names. |
 | `mpSingleSubmissionCharter` | A single submission acting as all four core signers is refused (Daml Script: "All parties must be on the same participant"); the script asserts this failure. |
-| `mpScenarios` 1–5 | The charter is created through per-signer approvals, each on its own participant. Then initialization (7,071,067 supply), a swap (1,000 → 1,993), a deposit (706,965 shares for 500,000 / 999,601), a withdrawal (353,482 shares → 249,999 / 499,799) and a swap-intent execution (2,000 → 997, change 3,000). Each is checked exactly against the pool, the reserves and the instrument totals. |
+| `mpScenarios` 1–5 | The charter is created through the production `SecurePoolProposal`: the operator proposes, then the Treasury issuer, the stablecoin issuer and the custodian each approve on their own participant, and the operator finalizes; every core participant sees each successor with exactly the signatures so far. The factory is created through `SecureSwapIntentFactoryProposal` and the intent executed through `SecureSwapIntentExecutionApproval`. Then initialization (7,071,067 supply), a swap (1,000 → 1,993), a deposit (706,965 shares for 500,000 / 999,601), a withdrawal (353,482 shares → 249,999 / 499,799) and a swap-intent execution (2,000 → 997, change 3,000). Each is checked exactly against the pool, the reserves and the instrument totals. |
 | `mpScenarios` 6–8 | Operator-only diversion, issuer-only archival (each issuer on its own participant) and operator-with-governance collusion through a governance-signed proxy are all rejected with `DAML_AUTHORIZATION_ERROR`. |
 | `mpScenarios` 9–10 | Each participant sees exactly its role's contracts; a trader without disclosure cannot settle. A replay of consumed contracts is rejected. |
 | `mpImpersonation` (scenario 11) | One participant submitting for core and issuer parties it does not host is rejected with `NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT`. |
-| `mpOfflineSwap` | With the stablecoin issuer's participant disconnected, a swap fails with `MEDIATOR_SAYS_TX_TIMED_OUT`. The pool state, the reserves and the trader's input are unchanged. |
-| `mpReconnectedSwap` | After reconnection, the same swap succeeds (1,000 → 1,993). |
+| `mpOnboardingAttacks` | Onboarding attacks, each from the attacker's own participant, with every onboarding, pool and holding contract compared on the core participants before and after. Charter creation by the operator or custodian alone, a proposal created by governance, and a proposal carrying a forged issuer signature: `DAML_AUTHORIZATION_ERROR`. The operator approving as either issuer, governance approving as the custodian, and the custodian finalizing: `DAML_AUTHORIZATION_ERROR`. Governance approving as itself and a repeated approval: `amm/onboarding-approver`. Seven sets of different terms (provider, auditors, instrument symbol, instrument issuer, governance, operator, reference): `amm/onboarding-terms`. A replayed approval of a consumed proposal: `CONTRACT_NOT_FOUND`. Finalization without the stablecoin issuer or without the custodian: `amm/onboarding-incomplete`. Conflicting proposals: an approval or a finalization naming the other proposal's terms fails with `amm/onboarding-terms`. Cancelled proposals approved or finalized again, and a finalized proposal finalized or cancelled again: `CONTRACT_NOT_FOUND`. A second pool is then onboarded and initialized on the same instruments: the first pool's position fails on it with `amm/position`, a first-factory intent aimed at it fails with `amm/pool-mismatch`, and a swap on it leaves the first pool unchanged. Domain rejections appear in `canton.log` as `DAML_FAILURE` with the `amm/...` error ID. |
+| `mpOfflineSwap` | With the stablecoin issuer's participant disconnected, a swap and the finalization of a proposal all four core signers have approved both fail with `MEDIATOR_SAYS_TX_TIMED_OUT`. The pool state, the reserves, the trader's input and the proposal are unchanged, and no charter exists for its terms. |
+| `mpReconnectedSwap` | After reconnection, the same swap succeeds (1,000 → 1,993) and the same proposal finalizes into exactly its charter. |
 
 The disconnection is done through the issuer participant's admin API, on the script's own local
 network only. It demonstrates one outage of one confirming participant and its recovery. It
 does not establish censorship resistance or any other outage behavior.
 
-**Finding: there is no production onboarding workflow.** A Secure V1 charter needs four
-signatories, a factory two, and `Execute` two controllers. When those parties are hosted on
-different participants, no single submission can supply their authority. The harness therefore
-uses test-only templates in the tests package, which are not deployable:
-- `CharterProposal`, which accumulates each core signer's approval;
-- `FactoryProposal`;
-- `ExecutionApproval`, in which governance pre-approves and the operator executes.
+**Onboarding (Stage 3.1).** Stage 2.3 found that there was no production onboarding workflow and
+used test-only templates in the tests package. Those templates are removed. Every
+multi-signatory step in the harness now uses the production templates in
+`CantonTreasuryAmm.SecureV1.Onboarding`; see [`ONBOARDING.md`](ONBOARDING.md). The only test-only
+template left in `MultiParticipant` is `GovernanceProxy`, an attack fixture for scenario 8.
 
-Production needs a reviewed equivalent of these workflows, or a multi-party submission
-mechanism. That is a deployment blocker.
-
-**Warnings in a passing run.** `canton.log` contains no ERROR lines and exactly one WARN. That
-WARN comes from the stablecoin issuer's `TransactionProcessor` during the outage phase: "Response
-message for request … timed out". After reconnection, the sequencer refuses the issuer's late
-confirmation with `MAX_SEQUENCING_TIME_EXCEEDED`, which is logged at INFO. The expected
+**Warnings in a passing run.** `canton.log` contains no ERROR lines and exactly two WARN lines.
+Both come from the stablecoin issuer's `TransactionProcessor` during the outage phase, one for
+the swap and one for the finalization: "Response message for request … timed out". After
+reconnection, the sequencer refuses the issuer's late confirmations with
+`MAX_SEQUENCING_TIME_EXCEEDED`, which is logged at INFO. The expected
 rejections in the other phases are logged at INFO. The daemon exits with status 143 when the
 script stops it with `SIGTERM`, and the script treats that as a clean stop.
 
@@ -168,6 +180,25 @@ structural mutations, all detected by the choice-surface script, that makes 18 m
 | `BurnPosition` added to `SecureLiquidityPosition` | Secure V1 choice surface |
 | A test that does not run (a stub declared but skipped) | `run-tests-strict.sh` |
 
+**Stage 3.1** (each applied alone to `Onboarding.daml`, built, run through
+`run-tests-strict.sh` and reverted; the file's SHA-256 matched the original afterwards):
+
+| Mutation | Caught by |
+| --- | --- |
+| Finalization no longer requires the stablecoin issuer's approval | `finalizationNeedsEveryCoreApproval`, `competingProposalsAndSecondPoolsStayIsolated`; the charter create then fails with `AuthorizationError` instead of `amm/onboarding-incomplete` |
+| Finalization no longer requires the custodian's approval | `finalizationNeedsEveryCoreApproval` |
+| Approval skips the terms equality check | `approvalsBindTheExactTerms` |
+| Finalization skips the terms equality check | `approvalsBindTheExactTerms`, `competingProposalsAndSecondPoolsStayIsolated` |
+| Approval is non-consuming (reusable) | 3 onboarding tests and the Secure V1 choice surface |
+| Execution approval is non-consuming (reusable) | `onboardingCreatesExactlyTheApprovedCharterAndPool`, `executionApprovalsAuthorizeExactlyOneExecution` |
+| Finalization controlled by the custodian instead of the operator | all 9 onboarding tests |
+| Approval ignores the stablecoin instrument in the terms | `approvalsBindTheExactTerms` |
+| Proposal precondition drops "operator among the signers" | `approvalsCannotBeForgedOrGivenForOthers` |
+| Proposal precondition drops "only core signers sign" | Survived at first; killed by `approvalsCannotBeForgedOrGivenForOthers` after adding proposals signed by the operator with governance or the provider |
+| Proposal precondition drops role independence | Survived at first (the charter's own precondition still rejects it at finalization); killed by `approvalsCannotBeForgedOrGivenForOthers` after adding proposals with dependent roles |
+| Factory acceptance skips the terms equality check | `factoryProposalsCreateOnlyTheAcceptedFactory` |
+| Approval skips the expiry check | `expiredProposalsCannotBeApprovedOrFinalized` |
+
 ## Deployment readiness
 
 - **Verified tests.** The full Daml Script suite passes on the IDE ledger. Legacy
@@ -176,7 +207,8 @@ structural mutations, all detected by the choice-surface script, that makes 18 m
 - **Real Canton participant coverage.**
   - Stage 2.2: four Secure V1 scripts on a single-participant Canton 3.5.12 sandbox.
   - Stage 2.3: a single-participant sandbox for package coexistence, plus the multi-participant
-    run above.
+    run.
+  - Stage 3.1: the multi-participant run above, with production onboarding.
   - Every other test ran on the IDE ledger only.
 - **Multi-participant verification.** PASS, locally, for the scenarios above. Not run on any
   production-like topology.
@@ -186,15 +218,18 @@ structural mutations, all detected by the choice-surface script, that makes 18 m
 - **Privacy requirements.** The custodian and both issuers see every pool state and position,
   including LP identities and share amounts. This needs sign-off from every LP and the
   issuers.
-- **Operational procedures.** None exist for signer separation, key custody, onboarding,
-  incident response, recovery after archival or a pause (see [`SECURITY.md`](SECURITY.md)).
+- **Onboarding.** Implemented in the package and tested on the IDE ledger and the local
+  multi-participant network. [`ONBOARDING.md`](ONBOARDING.md) describes the procedure. No
+  custodian or issuer has reviewed or accepted it.
+- **Operational procedures.** None exist for signer separation, key custody, incident
+  response, recovery after archival or a pause (see [`SECURITY.md`](SECURITY.md)).
 
 ### Remaining blockers
 
 | Severity | Blocker |
 | --- | --- |
 | High (inherent) | The full core coalition is trusted: it can forge, drain, freeze or destroy a pool. It is a trusted-custody design that relies on independent operation of the four core signers. |
-| High | There is no production onboarding workflow for charters, factories and intent execution across participants. |
+| High | The onboarding workflow exists in source but has not been reviewed or accepted by any custodian or issuer, has been run only on a local test network, and is not audited. |
 | High | There is no safe pause. Full-core archival is destructive. A non-destructive pause needs a schema change and its own review. |
 | High | No independent security audit has been done. |
 | Medium | Any one core participant can halt every pool operation, including LP exits. |

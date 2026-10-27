@@ -58,14 +58,15 @@ This MVP therefore trusts the operator as reserve custodian. It also trusts the 
 
 ## Secure V1 pool
 
-`CantonTreasuryAmm.SecureV1.Pool` and `CantonTreasuryAmm.SecureV1.SwapIntent` are a parallel implementation with protected reserves. Every pool state, reserve and LP position is signed by an independent custodian, the operator and both issuers. Reserves have no choices and change only inside the pool's own swap and liquidity choices, which bind them to the pool's lineage and genesis. Governance observes but holds no reserve authority, and no coalition smaller than those four signers can move reserves, forge positions or settle in another party's name. That full coalition remains trusted. Pricing, rounding, both fee counters, auditor visibility and the swap-intent roles match the legacy pool, which the tests check step by step. Arbitrary Token Standard holdings are not supported as reserves or deposits.
+`CantonTreasuryAmm.SecureV1.Pool` and `CantonTreasuryAmm.SecureV1.SwapIntent` are a parallel implementation with protected reserves. Every pool state, reserve and LP position is signed by an independent custodian, the operator and both issuers. Reserves have no choices and change only inside the pool's own swap and liquidity choices, which bind them to the pool's lineage and genesis. Governance observes but holds no reserve authority, and no coalition smaller than those four signers can move reserves, forge positions or settle in another party's name. That full coalition remains trusted. When the signers are hosted on separate participants, `CantonTreasuryAmm.SecureV1.Onboarding` lets each of them approve the exact pool terms from its own participant before the operator finalizes the charter, and lets governance accept the intent factory and approve each intent execution. Pricing, rounding, both fee counters, auditor visibility and the swap-intent roles match the legacy pool, which the tests check step by step. Arbitrary Token Standard holdings are not supported as reserves or deposits.
 
 Secure V1 is a separate package, `canton-treasury-amm-secure-v1` 0.1.0, in [`daml/canton-treasury-amm-secure-v1`](daml/canton-treasury-amm-secure-v1). It data-depends on the unchanged legacy `canton-treasury-amm` 0.1.0 DAR, so the legacy package keeps its package ID and both can be vetted on one participant. Secure V1 is not deployed, has not been audited and is not ready for deployment. No migration from legacy pools is implemented or authorized. See:
 
 - [`SECURE_V1.md`](daml/canton-treasury-amm-secure-v1/SECURE_V1.md) for the design, fee accounting, privacy and tests;
 - [`SECURITY.md`](daml/canton-treasury-amm-secure-v1/SECURITY.md) for the legacy and Secure V1 security model, residual trust, emergency operations and compatibility;
 - [`RELEASE_READINESS.md`](daml/canton-treasury-amm-secure-v1/RELEASE_READINESS.md) for packaging, CI, multi-participant Canton evidence and the remaining deployment blockers;
-- [`MIGRATION.md`](daml/canton-treasury-amm-secure-v1/MIGRATION.md) for the legacy cutover design.
+- [`MIGRATION.md`](daml/canton-treasury-amm-secure-v1/MIGRATION.md) for the legacy cutover design;
+- [`ONBOARDING.md`](daml/canton-treasury-amm-secure-v1/ONBOARDING.md) for the multi-party onboarding and approval procedure.
 
 ## Build and test
 
@@ -111,7 +112,7 @@ export PATH="$HOME/.dpm/bin:$PATH"
 dpm script --dar daml/canton-treasury-amm-tests/.daml/dist/canton-treasury-amm-tests-0.1.0.dar --all --ledger-host localhost --ledger-port 6865 --upload-dar true -w
 ```
 
-Restart the sandbox before uploading a changed DAR with the same package name and version. Canton uses wall-clock time; if static-time control is unavailable, only the two expiry scripts may be excluded with `--skip-script-name CantonTreasuryAmm.Test.SwapIntent:expiredDeadlinesRejectDirectSwapAndIntent` and `--skip-script-name CantonTreasuryAmm.Test.SecureV1SwapIntent:secureIntentsCannotReplayGoStaleOrOutliveTheirDeadline`.
+Restart the sandbox before uploading a changed DAR with the same package name and version. Canton uses wall-clock time; if static-time control is unavailable, only the three expiry scripts may be excluded with `--skip-script-name CantonTreasuryAmm.Test.SwapIntent:expiredDeadlinesRejectDirectSwapAndIntent`, `--skip-script-name CantonTreasuryAmm.Test.SecureV1SwapIntent:secureIntentsCannotReplayGoStaleOrOutliveTheirDeadline` and `--skip-script-name CantonTreasuryAmm.Test.SecureV1Onboarding:expiredProposalsCannotBeApprovedOrFinalized`.
 
 ## License
 

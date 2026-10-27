@@ -1,0 +1,675 @@
+-- Production onboarding for Secure V1 (`CantonTreasuryAmm.SecureV1.Onboarding`): pool proposals
+-- approved one core signer at a time, factory proposals accepted by governance, and per-execution
+-- intent approvals. Every rejection compares the whole onboarding and pool ledger before and after.
+module CantonTreasuryAmm.Test.SecureV1Onboarding where
+
+import DA.Action (foldlA)
+import DA.Assert ((===))
+import DA.Foldable (forA_, mapA_)
+import DA.List (sortOn)
+import DA.Time (addRelTime, hours)
+import Daml.Script
+
+import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.SecureV1.Errors
+import CantonTreasuryAmm.SecureV1.Onboarding
+import CantonTreasuryAmm.SecureV1.Pool
+import CantonTreasuryAmm.SecureV1.SwapIntent
+import CantonTreasuryAmm.Test.Fixtures
+import CantonTreasuryAmm.Test.ProtectedPoolSettlementTests qualified as Settlement
+import CantonTreasuryAmm.Test.SecureV1Support
+import CantonTreasuryAmm.Token
+import CantonTreasuryAmm.Types
+
+data Onboarding = Onboarding with
+  fixture : Fixture
+  custodian : Party
+  secondProvider : Party
+  terms : SecurePoolTerms
+
+openOnboarding : Text -> Script Onboarding
+openOnboarding charterReference = do
+  fixture <- setup
+  custodian <- allocateParty "SecureCustodian"
+  secondProvider <- allocateParty "SecondProvider"
+  expiresAt <- futureDeadline
+  pure Onboarding with
+    fixture
+    custodian
+    secondProvider
+    terms = SecurePoolTerms with
+      lineage = secureLineageFor fixture custodian charterReference
+      initialProvider = fixture.provider
+      auditors = [fixture.auditor]
+      expiresAt
+
+withReference : SecurePoolTerms -> Text -> SecurePoolTerms
+withReference terms charterReference = terms with lineage = (terms.lineage with charterReference)
+
+-- The three core signers that approve after the operator proposes, deliberately not in
+-- `coreSignatories` order.
+approversOf : SecurePoolTerms -> [Party]
+approversOf terms =
+  [terms.lineage.treasuryInstrument.issuer, terms.lineage.custodian, terms.lineage.stableInstrument.issuer]
+
+propose : SecurePoolTerms -> Script (ContractId SecurePoolProposal)
+propose terms = submit terms.lineage.operator $ createCmd SecurePoolProposal with
+  terms
+  approvals = [terms.lineage.operator]
+
+approveCmd : Party -> SecurePoolTerms -> ContractId SecurePoolProposal -> Commands (ContractId SecurePoolProposal)
+approveCmd approver expectedTerms proposalCid = exerciseCmd proposalCid ApprovePoolProposal with approver; expectedTerms
+
+approveAs : Party -> SecurePoolTerms -> ContractId SecurePoolProposal -> Script (ContractId SecurePoolProposal)
+approveAs approver terms proposalCid = submit approver $ approveCmd approver terms proposalCid
+
+approveAll : [Party] -> SecurePoolTerms -> ContractId SecurePoolProposal -> Script (ContractId SecurePoolProposal)
+approveAll approvers terms proposalCid = foldlA (\cid approver -> approveAs approver terms cid) proposalCid approvers
+
+finalizeCmd : SecurePoolTerms -> ContractId SecurePoolProposal -> Commands (ContractId SecurePoolCharter)
+finalizeCmd expectedTerms proposalCid = exerciseCmd proposalCid FinalizePoolProposal with expectedTerms
+
+finalize : SecurePoolTerms -> ContractId SecurePoolProposal -> Script (ContractId SecurePoolCharter)
+finalize terms proposalCid = submit terms.lineage.operator $ finalizeCmd terms proposalCid
+
+onboard : SecurePoolTerms -> Script (ContractId SecurePoolCharter)
+onboard terms = propose terms >>= approveAll (approversOf terms) terms >>= finalize terms
+
+charterOf : SecurePoolTerms -> SecurePoolCharter
+charterOf terms = SecurePoolCharter with
+  lineage = terms.lineage
+  initialProvider = terms.initialProvider
+  auditors = terms.auditors
+
+-- The initial provider initializes an onboarded charter with 5,000,000 / 10,000,000 atoms.
+initializeOnboarded : Onboarding -> SecurePoolTerms -> ContractId SecurePoolCharter -> Script SecureMarket
+initializeOnboarded onboarding terms charterCid = do
+  let fixture = onboarding.fixture
+  treasuryHoldingCid <- issueTreasury fixture fixture.provider (amountOf 5000000)
+  stableHoldingCid <- issueStable fixture fixture.provider (amountOf 10000000)
+  initialized <- submit fixture.provider $ exerciseCmd charterCid InitializePool with
+    treasuryHoldingCid
+    stableHoldingCid
+    treasuryAmount = amountOf 5000000
+    stableAmount = amountOf 10000000
+  pure SecureMarket with
+    fixture
+    custodian = onboarding.custodian
+    secondProvider = onboarding.secondProvider
+    lineage = terms.lineage
+    charterCid
+    initialized
+
+onboardedMarket : Text -> Script (Onboarding, SecureMarket)
+onboardedMarket charterReference = do
+  onboarding <- openOnboarding charterReference
+  charterCid <- onboard onboarding.terms
+  market <- initializeOnboarded onboarding onboarding.terms charterCid
+  pure (onboarding, market)
+
+factoryTermsOf : SecureMarket -> SecureFactoryTerms
+factoryTermsOf market = SecureFactoryTerms with
+  lineage = market.lineage
+  genesisCid = market.charterCid
+  authorizedTraders = [market.fixture.trader]
+  complianceObservers = [market.fixture.auditor]
+
+factoryOf : SecureFactoryTerms -> SecureSwapIntentFactory
+factoryOf terms = SecureSwapIntentFactory with
+  lineage = terms.lineage
+  genesisCid = terms.genesisCid
+  authorizedTraders = terms.authorizedTraders
+  complianceObservers = terms.complianceObservers
+
+openFactory : SecureMarket -> Script (ContractId SecureSwapIntentFactory)
+openFactory market = do
+  let terms = factoryTermsOf market
+  proposalCid <- submit market.lineage.operator $ createCmd SecureSwapIntentFactoryProposal with terms
+  submit market.lineage.governance $ exerciseCmd proposalCid AcceptFactoryProposal with expectedTerms = terms
+
+-- A stablecoin-for-Treasury intent against the pool's current version.
+submitIntent : SecureMarket -> ContractId SecureSwapIntentFactory -> ContractId SecurePool -> Int -> Int -> Script (ContractId SecureSwapIntent)
+submitIntent market factoryCid poolCid inputAtoms minimumOut = do
+  Some pool <- queryContractId market.custodian poolCid
+  deadline <- futureDeadline
+  submit market.fixture.trader $ exerciseCmd factoryCid SubmitSwapIntent with
+    trader = market.fixture.trader
+    poolCid
+    direction = StableForTreasury
+    inputAmount = amountOf inputAtoms
+    minimumAmountOut = amountOf minimumOut
+    deadline
+    expectedPoolVersion = pool.stateVersion
+
+approveExecution : SecureMarket -> ContractId SecureSwapIntent -> ContractId Holding -> Script (ContractId SecureSwapIntentExecutionApproval)
+approveExecution market intentCid inputHoldingCid = submit market.lineage.governance $ createCmd SecureSwapIntentExecutionApproval with
+  operator = market.lineage.operator
+  governance = market.lineage.governance
+  intentCid
+  inputHoldingCid
+
+-- The operator runs governance's approval with the trader's holding disclosed, and the trader
+-- receives exactly the quote with its change.
+executeApproved : SecureMarket -> ContractId SecurePool -> ContractId SecureSwapIntentExecutionApproval -> Int -> Int -> Script SecureSwapResult
+executeApproved market poolCid approvalCid inputAtoms expectedOut = do
+  let fixture = market.fixture
+  Some approval <- queryContractId fixture.governance approvalCid
+  let intentCid = approval.intentCid
+  let inputCid = approval.inputHoldingCid
+  (pool, treasuryReserve, stableReserve) <- checkSecurePool market poolCid
+  Some input <- queryContractId fixture.trader inputCid
+  totals <- totalsOf market
+  stableHeld <- holdingAtoms fixture.trader market.lineage.stableInstrument
+  treasuryHeld <- holdingAtoms fixture.trader market.lineage.treasuryInstrument
+  inputDisclosed <- disclosureOf fixture.trader inputCid
+  result <- submit (actAs fixture.operator <> discloseMany [inputDisclosed]) $ exerciseCmd approvalCid ExecuteApprovedIntent
+  result.amountOut === amountOf expectedOut
+  (next, nextTreasury, nextStable) <- checkSecurePool market result.poolCid
+  (atomsOf nextStable.amount, atomsOf nextTreasury.amount)
+    === (atomsOf stableReserve.amount + inputAtoms, atomsOf treasuryReserve.amount - expectedOut)
+  (atomsOf next.stableFeeAmount, next.treasuryFeeAmount, next.stateVersion)
+    === (atomsOf pool.stableFeeAmount + (inputAtoms * 3 + 999) / 1000, pool.treasuryFeeAmount, pool.stateVersion + 1)
+  Some output <- queryContractId fixture.trader result.outputHoldingCid
+  (output.owner, output.instrument, atomsOf output.amount) === (fixture.trader, market.lineage.treasuryInstrument, expectedOut)
+  Some changeCid <- pure result.inputChangeHoldingCid
+  Some change <- queryContractId fixture.trader changeCid
+  (change.owner, atomsOf change.amount) === (fixture.trader, atomsOf input.amount - inputAtoms)
+  holdingAtoms fixture.trader market.lineage.stableInstrument >>= (=== stableHeld - inputAtoms)
+  holdingAtoms fixture.trader market.lineage.treasuryInstrument >>= (=== treasuryHeld + expectedOut)
+  mapA_ (\party -> holdingAtoms party market.lineage.treasuryInstrument >>= (=== 0)) [fixture.operator, fixture.governance]
+  assertArchived fixture.governance approvalCid
+  assertArchived fixture.operator intentCid
+  totalsOf market >>= (=== totals)
+  pure result
+
+-- Every onboarding, pool, intent and holding contract any party can see.
+data Ledger = Ledger with
+  proposals : [(ContractId SecurePoolProposal, SecurePoolProposal)]
+  charters : [(ContractId SecurePoolCharter, SecurePoolCharter)]
+  pools : [(ContractId SecurePool, SecurePool)]
+  reserves : [(ContractId SecureReserveHolding, SecureReserveHolding)]
+  positions : [(ContractId SecureLiquidityPosition, SecureLiquidityPosition)]
+  factoryProposals : [(ContractId SecureSwapIntentFactoryProposal, SecureSwapIntentFactoryProposal)]
+  factories : [(ContractId SecureSwapIntentFactory, SecureSwapIntentFactory)]
+  intents : [(ContractId SecureSwapIntent, SecureSwapIntent)]
+  executionApprovals : [(ContractId SecureSwapIntentExecutionApproval, SecureSwapIntentExecutionApproval)]
+  holdings : [(ContractId Holding, Holding)]
+    deriving (Eq, Show)
+
+readersOf : Onboarding -> [Party]
+readersOf onboarding =
+  [ onboarding.custodian
+  , onboarding.secondProvider
+  , onboarding.fixture.treasuryIssuer
+  , onboarding.fixture.stableIssuer
+  , onboarding.fixture.operator
+  , onboarding.fixture.governance
+  , onboarding.fixture.provider
+  , onboarding.fixture.trader
+  , onboarding.fixture.other
+  , onboarding.fixture.auditor
+  ]
+
+sorted : [(ContractId t, t)] -> [(ContractId t, t)]
+sorted = sortOn (show . fst)
+
+ledgerOf : Onboarding -> Script Ledger
+ledgerOf onboarding = do
+  let readers = readersOf onboarding
+  proposals <- sorted <$> query @SecurePoolProposal readers
+  charters <- sorted <$> query @SecurePoolCharter readers
+  pools <- sorted <$> query @SecurePool readers
+  reserves <- sorted <$> query @SecureReserveHolding readers
+  positions <- sorted <$> query @SecureLiquidityPosition readers
+  factoryProposals <- sorted <$> query @SecureSwapIntentFactoryProposal readers
+  factories <- sorted <$> query @SecureSwapIntentFactory readers
+  intents <- sorted <$> query @SecureSwapIntent readers
+  executionApprovals <- sorted <$> query @SecureSwapIntentExecutionApproval readers
+  holdings <- sorted <$> query @Holding readers
+  pure Ledger with
+    proposals; charters; pools; reserves; positions; factoryProposals; factories; intents; executionApprovals; holdings
+
+refused : Onboarding -> (Either SubmitError a -> Script ()) -> Script (Either SubmitError a) -> Script ()
+refused onboarding check submission = do
+  before <- ledgerOf onboarding
+  submission >>= check
+  ledgerOf onboarding >>= (=== before)
+
+assertPreconditionFailed : Either SubmitError a -> Script ()
+assertPreconditionFailed = assertFailureId "UNHANDLED_EXCEPTION/DA.Exception.PreconditionFailed:PreconditionFailed"
+
+-- APPROVALS IN ORDER. The operator proposes; the Treasury issuer, the custodian and the
+-- stablecoin issuer each sign from their own submission; the operator finalizes. Checked after
+-- every step: only the proposal changes, signed by exactly the approvers so far, with the
+-- proposed terms; nothing else exists (no reserve, pool state, position, charter or holding).
+-- Finalization creates exactly the proposed charter and archives the proposal. The provider then
+-- initializes the pool, which creates its two reserves, and a swap, a deposit, a withdrawal and
+-- an approved intent execution settle exactly.
+onboardingCreatesExactlyTheApprovedCharterAndPool : Script ()
+onboardingCreatesExactlyTheApprovedCharterAndPool = do
+  onboarding <- openOnboarding "onboarding-happy"
+  let fixture = onboarding.fixture
+  let terms = onboarding.terms
+  before <- ledgerOf onboarding
+  let expectProposal proposalCid approvals = do
+        ledger <- ledgerOf onboarding
+        (ledger with proposals = []) === before
+        ledger.proposals === [(proposalCid, SecurePoolProposal with terms; approvals)]
+  proposed <- propose terms
+  expectProposal proposed [fixture.operator]
+  byTreasuryIssuer <- approveAs fixture.treasuryIssuer terms proposed
+  assertArchived fixture.operator proposed
+  expectProposal byTreasuryIssuer [fixture.operator, fixture.treasuryIssuer]
+  byCustodian <- approveAs onboarding.custodian terms byTreasuryIssuer
+  expectProposal byCustodian [fixture.operator, fixture.treasuryIssuer, onboarding.custodian]
+  ready <- approveAs fixture.stableIssuer terms byCustodian
+  expectProposal ready [fixture.operator, fixture.treasuryIssuer, onboarding.custodian, fixture.stableIssuer]
+  charterCid <- finalize terms ready
+  afterFinalize <- ledgerOf onboarding
+  (afterFinalize with charters = []) === before
+  afterFinalize.charters === [(charterCid, charterOf terms)]
+
+  market <- initializeOnboarded onboarding terms charterCid
+  (pool, treasuryReserve, stableReserve) <- checkSecurePool market market.initialized.poolCid
+  (atomsOf pool.totalShares, pool.stateVersion) === (7071067, 0)
+  (atomsOf treasuryReserve.amount, atomsOf stableReserve.amount) === (5000000, 10000000)
+  (treasuryReserve.genesisCid, stableReserve.genesisCid) === (charterCid, charterCid)
+  assertArchived onboarding.custodian charterCid
+  swapInput <- issueTreasury fixture fixture.trader (amountOf 1000)
+  swapped <- settleSwap market fixture.trader market.initialized.poolCid TreasuryForStable swapInput 1000 1993
+  depositTreasury <- issueTreasury fixture fixture.provider (amountOf 500000)
+  depositStable <- issueStable fixture fixture.provider (amountOf 1000000)
+  added <- settleAdd market fixture.provider swapped.poolCid depositTreasury depositStable 500000 1000000 706965 500000 999601
+  removed <- settleRemove market fixture.provider added.poolCid added.positionCid 353482 249999 499799
+  factoryCid <- openFactory market
+  Some factory <- queryContractId fixture.trader factoryCid
+  factory === factoryOf (factoryTermsOf market)
+  intentCid <- submitIntent market factoryCid removed.poolCid 2000 997
+  intentInput <- issueStable fixture fixture.trader (amountOf 5000)
+  approvalCid <- approveExecution market intentCid intentInput
+  _ <- executeApproved market removed.poolCid approvalCid 2000 997
+  pure ()
+
+-- MISSING APPROVALS AND PRIVILEGED SHORTCUTS. For each of the seven strict subsets of the three
+-- non-proposing core signers, finalization fails `amm/onboarding-incomplete`. Everyone except
+-- the custodian, acting together, can sign a proposal without it but not finalize one. Every
+-- subset of the five privileged parties that lacks a core signer fails with `AuthorizationError`
+-- when it creates a charter directly or a proposal that claims every core approval. Nothing
+-- changes.
+finalizationNeedsEveryCoreApproval : Script ()
+finalizationNeedsEveryCoreApproval = do
+  onboarding <- openOnboarding "onboarding-missing"
+  let fixture = onboarding.fixture
+  let terms = onboarding.terms
+  let core = coreSignatories terms.lineage
+  let partial = filter (\subset -> length subset < 3) (Settlement.subsetsOf (approversOf terms))
+  length partial === 7
+  forA_ partial $ \approvers -> do
+    incomplete <- propose terms >>= approveAll approvers terms
+    refused onboarding (assertFailureId onboardingIncompleteError) $
+      trySubmit fixture.operator $ finalizeCmd terms incomplete
+  let withoutCustodian = [fixture.operator, fixture.treasuryIssuer, fixture.stableIssuer, fixture.governance]
+  colluding <- submit (actAs withoutCustodian) $ createCmd SecurePoolProposal with
+    terms
+    approvals = [fixture.operator, fixture.treasuryIssuer, fixture.stableIssuer]
+  refused onboarding (assertFailureId onboardingIncompleteError) $
+    trySubmit (actAs withoutCustodian) $ finalizeCmd terms colluding
+  let privileged = terms.lineage.governance :: core
+  let lacking = filter (\subset -> not (null subset) && not (all (`elem` subset) core)) (Settlement.subsetsOf privileged)
+  length lacking === 29
+  forA_ lacking $ \subset -> do
+    refused onboarding assertAuthorizationError $
+      trySubmit (actAs subset) $ createCmd (charterOf terms)
+    refused onboarding assertAuthorizationError $
+      trySubmit (actAs subset) $ createCmd SecurePoolProposal with terms; approvals = core
+
+-- FORGED AND MISATTRIBUTED APPROVALS. With the proposal disclosed to every outsider:
+-- the operator cannot create a proposal carrying an issuer's approval; the operator cannot
+-- approve as an issuer, nor governance as the custodian (`AuthorizationError`); governance and
+-- the provider approving as themselves, a repeated approval and the operator approving again
+-- fail `amm/onboarding-approver`; only the operator can finalize; only core signers can cancel.
+-- Template preconditions: a non-operator cannot initiate a proposal, a non-core party cannot
+-- sign one even with its own authority, and the proposed roles must be independent. Nothing
+-- changes.
+approvalsCannotBeForgedOrGivenForOthers : Script ()
+approvalsCannotBeForgedOrGivenForOthers = do
+  onboarding <- openOnboarding "onboarding-forged"
+  let fixture = onboarding.fixture
+  let terms = onboarding.terms
+  refused onboarding assertAuthorizationError $
+    trySubmit fixture.operator $ createCmd SecurePoolProposal with
+      terms
+      approvals = [fixture.operator, fixture.treasuryIssuer]
+  refused onboarding assertPreconditionFailed $
+    trySubmit onboarding.custodian $ createCmd SecurePoolProposal with terms; approvals = [onboarding.custodian]
+  forA_ [fixture.governance, fixture.provider] $ \outsider ->
+    refused onboarding assertPreconditionFailed $
+      trySubmit (actAs [fixture.operator, outsider]) $ createCmd SecurePoolProposal with
+        terms
+        approvals = [fixture.operator, outsider]
+  let lineage = terms.lineage
+  forA_
+    [ lineage with custodian = fixture.operator
+    , lineage with governance = onboarding.custodian
+    , lineage with stableInstrument = lineage.treasuryInstrument
+    ] $ \dependent ->
+      refused onboarding assertPreconditionFailed $
+        trySubmit fixture.operator $ createCmd SecurePoolProposal with
+          terms = terms with lineage = dependent
+          approvals = [fixture.operator]
+  proposed <- propose terms
+  byTreasuryIssuer <- approveAs fixture.treasuryIssuer terms proposed
+  disclosed <- disclosureOf fixture.operator byTreasuryIssuer
+  let asOutsider party = actAs party <> discloseMany [disclosed]
+  refused onboarding assertAuthorizationError $
+    trySubmit fixture.operator $ approveCmd fixture.stableIssuer terms byTreasuryIssuer
+  refused onboarding assertAuthorizationError $
+    trySubmit (asOutsider fixture.governance) $ approveCmd onboarding.custodian terms byTreasuryIssuer
+  forA_ [fixture.governance, fixture.provider] $ \outsider ->
+    refused onboarding (assertFailureId onboardingApproverError) $
+      trySubmit (asOutsider outsider) $ approveCmd outsider terms byTreasuryIssuer
+  forA_ [fixture.treasuryIssuer, fixture.operator] $ \repeated ->
+    refused onboarding (assertFailureId onboardingApproverError) $
+      trySubmit repeated $ approveCmd repeated terms byTreasuryIssuer
+  ready <- approveAll [onboarding.custodian, fixture.stableIssuer] terms byTreasuryIssuer
+  readyDisclosed <- disclosureOf fixture.operator ready
+  forA_ [onboarding.custodian, fixture.treasuryIssuer, fixture.stableIssuer] $ \signer ->
+    refused onboarding assertAuthorizationError $ trySubmit signer $ finalizeCmd terms ready
+  forA_ [fixture.governance, fixture.provider] $ \outsider -> do
+    refused onboarding assertAuthorizationError $
+      trySubmit (actAs outsider <> discloseMany [readyDisclosed]) $ finalizeCmd terms ready
+    refused onboarding (assertFailureId onboardingApproverError) $
+      trySubmit (actAs outsider <> discloseMany [readyDisclosed]) $
+        exerciseCmd ready CancelPoolProposal with canceller = outsider
+  _ <- finalize terms ready
+  pure ()
+
+-- TERMS BINDING. Each security-relevant field is changed in turn: the custodian, operator and
+-- governance; each instrument's issuer and symbol; the instruments swapped; the charter
+-- reference; the initial provider; the auditors (removed, extended, reordered); the expiry.
+-- Approving or finalizing against any changed terms fails `amm/onboarding-terms`. A proposal of
+-- changed terms is a new contract that carries none of the earlier approvals. Nothing changes.
+approvalsBindTheExactTerms : Script ()
+approvalsBindTheExactTerms = do
+  onboarding <- openOnboarding "onboarding-terms"
+  let fixture = onboarding.fixture
+  let terms = onboarding.terms
+  let lineage = terms.lineage
+  rogue <- allocateParty "Rogue"
+  let variants =
+        [ terms with lineage = (lineage with custodian = rogue)
+        , terms with lineage = (lineage with operator = rogue)
+        , terms with lineage = (lineage with governance = rogue)
+        , terms with lineage = (lineage with treasuryInstrument = (lineage.treasuryInstrument with issuer = rogue))
+        , terms with lineage = (lineage with treasuryInstrument = (lineage.treasuryInstrument with symbol = "UST2"))
+        , terms with lineage = (lineage with stableInstrument = (lineage.stableInstrument with issuer = rogue))
+        , terms with lineage = (lineage with stableInstrument = (lineage.stableInstrument with symbol = "USDX"))
+        , terms with lineage = (lineage with treasuryInstrument = lineage.stableInstrument; stableInstrument = lineage.treasuryInstrument)
+        , withReference terms "onboarding-terms-other"
+        , terms with initialProvider = fixture.other
+        , terms with auditors = []
+        , terms with auditors = [fixture.auditor, fixture.other]
+        , terms with auditors = [fixture.other, fixture.auditor]
+        , terms with expiresAt = addRelTime terms.expiresAt (hours 1)
+        ]
+  forA_ variants $ \changed -> assertMsg "Each variant changes the terms" (changed /= terms)
+  proposed <- propose terms
+  forA_ variants $ \changed ->
+    refused onboarding (assertFailureId onboardingTermsError) $
+      trySubmit fixture.treasuryIssuer $ approveCmd fixture.treasuryIssuer changed proposed
+  ready <- approveAll (approversOf terms) terms proposed
+  forA_ variants $ \changed ->
+    refused onboarding (assertFailureId onboardingTermsError) $
+      trySubmit fixture.operator $ finalizeCmd changed ready
+  let changedProvider = terms with initialProvider = fixture.other
+  reproposed <- propose changedProvider
+  Some fresh <- queryContractId fixture.operator reproposed
+  fresh.approvals === [fixture.operator]
+  refused onboarding (assertFailureId onboardingIncompleteError) $
+    trySubmit fixture.operator $ finalizeCmd changedProvider reproposed
+  charterCid <- finalize terms ready
+  Some charter <- queryContractId onboarding.custodian charterCid
+  charter === charterOf terms
+
+-- REPLAY, DOUBLE FINALIZATION AND CANCELLATION. An approval on a superseded proposal fails with
+-- `ContractNotFound` for it, also when the approver presents the stale disclosure; finalizing or
+-- approving a finalized proposal fails the same way. Each core signer cancels a proposal at a
+-- different stage (unapproved, partly and fully approved); cancellation removes only the
+-- proposal, and the cancelled proposal can be neither approved nor finalized. The same terms
+-- proposed again start with only the operator's approval.
+consumedAndCancelledProposalsCannotBeReused : Script ()
+consumedAndCancelledProposalsCannotBeReused = do
+  onboarding <- openOnboarding "onboarding-replay"
+  let fixture = onboarding.fixture
+  let terms = onboarding.terms
+  proposed <- propose terms
+  staleDisclosure <- disclosureOf fixture.operator proposed
+  byTreasuryIssuer <- approveAs fixture.treasuryIssuer terms proposed
+  refused onboarding (assertConsumedContract proposed) $
+    trySubmit onboarding.custodian $ approveCmd onboarding.custodian terms proposed
+  refused onboarding (assertConsumedContract proposed) $
+    trySubmit (actAs onboarding.custodian <> discloseMany [staleDisclosure]) $
+      approveCmd onboarding.custodian terms proposed
+  ready <- approveAll [onboarding.custodian, fixture.stableIssuer] terms byTreasuryIssuer
+  _ <- finalize terms ready
+  refused onboarding (assertConsumedContract ready) $ trySubmit fixture.operator $ finalizeCmd terms ready
+  refused onboarding (assertConsumedContract ready) $
+    trySubmit onboarding.custodian $ approveCmd onboarding.custodian terms ready
+  forA_ (zip (coreSignatories terms.lineage) [0, 1, 2, 3]) $ \(canceller, approved) -> do
+    pending <- propose terms >>= approveAll (take approved (approversOf terms)) terms
+    before <- ledgerOf onboarding
+    submit canceller $ exerciseCmd pending CancelPoolProposal with canceller
+    ledgerOf onboarding >>= (=== (before with proposals = filter ((/= pending) . fst) before.proposals))
+    refused onboarding (assertConsumedContract pending) $ trySubmit fixture.operator $ finalizeCmd terms pending
+    refused onboarding (assertConsumedContract pending) $
+      trySubmit fixture.stableIssuer $ approveCmd fixture.stableIssuer terms pending
+  again <- propose terms
+  Some fresh <- queryContractId fixture.operator again
+  fresh.approvals === [fixture.operator]
+  refused onboarding (assertFailureId onboardingIncompleteError) $ trySubmit fixture.operator $ finalizeCmd terms again
+
+-- COMPETING PROPOSALS AND SECOND POOLS. Two proposals over the same parties, each issuer
+-- approving a different one: neither finalizes, and one's approvals cannot finalize the other's
+-- terms. Completed independently, they become two pools with their own reserves: the second pool
+-- rejects the first pool's reserves even in a state forged by the full core
+-- (`amm/reserve-mismatch`) and the first pool's position (`amm/position`), and a swap in either
+-- leaves the other's reserves unchanged. A proposal for another issuer's instrument with the
+-- same symbol does not involve the genuine stablecoin issuer, and its pool rejects genuine
+-- stablecoin holdings (`amm/instrument-mismatch`).
+competingProposalsAndSecondPoolsStayIsolated : Script ()
+competingProposalsAndSecondPoolsStayIsolated = do
+  onboarding <- openOnboarding "onboarding-first"
+  let fixture = onboarding.fixture
+  let first = onboarding.terms
+  let second = withReference first "onboarding-second"
+  firstProposal <- propose first >>= approveAs fixture.treasuryIssuer first >>= approveAs onboarding.custodian first
+  secondProposal <- propose second >>= approveAs fixture.stableIssuer second >>= approveAs onboarding.custodian second
+  forA_ [(first, firstProposal), (second, secondProposal)] $ \(terms, proposalCid) ->
+    refused onboarding (assertFailureId onboardingIncompleteError) $
+      trySubmit fixture.operator $ finalizeCmd terms proposalCid
+  refused onboarding (assertFailureId onboardingTermsError) $
+    trySubmit fixture.operator $ finalizeCmd second firstProposal
+  firstCharter <- approveAs fixture.stableIssuer first firstProposal >>= finalize first
+  secondCharter <- approveAs fixture.treasuryIssuer second secondProposal >>= finalize second
+  firstMarket <- initializeOnboarded onboarding first firstCharter
+  secondMarket <- initializeOnboarded onboarding second secondCharter
+  (firstPool, _, _) <- checkSecurePool firstMarket firstMarket.initialized.poolCid
+  (secondPool, _, _) <- checkSecurePool secondMarket secondMarket.initialized.poolCid
+
+  forgedCid <- submit (actAs (coreSignatories second.lineage)) $ createCmd secondPool with
+    treasuryReserveCid = firstPool.treasuryReserveCid
+    stableReserveCid = firstPool.stableReserveCid
+  forgedDisclosure <- disclosureOf onboarding.custodian forgedCid
+  firstReserveDisclosures <- drop 1 <$> secureDisclosures firstMarket firstMarket.initialized.poolCid
+  substitutedInput <- issueTreasury fixture fixture.trader (amountOf 1000)
+  deadline <- futureDeadline
+  refused onboarding (assertFailureId reserveMismatchError) $
+    trySubmit (actAs fixture.trader <> discloseMany (forgedDisclosure :: firstReserveDisclosures)) $
+      swapCommand forgedCid fixture.trader TreasuryForStable substitutedInput 1000 0 deadline secondPool.stateVersion
+  submit (actAs (coreSignatories second.lineage)) $ archiveCmd forgedCid
+
+  secondDisclosures <- secureDisclosures secondMarket secondMarket.initialized.poolCid
+  refused onboarding (assertFailureId positionError) $
+    trySubmit (actAs fixture.provider <> discloseMany secondDisclosures) $
+      exerciseCmd secondMarket.initialized.poolCid RemoveLiquidity with
+        provider = fixture.provider
+        positionCid = firstMarket.initialized.positionCid
+        burnShares = amountOf 1000
+        minimumTreasuryOut = 0.0
+        minimumStableOut = 0.0
+        expectedVersion = secondPool.stateVersion
+  firstReserves <- reserveAtomsOf firstMarket firstMarket.initialized.poolCid
+  secondSwap <- settleSwap secondMarket fixture.trader secondMarket.initialized.poolCid TreasuryForStable substitutedInput 1000 1993
+  reserveAtomsOf firstMarket firstMarket.initialized.poolCid >>= (=== firstReserves)
+  secondReserves <- reserveAtomsOf secondMarket secondSwap.poolCid
+  secondReserves === (5001000, 9998007)
+  firstInput <- issueTreasury fixture fixture.trader (amountOf 1000)
+  _ <- settleSwap firstMarket fixture.trader firstMarket.initialized.poolCid TreasuryForStable firstInput 1000 1993
+  reserveAtomsOf secondMarket secondSwap.poolCid >>= (=== secondReserves)
+
+  rogueIssuer <- allocateParty "RogueStableIssuer"
+  let rogueInstrument = first.lineage.stableInstrument with issuer = rogueIssuer
+  let rogueLineage = first.lineage with stableInstrument = rogueInstrument; charterReference = "onboarding-rogue-usd"
+  let rogue = first with lineage = rogueLineage
+  rogueProposal <- propose rogue
+  rogueDisclosure <- disclosureOf fixture.operator rogueProposal
+  refused onboarding (assertFailureId onboardingApproverError) $
+    trySubmit (actAs fixture.stableIssuer <> discloseMany [rogueDisclosure]) $
+      approveCmd fixture.stableIssuer rogue rogueProposal
+  rogueCharter <- approveAll [fixture.treasuryIssuer, onboarding.custodian, rogueIssuer] rogue rogueProposal >>= finalize rogue
+  genuineTreasury <- issueTreasury fixture fixture.provider (amountOf 5000000)
+  genuineStable <- issueStable fixture fixture.provider (amountOf 10000000)
+  refused onboarding (assertFailureId instrumentMismatchError) $
+    trySubmit fixture.provider $ exerciseCmd rogueCharter InitializePool with
+      treasuryHoldingCid = genuineTreasury
+      stableHoldingCid = genuineStable
+      treasuryAmount = amountOf 5000000
+      stableAmount = amountOf 10000000
+
+-- EXPIRY. After the proposal's `expiresAt`, approval and finalization fail `amm/deadline` and
+-- change nothing; cancellation still works and creates nothing.
+expiredProposalsCannotBeApprovedOrFinalized : Script ()
+expiredProposalsCannotBeApprovedOrFinalized = do
+  onboarding <- openOnboarding "onboarding-expiry"
+  let fixture = onboarding.fixture
+  let terms = onboarding.terms
+  partial <- propose terms >>= approveAs fixture.treasuryIssuer terms
+  ready <- propose terms >>= approveAll (approversOf terms) terms
+  passTime (hours 2)
+  refused onboarding (assertFailureId deadlineError) $
+    trySubmit onboarding.custodian $ approveCmd onboarding.custodian terms partial
+  refused onboarding (assertFailureId deadlineError) $ trySubmit fixture.operator $ finalizeCmd terms ready
+  before <- ledgerOf onboarding
+  submit onboarding.custodian $ exerciseCmd partial CancelPoolProposal with canceller = onboarding.custodian
+  submit fixture.stableIssuer $ exerciseCmd ready CancelPoolProposal with canceller = fixture.stableIssuer
+  ledgerOf onboarding >>= (=== (before with proposals = []))
+
+-- FACTORY ONBOARDING. Neither the operator nor governance can create a factory alone, and
+-- governance cannot propose in the operator's name (`AuthorizationError`). Governance accepting
+-- changed terms (traders, compliance observers, lineage) fails `amm/onboarding-terms`; the
+-- operator cannot accept; an outsider cannot cancel (`amm/onboarding-approver`). Acceptance
+-- creates exactly the proposed factory, and a second acceptance fails on the consumed proposal.
+-- Either signer can cancel a proposal, which creates nothing.
+factoryProposalsCreateOnlyTheAcceptedFactory : Script ()
+factoryProposalsCreateOnlyTheAcceptedFactory = do
+  (onboarding, market) <- onboardedMarket "onboarding-factory"
+  let fixture = onboarding.fixture
+  let terms = factoryTermsOf market
+  forA_ [fixture.operator, fixture.governance] $ \signer ->
+    refused onboarding assertAuthorizationError $ trySubmit signer $ createCmd (factoryOf terms)
+  refused onboarding assertAuthorizationError $
+    trySubmit fixture.governance $ createCmd SecureSwapIntentFactoryProposal with terms
+  proposalCid <- submit fixture.operator $ createCmd SecureSwapIntentFactoryProposal with terms
+  proposalDisclosure <- disclosureOf fixture.operator proposalCid
+  let variants =
+        [ terms with authorizedTraders = [fixture.trader, fixture.other]
+        , terms with authorizedTraders = []
+        , terms with complianceObservers = []
+        , terms with lineage = (terms.lineage with charterReference = "onboarding-factory-other")
+        ]
+  forA_ variants $ \changed ->
+    refused onboarding (assertFailureId onboardingTermsError) $
+      trySubmit fixture.governance $ exerciseCmd proposalCid AcceptFactoryProposal with expectedTerms = changed
+  refused onboarding assertAuthorizationError $
+    trySubmit fixture.operator $ exerciseCmd proposalCid AcceptFactoryProposal with expectedTerms = terms
+  refused onboarding (assertFailureId onboardingApproverError) $
+    trySubmit (actAs fixture.trader <> discloseMany [proposalDisclosure]) $
+      exerciseCmd proposalCid CancelFactoryProposal with canceller = fixture.trader
+  factoryCid <- submit fixture.governance $ exerciseCmd proposalCid AcceptFactoryProposal with expectedTerms = terms
+  ledger <- ledgerOf onboarding
+  ledger.factories === [(factoryCid, factoryOf terms)]
+  ledger.factoryProposals === []
+  refused onboarding (assertConsumedContract proposalCid) $
+    trySubmit fixture.governance $ exerciseCmd proposalCid AcceptFactoryProposal with expectedTerms = terms
+  forA_ [fixture.operator, fixture.governance] $ \canceller -> do
+    pending <- submit fixture.operator $ createCmd SecureSwapIntentFactoryProposal with terms
+    before <- ledgerOf onboarding
+    submit canceller $ exerciseCmd pending CancelFactoryProposal with canceller
+    ledgerOf onboarding >>= (=== (before with factoryProposals = []))
+
+-- EXECUTION APPROVALS. The operator alone can neither execute an intent nor create governance's
+-- approval (`AuthorizationError`). An approval can be exercised only by the operator it names: an
+-- outsider fails `AuthorizationError`, and an approval naming another operator fails in the
+-- nested `Execute`. An approval of a holding the trader does not own fails
+-- `amm/owner-mismatch`. The approved execution pays the trader exactly; replaying the approval,
+-- or approving the executed or a cancelled intent, fails on the consumed contract. Only the
+-- operator or governance can cancel an approval. Nothing changes on any rejection.
+executionApprovalsAuthorizeExactlyOneExecution : Script ()
+executionApprovalsAuthorizeExactlyOneExecution = do
+  (onboarding, market) <- onboardedMarket "onboarding-execution"
+  let fixture = onboarding.fixture
+  let poolCid = market.initialized.poolCid
+  factoryCid <- openFactory market
+  intentCid <- submitIntent market factoryCid poolCid 2000 996
+  inputCid <- issueStable fixture fixture.trader (amountOf 5000)
+  inputDisclosed <- disclosureOf fixture.trader inputCid
+  intentDisclosed <- disclosureOf fixture.trader intentCid
+  refused onboarding assertAuthorizationError $
+    trySubmit (actAs fixture.operator <> discloseMany [inputDisclosed]) $
+      exerciseCmd intentCid Execute with inputHoldingCid = inputCid
+  refused onboarding assertAuthorizationError $
+    trySubmit fixture.operator $ createCmd SecureSwapIntentExecutionApproval with
+      operator = fixture.operator
+      governance = fixture.governance
+      intentCid
+      inputHoldingCid = inputCid
+
+  approvalCid <- approveExecution market intentCid inputCid
+  approvalDisclosed <- disclosureOf fixture.governance approvalCid
+  refused onboarding assertAuthorizationError $
+    trySubmit (actAs fixture.other <> discloseMany [approvalDisclosed, intentDisclosed, inputDisclosed]) $
+      exerciseCmd approvalCid ExecuteApprovedIntent
+  refused onboarding (assertFailureId onboardingApproverError) $
+    trySubmit (actAs fixture.trader <> discloseMany [approvalDisclosed]) $
+      exerciseCmd approvalCid CancelExecutionApproval with canceller = fixture.trader
+  misnamed <- submit fixture.governance $ createCmd SecureSwapIntentExecutionApproval with
+    operator = fixture.other
+    governance = fixture.governance
+    intentCid
+    inputHoldingCid = inputCid
+  refused onboarding assertAuthorizationError $
+    trySubmit (actAs fixture.other <> discloseMany [intentDisclosed, inputDisclosed]) $
+      exerciseCmd misnamed ExecuteApprovedIntent
+  foreignInput <- issueStable fixture fixture.provider (amountOf 5000)
+  foreignDisclosed <- disclosureOf fixture.provider foreignInput
+  foreign <- approveExecution market intentCid foreignInput
+  refused onboarding (assertFailureId ownerMismatchError) $
+    trySubmit (actAs fixture.operator <> discloseMany [foreignDisclosed]) $ exerciseCmd foreign ExecuteApprovedIntent
+  forA_ [misnamed, foreign] $ \unused ->
+    submit fixture.governance $ exerciseCmd unused CancelExecutionApproval with canceller = fixture.governance
+
+  executed <- executeApproved market poolCid approvalCid 2000 996
+  refused onboarding (assertConsumedContract approvalCid) $
+    trySubmit (actAs fixture.operator <> discloseMany [inputDisclosed]) $ exerciseCmd approvalCid ExecuteApprovedIntent
+  replayInput <- issueStable fixture fixture.trader (amountOf 5000)
+  replayDisclosed <- disclosureOf fixture.trader replayInput
+  replay <- approveExecution market intentCid replayInput
+  refused onboarding (Settlement.assertConsumedAmong [show intentCid]) $
+    trySubmit (actAs fixture.operator <> discloseMany [replayDisclosed]) $ exerciseCmd replay ExecuteApprovedIntent
+  submit fixture.operator $ exerciseCmd replay CancelExecutionApproval with canceller = fixture.operator
+
+  cancelledIntent <- submitIntent market factoryCid executed.poolCid 2000 0
+  cancelledApproval <- approveExecution market cancelledIntent replayInput
+  submit fixture.trader $ exerciseCmd cancelledIntent Cancel
+  refused onboarding (Settlement.assertConsumedAmong [show cancelledIntent]) $
+    trySubmit (actAs fixture.operator <> discloseMany [replayDisclosed]) $ exerciseCmd cancelledApproval ExecuteApprovedIntent

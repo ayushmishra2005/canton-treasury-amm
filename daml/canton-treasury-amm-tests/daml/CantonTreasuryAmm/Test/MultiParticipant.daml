@@ -2,21 +2,24 @@
 -- participant per role. Run only through `scripts/run-multi-participant.sh`; every script here
 -- takes an argument so `dpm test` does not run it against the IDE ledger.
 --
--- A Canton submission must come from a participant hosting every `actAs` party, so the
--- multi-signatory steps that the IDE tests submit at once are split into the test-only approval
--- contracts below. Each carries exactly the authority of the parties that signed it, as
--- `SecureV1Adversary` does. Production has no such onboarding workflow yet.
+-- A Canton submission must come from a participant hosting every `actAs` party, so every
+-- multi-signatory step goes through the production workflows of
+-- `CantonTreasuryAmm.SecureV1.Onboarding`, each signer submitting from its own participant.
+-- `GovernanceProxy` below is an attack fixture, not an approval mechanism.
 module CantonTreasuryAmm.Test.MultiParticipant where
 
 import DA.Action ((>=>), unless)
 import DA.Assert ((===))
 import DA.Foldable (forA_)
-import DA.List (sort, unique)
+import DA.List (sortOn, unique)
 import DA.Optional (isNone, isSome)
 import DA.Text (isInfixOf)
 import DA.Time (milliseconds)
 import Daml.Script
 
+import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.SecureV1.Errors
+import CantonTreasuryAmm.SecureV1.Onboarding
 import CantonTreasuryAmm.SecureV1.Pool
 import CantonTreasuryAmm.SecureV1.SwapIntent
 import CantonTreasuryAmm.Test.Fixtures
@@ -25,65 +28,6 @@ import CantonTreasuryAmm.Test.SecureV1Attacks (assertInvisibleActive)
 import CantonTreasuryAmm.Test.SecureV1Support
 import CantonTreasuryAmm.Token
 import CantonTreasuryAmm.Types
-
--- Collects the four core signatures for a charter, one participant at a time.
-template CharterProposal
-  with
-    charter : SecurePoolCharter
-    approved : [Party]
-  where
-    signatory approved
-    observer coreSignatories charter.lineage
-    ensure
-      not (null approved)
-        && unique approved
-        && all (`elem` coreSignatories charter.lineage) approved
-
-    choice ApproveCharter : ContractId CharterProposal
-      with
-        approver : Party
-      controller approver
-      do
-        assertMsg "Approver is not a missing core signer"
-          (approver `elem` coreSignatories charter.lineage && approver `notElem` approved)
-        create this with approved = approver :: approved
-
-    choice FinalizeCharter : ContractId SecurePoolCharter
-      with
-        finalizer : Party
-      controller finalizer
-      do
-        assertMsg "Finalizer has not approved" (finalizer `elem` approved)
-        assertMsg "Every core signer must approve" (sort approved == sort (coreSignatories charter.lineage))
-        create charter
-
--- The operator proposes a swap-intent factory; governance co-signs it by accepting.
-template FactoryProposal
-  with
-    factory : SecureSwapIntentFactory
-  where
-    signatory factory.lineage.operator
-    observer factory.lineage.governance
-
-    choice AcceptFactory : ContractId SecureSwapIntentFactory
-      controller factory.lineage.governance
-      do create factory
-
--- Governance approves one execution of one intent with one input holding; the operator then
--- exercises `Execute` with both controllers' authority.
-template ExecutionApproval
-  with
-    operator : Party
-    governance : Party
-    intentCid : ContractId SecureSwapIntent
-    inputHoldingCid : ContractId Holding
-  where
-    signatory governance
-    observer operator
-
-    choice ExecuteApproved : SecureSwapResult
-      controller operator
-      do exercise intentCid Execute with inputHoldingCid
 
 -- Governance lends the operator its authority for anything: the strongest operator and
 -- governance collusion that involves neither the custodian nor an issuer.
@@ -175,8 +119,15 @@ data MpState = MpState with
   poolCid : ContractId SecurePool
     deriving (Eq, Show)
 
-data MpLiveness = MpLiveness with
+-- A proposal every core signer has approved but nobody has finalized.
+data MpOutage = MpOutage with
   state : MpState
+  terms : SecurePoolTerms
+  proposalCid : ContractId SecurePoolProposal
+    deriving (Eq, Show)
+
+data MpLiveness = MpLiveness with
+  outage : MpOutage
   inputCid : ContractId Holding
     deriving (Eq, Show)
 
@@ -252,6 +203,86 @@ issue market instrument owner atoms = do
 
 feeFor : Int -> Int
 feeFor inputAtoms = (inputAtoms * 3 + 999) / 1000
+
+coreParties : MpParties -> [Party]
+coreParties parties = [parties.custodian, parties.operator, parties.treasuryIssuer, parties.stableIssuer]
+
+termsFor : MpParties -> SecureLineage -> Text -> Script SecurePoolTerms
+termsFor parties lineage charterReference = do
+  expiresAt <- futureDeadline
+  pure SecurePoolTerms with
+    lineage = lineage with charterReference
+    initialProvider = parties.provider
+    auditors = [parties.auditor]
+    expiresAt
+
+charterFor : SecurePoolTerms -> SecurePoolCharter
+charterFor terms = SecurePoolCharter with
+  lineage = terms.lineage
+  initialProvider = terms.initialProvider
+  auditors = terms.auditors
+
+-- The operator proposes on its own participant; every core participant then sees the proposal.
+mpPropose : MpParties -> SecurePoolTerms -> Script (ContractId SecurePoolProposal)
+mpPropose parties terms = do
+  proposalCid <- submit parties.operator $ createCmd SecurePoolProposal with terms; approvals = [parties.operator]
+  awaitActive (coreParties parties) proposalCid
+  pure proposalCid
+
+-- One core signer approves on its own participant. The successor carries the same terms and
+-- exactly the previous signatures plus the approver's.
+mpApprove : MpParties -> Party -> SecurePoolTerms -> ContractId SecurePoolProposal -> Script (ContractId SecurePoolProposal)
+mpApprove parties approver terms proposalCid = do
+  Some proposal <- queryContractId approver proposalCid
+  nextCid <- submit approver $ exerciseCmd proposalCid ApprovePoolProposal with approver; expectedTerms = terms
+  awaitActive (coreParties parties) nextCid
+  awaitArchived (coreParties parties) proposalCid
+  Some next <- queryContractId parties.operator nextCid
+  next === SecurePoolProposal with terms; approvals = proposal.approvals ++ [approver]
+  pure nextCid
+
+-- The operator finalizes on its own participant into exactly the proposed charter, which every
+-- core signer, governance, the provider and the auditor then see.
+mpFinalize : MpParties -> SecurePoolTerms -> ContractId SecurePoolProposal -> Script (ContractId SecurePoolCharter)
+mpFinalize parties terms proposalCid = do
+  charterCid <- submit parties.operator $ exerciseCmd proposalCid FinalizePoolProposal with expectedTerms = terms
+  let readers = coreParties parties ++ [parties.governance, parties.provider, parties.auditor]
+  awaitActive readers charterCid
+  awaitArchived (coreParties parties) proposalCid
+  forA_ readers $ \reader -> do
+    Some charter <- queryContractId reader charterCid
+    charter === charterFor terms
+  pure charterCid
+
+-- Onboarding and intent contracts, each core signer's view read on its own participant.
+data MpOnboarding = MpOnboarding with
+  proposals : [[(ContractId SecurePoolProposal, SecurePoolProposal)]]
+  charters : [[(ContractId SecurePoolCharter, SecurePoolCharter)]]
+  factoryProposals : [(ContractId SecureSwapIntentFactoryProposal, SecureSwapIntentFactoryProposal)]
+  factories : [(ContractId SecureSwapIntentFactory, SecureSwapIntentFactory)]
+  intents : [(ContractId SecureSwapIntent, SecureSwapIntent)]
+  executionApprovals : [(ContractId SecureSwapIntentExecutionApproval, SecureSwapIntentExecutionApproval)]
+    deriving (Eq, Show)
+
+sortedById : [(ContractId t, t)] -> [(ContractId t, t)]
+sortedById = sortOn (show . fst)
+
+onboardingOf : MpParties -> Script MpOnboarding
+onboardingOf parties = do
+  proposals <- mapA (\reader -> sortedById <$> query @SecurePoolProposal reader) (coreParties parties)
+  charters <- mapA (\reader -> sortedById <$> query @SecurePoolCharter reader) (coreParties parties)
+  factoryProposals <- sortedById <$> query @SecureSwapIntentFactoryProposal parties.operator
+  factories <- sortedById <$> query @SecureSwapIntentFactory parties.operator
+  intents <- sortedById <$> query @SecureSwapIntent parties.operator
+  executionApprovals <- sortedById <$> query @SecureSwapIntentExecutionApproval parties.operator
+  pure MpOnboarding with proposals; charters; factoryProposals; factories; intents; executionApprovals
+
+-- `rejectsWith`, also requiring every onboarding and intent contract to be unchanged.
+mpRejects : MpParties -> SecureMarket -> (Either SubmitError a -> Script ()) -> Script (Either SubmitError a) -> Script ()
+mpRejects parties market check submission = do
+  before <- onboardingOf parties
+  rejectsWith market check submission
+  onboardingOf parties >>= (=== before)
 
 -- A Treasury-for-stablecoin swap submitted from the trader's participant with the pool
 -- disclosed by the custodian's participant, checked on every participant that sees it.
@@ -356,15 +387,16 @@ mpExecuteIntent market poolCid intentCid inputCid inputAtoms expectedOut = do
   totals <- totalsOf market
   treasuryHeld <- holdingAtoms fixture.trader market.lineage.treasuryInstrument
   stableHeld <- holdingAtoms fixture.trader market.lineage.stableInstrument
-  approvalCid <- submit fixture.governance $ createCmd ExecutionApproval with
+  approvalCid <- submit fixture.governance $ createCmd SecureSwapIntentExecutionApproval with
     operator = fixture.operator
     governance = fixture.governance
     intentCid
     inputHoldingCid = inputCid
   awaitActive [fixture.operator] approvalCid
   inputDisclosed <- disclosureOf fixture.trader inputCid
-  result <- submit (actAs fixture.operator <> discloseMany [inputDisclosed]) $ exerciseCmd approvalCid ExecuteApproved
+  result <- submit (actAs fixture.operator <> discloseMany [inputDisclosed]) $ exerciseCmd approvalCid ExecuteApprovedIntent
   awaitActive (poolReaders market) result.poolCid
+  awaitArchived [fixture.operator, fixture.governance] approvalCid
   awaitActive [fixture.trader] result.outputHoldingCid
   awaitArchived [fixture.trader, fixture.auditor] intentCid
   result.amountOut === amountOf expectedOut
@@ -447,21 +479,15 @@ mpScenarios parties = do
         stableInstrument
         charterReference = "multi-participant-pool"
 
-  -- SCENARIO 1. Initialization: each core signer approves the charter on its own participant,
-  -- then the provider initializes it on the provider's participant.
-  let charter = SecurePoolCharter with lineage; initialProvider = parties.provider; auditors = [parties.auditor]
-  proposal0 <- submit parties.custodian $ createCmd CharterProposal with charter; approved = [parties.custodian]
-  awaitActive [parties.operator] proposal0
-  proposal1 <- submit parties.operator $ exerciseCmd proposal0 ApproveCharter with approver = parties.operator
-  awaitActive [parties.treasuryIssuer] proposal1
-  proposal2 <- submit parties.treasuryIssuer $ exerciseCmd proposal1 ApproveCharter with approver = parties.treasuryIssuer
-  awaitActive [parties.stableIssuer] proposal2
-  proposal3 <- submit parties.stableIssuer $ exerciseCmd proposal2 ApproveCharter with approver = parties.stableIssuer
-  awaitActive [parties.custodian] proposal3
-  charterCid <- submit parties.custodian $ exerciseCmd proposal3 FinalizeCharter with finalizer = parties.custodian
-  awaitActive [parties.provider, parties.governance, parties.auditor] charterCid
-  Some charterSeen <- queryContractId parties.provider charterCid
-  charterSeen === charter
+  -- SCENARIO 1. Onboarding and initialization: the operator proposes the charter terms; the
+  -- Treasury issuer, the stablecoin issuer and the custodian each approve on their own
+  -- participant; the operator finalizes; the provider initializes on its participant.
+  terms <- termsFor parties lineage "multi-participant-pool"
+  proposal0 <- mpPropose parties terms
+  proposal1 <- mpApprove parties parties.treasuryIssuer terms proposal0
+  proposal2 <- mpApprove parties parties.stableIssuer terms proposal1
+  proposal3 <- mpApprove parties parties.custodian terms proposal2
+  charterCid <- mpFinalize parties terms proposal3
   initialTreasury <- issueFrom parties.treasuryIssuer treasuryInstrumentCid parties.auditor parties.provider 5000000
   initialStable <- issueFrom parties.stableIssuer stableInstrumentCid parties.auditor parties.provider 10000000
   initialized <- submit parties.provider $ exerciseCmd charterCid InitializePool with
@@ -500,15 +526,22 @@ mpScenarios parties = do
 
   -- SCENARIO 5. Swap intent: the operator and governance create the factory on their own
   -- participants, the trader submits on its own, and the execution needs both controllers.
-  factoryProposal <- submit parties.operator $ createCmd FactoryProposal with
-    factory = SecureSwapIntentFactory with
-      lineage
-      genesisCid = charterCid
-      authorizedTraders = [parties.trader]
-      complianceObservers = [parties.auditor]
+  let factoryTerms = SecureFactoryTerms with
+        lineage
+        genesisCid = charterCid
+        authorizedTraders = [parties.trader]
+        complianceObservers = [parties.auditor]
+  factoryProposal <- submit parties.operator $ createCmd SecureSwapIntentFactoryProposal with terms = factoryTerms
   awaitActive [parties.governance] factoryProposal
-  factoryCid <- submit parties.governance $ exerciseCmd factoryProposal AcceptFactory
+  factoryCid <- submit parties.governance $ exerciseCmd factoryProposal AcceptFactoryProposal with expectedTerms = factoryTerms
   awaitActive [parties.trader, parties.operator, parties.auditor] factoryCid
+  awaitArchived [parties.operator, parties.governance] factoryProposal
+  Some factory <- queryContractId parties.operator factoryCid
+  factory === SecureSwapIntentFactory with
+    lineage
+    genesisCid = charterCid
+    authorizedTraders = [parties.trader]
+    complianceObservers = [parties.auditor]
   deadline <- futureDeadline
   Some poolBeforeIntent <- queryContractId parties.custodian removed.poolCid
   intentCid <- submit parties.trader $ exerciseCmd factoryCid SubmitSwapIntent with
@@ -620,14 +653,14 @@ mpScenarios parties = do
   rejectsWith market (Settlement.assertConsumedAmong [show swapInput]) $
     trySubmit (actAs parties.trader <> discloseMany disclosures) $
       swapCommand current parties.trader TreasuryForStable swapInput 1000 0 attackDeadline pool.stateVersion
-  replayApproval <- submit parties.governance $ createCmd ExecutionApproval with
+  replayApproval <- submit parties.governance $ createCmd SecureSwapIntentExecutionApproval with
     operator = parties.operator
     governance = parties.governance
     intentCid
     inputHoldingCid = victimInput
   awaitActive [parties.operator] replayApproval
   rejectsWith market (Settlement.assertConsumedAmong [show intentCid]) $
-    trySubmit (actAs parties.operator <> discloseMany [victimDisclosed]) $ exerciseCmd replayApproval ExecuteApproved
+    trySubmit (actAs parties.operator <> discloseMany [victimDisclosed]) $ exerciseCmd replayApproval ExecuteApprovedIntent
   replayTreasury <- issue market treasuryInstrument parties.provider 5000000
   replayStable <- issue market stableInstrument parties.provider 10000000
   rejectsWith market (Settlement.assertConsumedAmong [show charterCid]) $
@@ -666,28 +699,185 @@ mpImpersonation state = do
   forA_ [reserveOutcome, holdingOutcome] debug
   pure [reserveOutcome, holdingOutcome]
 
--- PHASE 6. After PHASE 5: nothing was created, then a swap is attempted while the stablecoin
--- issuer's participant is disconnected. It must not commit, and nothing may change.
-mpOfflineSwap : MpState -> Script MpLiveness
-mpOfflineSwap state = do
+-- PHASE 6. After PHASE 5: onboarding attacks, each submitted from the participant of the party
+-- attempting it, with every onboarding, pool and holding contract unchanged after each one. A
+-- second pool is then onboarded on the same instruments and stays isolated from the first. Ends
+-- with a proposal every core signer has approved, for the outage phases.
+mpOnboardingAttacks : MpState -> Script MpOutage
+mpOnboardingAttacks state = do
+  let parties = state.parties
+  let market = marketOf state
+  terms <- termsFor parties state.lineage "multi-participant-second-pool"
+  let approveCmd approver expectedTerms proposalCid =
+        exerciseCmd proposalCid ApprovePoolProposal with approver; expectedTerms
+
+  mpRejects parties market assertAuthorizationError $ trySubmit parties.operator $ createCmd (charterFor terms)
+  mpRejects parties market assertAuthorizationError $ trySubmit parties.custodian $ createCmd (charterFor terms)
+  mpRejects parties market assertAuthorizationError $ trySubmit parties.governance $
+    createCmd SecurePoolProposal with terms; approvals = [parties.operator]
+  mpRejects parties market assertAuthorizationError $ trySubmit parties.operator $
+    createCmd SecurePoolProposal with terms; approvals = [parties.operator, parties.treasuryIssuer]
+  debug "ONBOARDING unauthorized charter creation and forged approval rejected: PASS"
+
+  proposal0 <- mpPropose parties terms
+  disclosed0 <- disclosureOf parties.operator proposal0
+  let asGovernance = actAs parties.governance <> discloseMany [disclosed0]
+  mpRejects parties market assertAuthorizationError $ trySubmit parties.operator $ approveCmd parties.treasuryIssuer terms proposal0
+  mpRejects parties market assertAuthorizationError $ trySubmit parties.operator $ approveCmd parties.stableIssuer terms proposal0
+  mpRejects parties market assertAuthorizationError $ trySubmit asGovernance $ approveCmd parties.custodian terms proposal0
+  mpRejects parties market (assertFailureId onboardingApproverError) $ trySubmit asGovernance $ approveCmd parties.governance terms proposal0
+  mpRejects parties market assertAuthorizationError $ trySubmit parties.custodian $
+    exerciseCmd proposal0 FinalizePoolProposal with expectedTerms = terms
+  debug "ONBOARDING operator acting for an issuer and governance acting for the custodian rejected: PASS"
+
+  let wrongTerms =
+        [ terms with initialProvider = parties.trader
+        , terms with auditors = []
+        , terms with lineage = (terms.lineage with stableInstrument = (terms.lineage.stableInstrument with symbol = "USDX"))
+        , terms with lineage = (terms.lineage with treasuryInstrument = (terms.lineage.treasuryInstrument with issuer = parties.stableIssuer))
+        , terms with lineage = (terms.lineage with governance = parties.auditor)
+        , terms with lineage = (terms.lineage with operator = parties.governance)
+        , terms with lineage = (terms.lineage with charterReference = "multi-participant-pool")
+        ]
+  forA_ wrongTerms $ \wrong ->
+    mpRejects parties market (assertFailureId onboardingTermsError) $ trySubmit parties.treasuryIssuer $
+      approveCmd parties.treasuryIssuer wrong proposal0
+  debug "ONBOARDING approval of different parameters rejected: PASS"
+
+  proposal1 <- mpApprove parties parties.treasuryIssuer terms proposal0
+  mpRejects parties market (Settlement.assertConsumedAmong [show proposal0]) $ trySubmit parties.treasuryIssuer $
+    approveCmd parties.treasuryIssuer terms proposal0
+  mpRejects parties market (Settlement.assertConsumedAmong [show proposal0]) $ trySubmit parties.stableIssuer $
+    approveCmd parties.stableIssuer terms proposal0
+  mpRejects parties market (assertFailureId onboardingApproverError) $ trySubmit parties.treasuryIssuer $
+    approveCmd parties.treasuryIssuer terms proposal1
+  proposal2 <- mpApprove parties parties.custodian terms proposal1
+  mpRejects parties market (assertFailureId onboardingIncompleteError) $ trySubmit parties.operator $
+    exerciseCmd proposal2 FinalizePoolProposal with expectedTerms = terms
+  debug "ONBOARDING replayed approval and finalization without the stablecoin issuer rejected: PASS"
+
+  missingTerms <- termsFor parties state.lineage "multi-participant-missing-custodian"
+  missing <- mpPropose parties missingTerms
+    >>= mpApprove parties parties.treasuryIssuer missingTerms
+    >>= mpApprove parties parties.stableIssuer missingTerms
+  mpRejects parties market (assertFailureId onboardingIncompleteError) $ trySubmit parties.operator $
+    exerciseCmd missing FinalizePoolProposal with expectedTerms = missingTerms
+  debug "ONBOARDING finalization without the custodian rejected: PASS"
+
+  let conflictingTerms = missingTerms with initialProvider = parties.trader
+  conflicting <- mpPropose parties conflictingTerms
+  mpRejects parties market (assertFailureId onboardingTermsError) $ trySubmit parties.custodian $
+    approveCmd parties.custodian missingTerms conflicting
+  mpRejects parties market (assertFailureId onboardingTermsError) $ trySubmit parties.operator $
+    exerciseCmd missing FinalizePoolProposal with expectedTerms = conflictingTerms
+  submit parties.custodian $ exerciseCmd conflicting CancelPoolProposal with canceller = parties.custodian
+  awaitArchived (coreParties parties) conflicting
+  submit parties.stableIssuer $ exerciseCmd missing CancelPoolProposal with canceller = parties.stableIssuer
+  awaitArchived (coreParties parties) missing
+  mpRejects parties market (Settlement.assertConsumedAmong [show conflicting]) $ trySubmit parties.custodian $
+    approveCmd parties.custodian conflictingTerms conflicting
+  mpRejects parties market (Settlement.assertConsumedAmong [show missing]) $ trySubmit parties.custodian $
+    approveCmd parties.custodian missingTerms missing
+  mpRejects parties market (Settlement.assertConsumedAmong [show missing]) $ trySubmit parties.operator $
+    exerciseCmd missing FinalizePoolProposal with expectedTerms = missingTerms
+  debug "ONBOARDING conflicting approval and resubmitted cancelled proposals rejected: PASS"
+
+  proposal3 <- mpApprove parties parties.stableIssuer terms proposal2
+  secondCharter <- mpFinalize parties terms proposal3
+  mpRejects parties market (Settlement.assertConsumedAmong [show proposal3]) $ trySubmit parties.operator $
+    exerciseCmd proposal3 FinalizePoolProposal with expectedTerms = terms
+  mpRejects parties market (Settlement.assertConsumedAmong [show proposal3]) $ trySubmit parties.custodian $
+    exerciseCmd proposal3 CancelPoolProposal with canceller = parties.custodian
+  debug "ONBOARDING stale finalized proposal and double finalization rejected: PASS"
+
+  secondTreasury <- issueFrom parties.treasuryIssuer state.treasuryInstrumentCid parties.auditor parties.provider 5000000
+  secondStable <- issueFrom parties.stableIssuer state.stableInstrumentCid parties.auditor parties.provider 10000000
+  secondInitialized <- submit parties.provider $ exerciseCmd secondCharter InitializePool with
+    treasuryHoldingCid = secondTreasury
+    stableHoldingCid = secondStable
+    treasuryAmount = amountOf 5000000
+    stableAmount = amountOf 10000000
+  let second = market with lineage = terms.lineage; charterCid = secondCharter; initialized = secondInitialized
+  awaitActive (poolReaders second) secondInitialized.poolCid
+  awaitActive [parties.provider] secondInitialized.positionCid
+  (secondPool, _, _) <- checkSecurePool second secondInitialized.poolCid
+  firstBefore <- checkSecurePool market state.poolCid
+
+  secondDisclosures <- secureDisclosures second secondInitialized.poolCid
+  positions <- query @SecureLiquidityPosition parties.provider
+  (firstPositionCid, _) :: _ <- pure
+    [entry | entry@(_, position) <- positions, position.genesisCid == state.charterCid, position.provider == parties.provider]
+  mpRejects parties market (assertFailureId positionError) $ trySubmit (actAs parties.provider <> discloseMany secondDisclosures) $
+    exerciseCmd secondInitialized.poolCid RemoveLiquidity with
+      provider = parties.provider
+      positionCid = firstPositionCid
+      burnShares = amountOf 1000
+      minimumTreasuryOut = 0.0
+      minimumStableOut = 0.0
+      expectedVersion = secondPool.stateVersion
+
+  [(factoryCid, _)] <- query @SecureSwapIntentFactory parties.operator
+  deadline <- futureDeadline
+  crossIntent <- submit parties.trader $ exerciseCmd factoryCid SubmitSwapIntent with
+    trader = parties.trader
+    poolCid = secondInitialized.poolCid
+    direction = StableForTreasury
+    inputAmount = amountOf 2000
+    minimumAmountOut = 0.0
+    deadline
+    expectedPoolVersion = secondPool.stateVersion
+  awaitActive [parties.operator, parties.governance] crossIntent
+  crossInput <- issue market state.lineage.stableInstrument parties.trader 5000
+  crossApproval <- submit parties.governance $ createCmd SecureSwapIntentExecutionApproval with
+    operator = parties.operator
+    governance = parties.governance
+    intentCid = crossIntent
+    inputHoldingCid = crossInput
+  awaitActive [parties.operator] crossApproval
+  crossDisclosed <- disclosureOf parties.trader crossInput
+  mpRejects parties market (assertFailureId poolMismatchError) $ trySubmit (actAs parties.operator <> discloseMany [crossDisclosed]) $
+    exerciseCmd crossApproval ExecuteApprovedIntent
+  submit parties.governance $ exerciseCmd crossApproval CancelExecutionApproval with canceller = parties.governance
+  submit parties.trader $ exerciseCmd crossIntent Cancel
+  awaitArchived [parties.operator, parties.governance] crossApproval
+  awaitArchived [parties.operator, parties.governance] crossIntent
+
+  secondInput <- issue market state.lineage.treasuryInstrument parties.trader 1000
+  _ <- mpSwap second secondInitialized.poolCid secondInput 1000 1993
+  checkSecurePool market state.poolCid >>= (=== firstBefore)
+  debug "ONBOARDING second pool isolated from the first pool's position and intents: PASS"
+
+  outageTerms <- termsFor parties state.lineage "multi-participant-outage"
+  outageCid <- mpPropose parties outageTerms
+    >>= mpApprove parties parties.treasuryIssuer outageTerms
+    >>= mpApprove parties parties.stableIssuer outageTerms
+    >>= mpApprove parties parties.custodian outageTerms
+  pure MpOutage with state; terms = outageTerms; proposalCid = outageCid
+
+-- PHASE 7. With the stablecoin issuer's participant disconnected, a swap and the finalization of
+-- the fully approved proposal are attempted. Neither may commit, and nothing may change.
+mpOfflineSwap : MpOutage -> Script MpLiveness
+mpOfflineSwap outage = do
+  let state = outage.state
   let market = marketOf state
   let parties = state.parties
   reserves <- query @SecureReserveHolding parties.custodian
-  length reserves === 2
+  length [() | (_, reserve) <- reserves, reserve.genesisCid == state.charterCid] === 2
   forgedHoldings <- query @Holding parties.treasuryIssuer
   [() | (_, holding) <- forgedHoldings, atomsOf holding.amount == 1000000, holding.owner == parties.trader] === []
   (pool, treasuryReserve, stableReserve) <- checkSecurePool market state.poolCid
   inputCid <- issue market state.lineage.treasuryInstrument parties.trader 1000
   disclosures <- secureDisclosures market state.poolCid
   deadline <- futureDeadline
-  result <- trySubmit (actAs parties.trader <> discloseMany disclosures) $
+  let timedOut label result = case result of
+        Left err@UnknownError {unknownErrorMessage}
+          | "MEDIATOR_SAYS_TX_TIMED_OUT" `isInfixOf` unknownErrorMessage ->
+            debug ("LIVENESS " <> label <> " with the stablecoin issuer's participant disconnected rejected: " <> show err)
+        Left err -> abort ("The offline " <> label <> " failed for another reason: " <> show err)
+        Right _ -> abort ("A " <> label <> " committed while the stablecoin issuer's participant was disconnected")
+  swapResult <- trySubmit (actAs parties.trader <> discloseMany disclosures) $
     swapCommand state.poolCid parties.trader TreasuryForStable inputCid 1000 0 deadline pool.stateVersion
-  case result of
-    Left err@UnknownError {unknownErrorMessage}
-      | "MEDIATOR_SAYS_TX_TIMED_OUT" `isInfixOf` unknownErrorMessage ->
-        debug ("LIVENESS swap with the stablecoin issuer's participant disconnected rejected: " <> show err)
-    Left err -> abort ("The offline swap failed for another reason: " <> show err)
-    Right _ -> abort "A swap committed while the stablecoin issuer's participant was disconnected"
+  timedOut "swap" swapResult
   forA_ [parties.custodian, parties.operator, parties.governance, parties.treasuryIssuer, parties.auditor] $ \reader -> do
     Some seen <- queryContractId reader state.poolCid
     seen === pool
@@ -696,11 +886,24 @@ mpOfflineSwap state = do
   (currentTreasury, currentStable) === (treasuryReserve, stableReserve)
   inputStill <- queryContractId parties.trader inputCid
   assertMsg "The trader's input was consumed by a swap that did not commit" (isSome inputStill)
-  pure MpLiveness with state; inputCid
 
--- PHASE 7. After reconnecting the stablecoin issuer's participant, the same swap settles.
+  finalizeResult <- trySubmit parties.operator $
+    exerciseCmd outage.proposalCid FinalizePoolProposal with expectedTerms = outage.terms
+  timedOut "finalization" finalizeResult
+  forA_ [parties.custodian, parties.operator, parties.treasuryIssuer] $ \reader -> do
+    proposal <- queryContractId reader outage.proposalCid
+    assertMsg "The approved proposal was consumed by a finalization that did not commit" (isSome proposal)
+    charters <- query @SecurePoolCharter reader
+    [() | (_, charter) <- charters, charter.lineage == outage.terms.lineage] === []
+  pure MpLiveness with outage; inputCid
+
+-- PHASE 8. After reconnecting the stablecoin issuer's participant, the same swap settles and the
+-- same proposal finalizes into exactly its charter.
 mpReconnectedSwap : MpLiveness -> Script ()
 mpReconnectedSwap liveness = do
-  let market = marketOf liveness.state
-  _ <- mpSwap market liveness.state.poolCid liveness.inputCid 1000 1993
+  let outage = liveness.outage
+  let market = marketOf outage.state
+  _ <- mpSwap market outage.state.poolCid liveness.inputCid 1000 1993
   debug "LIVENESS swap after reconnecting the stablecoin issuer's participant: PASS"
+  _ <- mpFinalize outage.state.parties outage.terms outage.proposalCid
+  debug "LIVENESS finalization after reconnecting the stablecoin issuer's participant: PASS"

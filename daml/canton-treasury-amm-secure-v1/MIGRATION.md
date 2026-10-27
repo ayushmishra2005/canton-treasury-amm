@@ -7,7 +7,7 @@ tooling review and a rehearsal on a non-production network.
 
 **Default: parallel deployment.** The legacy package (`canton-treasury-amm` 0.1.0,
 `d8cadd3c…`) stays deployed and unchanged. Secure V1 (`canton-treasury-amm-secure-v1` 0.1.0,
-`7f698164…`) is vetted alongside it as a separate package; see
+`e4546c3f…`) is vetted alongside it as a separate package; see
 [`RELEASE_READINESS.md`](RELEASE_READINESS.md#packaging-and-coexistence). Liquidity moves only
 through each LP's own legacy `RemoveLiquidity` and a fresh Secure V1 deposit. Legacy contracts
 stay bound to the legacy package; nothing converts them.
@@ -89,8 +89,9 @@ stay bound to the legacy package; nothing converts them.
    procedure. Migration of that pool stops until then.
 9. **Reinitialize an independently authorized Secure V1 pool.** The four core signers create a
    new `SecurePoolCharter` with a fresh `charterReference`, the pool auditors and an initial
-   provider. That requires the onboarding workflow listed as a blocker in
-   [`RELEASE_READINESS.md`](RELEASE_READINESS.md#remaining-blockers). The initial provider
+   provider, through the proposal and approval workflow in [`ONBOARDING.md`](ONBOARDING.md),
+   which no custodian or issuer has yet reviewed (see
+   [`RELEASE_READINESS.md`](RELEASE_READINESS.md#remaining-blockers)). The initial provider
    deposits redeemed assets through `InitializePool`. The initial ratio sets the starting price.
    It should match the legacy pool's last price, so that the first trades do not hand an
    arbitrage to the market at LPs' expense. Further LPs join through `AddLiquidity` with their
@@ -141,7 +142,8 @@ stay bound to the legacy package; nothing converts them.
 
 The following are not implemented:
 - inventory, snapshot and reconciliation tooling;
-- the core onboarding workflow for charters and factories;
+- an onboarding procedure agreed with the custodian and issuers (the workflow itself is in
+  [`ONBOARDING.md`](ONBOARDING.md));
 - a legacy withdrawal-window procedure;
 - a Secure V1 pause (see [`SECURITY.md`](SECURITY.md#emergency-stop-and-recovery-design));
 - a decision on legacy dust;

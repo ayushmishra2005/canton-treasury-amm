@@ -10,7 +10,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 legacy_id=d8cadd3c038655678a71e052616b054a07ad53600e2feb719456f629c2772aa6
-secure_id=7f69816410e1c5e0ea68f839999abdbebd6ea33fe3b05b5861d5c75ae99f20dc
+secure_id=e4546c3f60ef59f07edb4ad1c61676ed46fe66eb8c998a1277aa29bc43b958c8
 legacy_dar=canton-treasury-amm/.daml/dist/canton-treasury-amm-0.1.0.dar
 secure_dar=canton-treasury-amm-secure-v1/.daml/dist/canton-treasury-amm-secure-v1-0.1.0.dar
 prototype_dar=canton-treasury-amm-live-reserve-prototype/.daml/dist/canton-treasury-amm-live-reserve-prototype-0.1.0.dar

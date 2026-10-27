@@ -16,6 +16,8 @@ implemented. Related documents in this package:
 - [`RELEASE_READINESS.md`](RELEASE_READINESS.md): packaging and coexistence, CI, multi-participant
   Canton evidence, mutation testing and deployment blockers.
 - [`MIGRATION.md`](MIGRATION.md): the legacy-to-Secure V1 cutover design.
+- [`ONBOARDING.md`](ONBOARDING.md): how charters, factories and intent executions are approved
+  when every signer is hosted on its own participant.
 
 ## Architecture and trust
 
@@ -27,6 +29,13 @@ implemented. Related documents in this package:
 | `SecureLiquidityPosition` | provider and core | governance, pool auditors | none |
 | `SecureSwapIntentFactory` | operator, governance | authorized traders, compliance observers | `SubmitSwapIntent` (trader), non-consuming |
 | `SecureSwapIntent` | trader, operator, governance | compliance observers | `Cancel` (trader), `Execute` (operator and governance) |
+| `SecurePoolProposal` | the operator and each core signer that has approved | core | `ApprovePoolProposal` (the approving core signer), `FinalizePoolProposal` (operator), `CancelPoolProposal` (any core signer) |
+| `SecureSwapIntentFactoryProposal` | operator | governance | `AcceptFactoryProposal` (governance), `CancelFactoryProposal` (operator or governance) |
+| `SecureSwapIntentExecutionApproval` | governance | operator | `ExecuteApprovedIntent` (operator), `CancelExecutionApproval` (operator or governance) |
+
+The last three templates (`CantonTreasuryAmm.SecureV1.Onboarding`) only collect approvals. They
+hold no assets, and each creates exactly one charter or factory, or runs one intent's
+`Execute`. See [`ONBOARDING.md`](ONBOARDING.md).
 
 - **Reserves have no choices.** Every reserve is archived and recreated only inside a pool
   choice. Those choices run with the core's authority (the pool's signatories) and enforce the
@@ -169,6 +178,7 @@ On the local multi-participant Canton network, the same cases surface as Canton 
 | Canton code | Case |
 | --- | --- |
 | `DAML_AUTHORIZATION_ERROR` | Missing signatory or controller authority, detected while the submitting participant interprets the command. |
+| `DAML_FAILURE` | A domain rejection; the `amm/...` error ID is in the error context, and Daml Script reports it as `FailureStatusError`. |
 | `CONTRACT_NOT_FOUND` | Replay of a consumed contract. |
 | `NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT` | A participant submitting for a party it does not host, including one that claims every core signer. |
 | `MEDIATOR_SAYS_TX_TIMED_OUT` | A required confirming participant (a disconnected issuer's) did not respond; nothing is committed. |
@@ -181,6 +191,9 @@ On the local multi-participant Canton network, the same cases surface as Canton 
   reserves untouched.
 - `SecureV1Attacks`: attacks 1–16 and all 31 partial coalitions.
 - `SecureV1SwapIntent`: intents, including the executor's holder-selection boundary.
+- `SecureV1Onboarding`: pool proposals, factory proposals and execution approvals, including
+  every incomplete approval set, forged and misattributed approvals, changed terms, replay,
+  cancellation, expiry, competing proposals and second pools.
 - `MultiParticipant`: the multi-participant Canton scenarios. Its scripts take arguments, so
   `dpm test` does not run them; `scripts/run-multi-participant.sh` runs them on a local
   eight-participant network (see [`RELEASE_READINESS.md`](RELEASE_READINESS.md)).

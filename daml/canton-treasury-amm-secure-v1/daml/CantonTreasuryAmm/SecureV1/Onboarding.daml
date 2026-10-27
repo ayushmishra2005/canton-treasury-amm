@@ -1,0 +1,150 @@
+-- Onboarding for Secure V1 when the core signers are hosted on different participants. A Canton
+-- submission can only act as parties hosted on the submitting participant, and a choice body
+-- carries only its contract's signatories and its controllers, so authority from separate
+-- contracts cannot be combined into one four-signer create. Each workflow below therefore
+-- accumulates signatures on one contract whose terms are fixed when it is proposed:
+--
+-- - `SecurePoolProposal`: the operator proposes exact charter terms; the custodian and both
+--   issuers each add their own signature from their own participant, in any order; once all
+--   four core signers have signed, the operator finalizes it into exactly that
+--   `SecurePoolCharter`. It creates nothing else, moves no asset and issues no LP shares; the
+--   pool still starts only through the charter's `InitializePool`.
+-- - `SecureSwapIntentFactoryProposal`: the operator proposes a factory; governance accepts it.
+-- - `SecureSwapIntentExecutionApproval`: governance approves one execution of one intent with
+--   one trader holding; the operator then exercises the intent's `Execute` with both
+--   controllers' authority.
+--
+-- Every approval is the approver's own signature on a contract with immutable terms, and every
+-- step also takes the terms the approver expects, so an approval cannot be forged, moved to
+-- other terms or replayed. The full core coalition remains trusted, as for every Secure V1
+-- contract: together it can still create any charter directly.
+module CantonTreasuryAmm.SecureV1.Onboarding where
+
+import DA.List (sort, unique)
+
+import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.SecureV1.Errors
+import CantonTreasuryAmm.SecureV1.Pool
+import CantonTreasuryAmm.SecureV1.SwapIntent
+import CantonTreasuryAmm.Token
+
+-- Everything a core signer approves. `lineage.charterReference` identifies the proposal; it is
+-- not globally unique, and two charters with equal terms are two separate pools.
+data SecurePoolTerms = SecurePoolTerms with
+    lineage : SecureLineage
+    initialProvider : Party
+    auditors : [Party]
+    expiresAt : Time
+  deriving (Eq, Show)
+
+template SecurePoolProposal
+  with
+    terms : SecurePoolTerms
+    approvals : [Party]
+  where
+    signatory approvals
+    observer coreSignatories terms.lineage
+    ensure
+      secureLineageIsIndependent terms.lineage
+        && terms.lineage.operator `elem` approvals
+        && unique approvals
+        && all (`elem` coreSignatories terms.lineage) approvals
+
+    -- Adds the approver's signature. The successor is signed by exactly the previous approvers
+    -- and the approver, whose authority this body carries.
+    choice ApprovePoolProposal : ContractId SecurePoolProposal
+      with
+        approver : Party
+        expectedTerms : SecurePoolTerms
+      controller approver
+      do
+        requireDomain (expectedTerms == terms) onboardingTermsError "Proposal terms differ from the approved terms"
+        requireDomain (approver `elem` coreSignatories terms.lineage && approver `notElem` approvals)
+          onboardingApproverError "Approver is not a core signer that has yet to approve"
+        now <- getTime
+        requireState (now < terms.expiresAt) deadlineError "Proposal has expired"
+        create this with approvals = approvals ++ [approver]
+
+    -- Runs with all four core signers' authority and creates exactly the proposed charter.
+    choice FinalizePoolProposal : ContractId SecurePoolCharter
+      with
+        expectedTerms : SecurePoolTerms
+      controller terms.lineage.operator
+      do
+        requireDomain (expectedTerms == terms) onboardingTermsError "Proposal terms differ from the finalized terms"
+        requireState (sort approvals == sort (coreSignatories terms.lineage))
+          onboardingIncompleteError "Every core signer must approve before finalization"
+        now <- getTime
+        requireState (now < terms.expiresAt) deadlineError "Proposal has expired"
+        create SecurePoolCharter with
+          lineage = terms.lineage
+          initialProvider = terms.initialProvider
+          auditors = terms.auditors
+
+    -- Any core signer, approved or not, can end the proposal; it creates nothing.
+    choice CancelPoolProposal : ()
+      with
+        canceller : Party
+      controller canceller
+      do
+        requireDomain (canceller `elem` coreSignatories terms.lineage)
+          onboardingApproverError "Only a core signer can cancel the proposal"
+
+data SecureFactoryTerms = SecureFactoryTerms with
+    lineage : SecureLineage
+    genesisCid : ContractId SecurePoolCharter
+    authorizedTraders : [Party]
+    complianceObservers : [Party]
+  deriving (Eq, Show)
+
+template SecureSwapIntentFactoryProposal
+  with
+    terms : SecureFactoryTerms
+  where
+    signatory terms.lineage.operator
+    observer terms.lineage.governance
+
+    choice AcceptFactoryProposal : ContractId SecureSwapIntentFactory
+      with
+        expectedTerms : SecureFactoryTerms
+      controller terms.lineage.governance
+      do
+        requireDomain (expectedTerms == terms) onboardingTermsError "Factory terms differ from the accepted terms"
+        create SecureSwapIntentFactory with
+          lineage = terms.lineage
+          genesisCid = terms.genesisCid
+          authorizedTraders = terms.authorizedTraders
+          complianceObservers = terms.complianceObservers
+
+    choice CancelFactoryProposal : ()
+      with
+        canceller : Party
+      controller canceller
+      do
+        requireDomain (canceller == terms.lineage.operator || canceller == terms.lineage.governance)
+          onboardingApproverError "Only the operator or governance can cancel the factory proposal"
+
+-- Governance's consent to one execution of one intent with one trader holding. The operator
+-- adds its own authority by exercising it; the body can only run that intent's `Execute`,
+-- which pays the intent's trader under the intent's terms.
+template SecureSwapIntentExecutionApproval
+  with
+    operator : Party
+    governance : Party
+    intentCid : ContractId SecureSwapIntent
+    inputHoldingCid : ContractId Holding
+  where
+    signatory governance
+    observer operator
+
+    choice ExecuteApprovedIntent : SecureSwapResult
+      controller operator
+      do exercise intentCid Execute with inputHoldingCid
+
+    choice CancelExecutionApproval : ()
+      with
+        canceller : Party
+      controller canceller
+      do
+        requireDomain (canceller == operator || canceller == governance)
+          onboardingApproverError "Only the operator or governance can cancel the execution approval"

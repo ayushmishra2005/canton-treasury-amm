@@ -58,6 +58,18 @@ diversion in the same ledger cannot touch Secure V1 reserves or pool state.
   operator alone, issuers, and operator with governance (`operatorAloneCannotDivertSecureReserves`,
   `issuersCannotArchiveOrSpendSecureReserves`, `operatorGovernanceCollusionCannotMoveReserves`).
   On Canton, each core party's participant must confirm every pool transaction.
+- **Onboarding across participants.** A charter is created only by finalizing a
+  `SecurePoolProposal` that carries all four core signatures, each added by that signer's own
+  `ApprovePoolProposal` against the exact terms it reviewed (see [`ONBOARDING.md`](ONBOARDING.md)).
+  The factory needs governance's acceptance of the operator's exact proposal, and each intent
+  execution needs governance's approval of one intent with one holding. None of these templates
+  holds or moves assets or LP shares, and the pool still starts only through `InitializePool`.
+  `SecureV1Onboarding` tests finalization after every incomplete set of approvals, direct
+  charter and proposal creation by each of the 29 privileged subsets missing a core signer,
+  forged and misattributed approvals, 14 changed-term variants, replay, cancellation, expiry,
+  competing proposals and second pools; the multi-participant run repeats the attacks across
+  participants. A correct approval workflow does not reduce the full-core trust described
+  below: the four core signers together can still create any charter directly.
 - **Active protected reserve contracts.** Reserves are `SecureReserveHolding`s with no choices.
   They are archived and recreated only inside the pool's own choices. Before every operation,
   each choice fetches both referenced reserves and requires their amounts to equal the pool's
@@ -179,6 +191,35 @@ Structural checks cannot prove that an existing choice body is safe. Any change 
 signatory or observer list, `ensure` clause or helper needs a semantic review against this
 section.
 
+### Onboarding source review (Stage 3.1)
+
+This review covered `SecureV1/Onboarding.daml` at package ID `e4546c3f60ef59f0…`. `Pool.daml`
+and `SwapIntent.daml` are unchanged from the review above. No critical, high or medium finding
+was identified.
+
+- **Whose authority each body carries.** `ApprovePoolProposal` runs with the current signers
+  and the approver, and creates a successor signed by exactly those parties.
+  `FinalizePoolProposal` runs with the proposal's signers, which must be exactly the four core
+  signers, and creates only the charter. A charter create with any core signer missing fails
+  authorization even if the finalization checks were removed (mutation testing confirms this).
+  `AcceptFactoryProposal` runs with the operator and governance and creates only the factory.
+  `ExecuteApprovedIntent` runs with governance and the operator and exercises only the approved
+  intent's `Execute` with the approved holding.
+- **No delegated authority beyond one action.** No choice takes a contract or command to run
+  on the signers' behalf. Each body has a fixed effect, and the only party arguments are the
+  approver or canceller, who must also be the controller.
+- **Exact terms.** Every approval, finalization and factory acceptance compares the full terms
+  record with the caller's expectation, so an approval cannot be moved to different parties,
+  instruments, provider, auditors, reference or expiry.
+- **Replay and duplicates.** Approvals, finalization, factory acceptance and execution
+  approvals are consuming. Duplicate approvals fail the approver check. There is no global
+  uniqueness: equal terms can create separate pools, and each stays bound to its own genesis.
+- **Signers.** The proposal precondition admits only core signers and requires the operator,
+  so governance or an outsider can never become a confirming party of a proposal, and requires
+  independent roles, which the charter's precondition also enforces.
+- **Governance.** Governance signs only the factory and execution approvals. It is never a
+  signer of a proposal or a charter and gains no reserve authority.
+
 ## Residual trust
 
 ### What the full core can do
@@ -221,8 +262,10 @@ On Canton, every pool transaction needs a confirmation from each core party's pa
   disconnected the stablecoin issuer's participant. A swap then failed with
   `MEDIATOR_SAYS_TX_TIMED_OUT`, the pool state, reserves and the trader's input were unchanged,
   and a swap succeeded after reconnection (`MultiParticipant:mpOfflineSwap`,
-  `mpReconnectedSwap`). That shows one participant, one outage and one recovery. It does not
-  prove every outage or censorship property.
+  `mpReconnectedSwap`). Finalizing a fully approved pool proposal failed the same way during
+  the outage, left the proposal unchanged, and succeeded after reconnection. That shows one
+  participant, one outage and one recovery. It does not prove every outage or censorship
+  property.
 - **An issuer refuses to confirm.** The effect is the same as unavailability, but indefinite and
   selective: the issuer can block any swap or LP exit. LPs cannot exit without the issuer.
   There is no on-ledger remedy by design, because any bypass would let a smaller coalition move
@@ -241,7 +284,7 @@ On Canton, every pool transaction needs a confirmation from each core party's pa
 ### Unanimous operations
 
 All four core signers must confirm:
-- creating a charter, which also requires an onboarding workflow (see [`RELEASE_READINESS.md`](RELEASE_READINESS.md#remaining-blockers));
+- creating a charter, through the `SecurePoolProposal` workflow (see [`ONBOARDING.md`](ONBOARDING.md));
 - every `InitializePool`, `SwapExactInput`, `AddLiquidity`, `RemoveLiquidity` and intent `Execute`;
 - every archive of a reserve, pool state or charter.
 
@@ -254,7 +297,9 @@ own participant, namespace keys and administrators, with no shared operator acce
 shared participant or key collapses the coalition the design relies on. The ledger only checks
 that the party IDs differ. The multi-participant harness hosts each role on its own participant
 and asserts that through the participants' own party lists. Production hosting must be verified
-the same way before go-live.
+the same way before go-live. Independent hosting makes each onboarding approval a separate
+decision, but it does not prevent the organizations from colluding, and it does not protect
+against a compromised key or participant of any signer.
 
 ### Emergency stop and recovery design
 

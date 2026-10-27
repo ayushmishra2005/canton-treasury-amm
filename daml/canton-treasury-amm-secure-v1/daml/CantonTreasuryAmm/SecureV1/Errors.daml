@@ -4,3 +4,12 @@ module CantonTreasuryAmm.SecureV1.Errors where
 
 poolMismatchError : Text
 poolMismatchError = "amm/pool-mismatch"
+
+onboardingTermsError : Text
+onboardingTermsError = "amm/onboarding-terms"
+
+onboardingApproverError : Text
+onboardingApproverError = "amm/onboarding-approver"
+
+onboardingIncompleteError : Text
+onboardingIncompleteError = "amm/onboarding-incomplete"
