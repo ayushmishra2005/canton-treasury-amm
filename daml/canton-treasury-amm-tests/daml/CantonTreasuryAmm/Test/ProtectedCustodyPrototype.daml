@@ -1,0 +1,488 @@
+-- PROTOTYPE ONLY. These templates live in the test package to evaluate an authorization
+-- boundary for protected reserves; they are not a deployed or production design.
+--
+-- Boundary: a `ProtectedReserve` is signed by its issuer and an independent custodian, and
+-- `Release` is controlled by the custodian and the pool operator together. Custodian authority
+-- can only reach a release through contracts the custodian itself signs (`ReleaseMandate`) or a
+-- choice it exercises (`ApproveRelease`). A contract signed only by other parties carries only
+-- their authority, so no contract the operator and governance create can supply it.
+--
+-- Trust model:
+-- * Movement: custodian and operator together, either per release (`ApproveRelease`) or within
+--   a bounded allowance the custodian pre-signs (`ReleaseMandate`).
+-- * Creation and archival: issuer and custodian together. Either alone is rejected, but jointly
+--   they can create, copy or archive any protected reserve; they remain trusted.
+-- * Minting: the issuer alone still mints unrestricted ordinary `Holding`s (unchanged), and
+--   anyone can deposit holdings they own through the custody agreement.
+-- * Operator and governance, alone or together, cannot move, archive or forge protected
+--   reserves or the custodian's approvals.
+-- * Custodian with operator can release anything; custodian with issuer can rewrite reserves.
+--   The custodian's independence is a deployment assumption: its keys and hosting participant
+--   must not be controlled by the operator or governance.
+-- * Liveness: if the custodian is unavailable, only unspent mandate allowance can be released;
+--   there is deliberately no administrative withdrawal path.
+-- * Privacy: the custodian sees every protected reserve, request and mandate it is party to.
+-- * Not addressed: pool state, LP entitlements and AMM pricing (Stage 1.2); Token Standard
+--   interface views for protected reserves.
+module CantonTreasuryAmm.Test.ProtectedCustodyPrototype where
+
+import DA.Assert ((===))
+import Daml.Script
+
+import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.Test.Fixtures
+import CantonTreasuryAmm.Token
+import CantonTreasuryAmm.Types
+
+data ReleaseResult = ReleaseResult with
+  releasedHoldingCid : ContractId Holding
+  remainderCid : Optional (ContractId ProtectedReserve)
+    deriving (Eq, Show)
+
+data MandateReleaseResult = MandateReleaseResult with
+  release : ReleaseResult
+  nextMandateCid : Optional (ContractId ReleaseMandate)
+    deriving (Eq, Show)
+
+template CustodyAgreement
+  with
+    instrument : InstrumentId
+    custodian : Party
+    operator : Party
+  where
+    signatory instrument.issuer, custodian
+    observer operator
+
+    -- The issuer's authority lets the agreement retire the deposited holding, so the owner
+    -- check is what stops anyone from depositing a holding they do not own.
+    nonconsuming choice Deposit : ContractId ProtectedReserve
+      with
+        depositor : Party
+        holdingCid : ContractId Holding
+      controller depositor
+      do
+        holding <- fetch holdingCid
+        requireDomain (holding.instrument == instrument) instrumentMismatchError "Deposit uses the wrong instrument"
+        requireDomain (holding.owner == depositor) ownerMismatchError "Depositor does not own the holding"
+        archive holdingCid
+        create ProtectedReserve with
+          instrument
+          custodian
+          operator
+          amount = holding.amount
+
+template ProtectedReserve
+  with
+    instrument : InstrumentId
+    custodian : Party
+    operator : Party
+    amount : Decimal
+  where
+    signatory instrument.issuer, custodian
+    observer operator
+    ensure isPositiveCapped amount
+
+    choice Release : ReleaseResult
+      with
+        recipient : Party
+        releaseAmount : Decimal
+      controller custodian, operator
+      do
+        requireDomain (releaseAmount > 0.0) invalidAmountError "Release amount must be positive"
+        requireDomain (releaseAmount <= maxReserveAmount) reserveCapError "Release amount exceeds the atom cap"
+        let releaseAtoms = atomsOf releaseAmount
+        let balanceAtoms = atomsOf amount
+        requireState (releaseAtoms <= balanceAtoms) insufficientBalanceError "Release exceeds the protected balance"
+        releasedHoldingCid <- create Holding with
+          instrument
+          owner = recipient
+          amount = releaseAmount
+          auditors = []
+        remainderCid <-
+          if releaseAtoms == balanceAtoms
+            then pure None
+            else Some <$> create this with amount = amountOf (balanceAtoms - releaseAtoms)
+        pure ReleaseResult with releasedHoldingCid; remainderCid
+
+-- Per-release approval: the operator proposes, the custodian reviews the exact terms and approves.
+template ReleaseRequest
+  with
+    operator : Party
+    custodian : Party
+    reserveCid : ContractId ProtectedReserve
+    recipient : Party
+    releaseAmount : Decimal
+  where
+    signatory operator
+    observer custodian
+
+    choice ApproveRelease : ReleaseResult
+      controller custodian
+      do
+        reserve <- fetch reserveCid
+        requireDomain (reserve.custodian == custodian && reserve.operator == operator) reserveMismatchError
+          "Request names a reserve held for other parties"
+        exercise reserveCid Release with recipient; releaseAmount
+
+-- Pre-authorized, bounded release: the custodian fixes the instrument, beneficiary and total
+-- allowance, so the operator can release without the custodian online but only within them.
+template ReleaseMandate
+  with
+    custodian : Party
+    operator : Party
+    instrument : InstrumentId
+    beneficiary : Party
+    remainingAllowance : Decimal
+  where
+    signatory custodian
+    observer operator
+    ensure isPositiveCapped remainingAllowance
+
+    choice ReleaseUnderMandate : MandateReleaseResult
+      with
+        reserveCid : ContractId ProtectedReserve
+        releaseAmount : Decimal
+      controller operator
+      do
+        requireDomain (releaseAmount > 0.0) invalidAmountError "Release amount must be positive"
+        let releaseAtoms = atomsOf releaseAmount
+        let allowanceAtoms = atomsOf remainingAllowance
+        requireState (releaseAtoms <= allowanceAtoms) insufficientBalanceError "Release exceeds the mandate allowance"
+        reserve <- fetch reserveCid
+        requireDomain (reserve.custodian == custodian && reserve.operator == operator && reserve.instrument == instrument)
+          reserveMismatchError "Mandate does not cover this reserve"
+        release <- exercise reserveCid Release with recipient = beneficiary; releaseAmount
+        nextMandateCid <-
+          if releaseAtoms == allowanceAtoms
+            then pure None
+            else Some <$> create this with remainingAllowance = amountOf (allowanceAtoms - releaseAtoms)
+        pure MandateReleaseResult with release; nextMandateCid
+
+-- Stands for any pool-like or authority-bearing contract the operator and governance can write,
+-- upload and sign themselves. Its choices carry only their authority.
+template CoalitionReserveController
+  with
+    operator : Party
+    governance : Party
+    reserveCid : ContractId ProtectedReserve
+  where
+    signatory operator, governance
+
+    choice Sweep : ReleaseResult
+      with
+        recipient : Party
+        releaseAmount : Decimal
+      controller operator
+      do
+        exercise reserveCid Release with recipient; releaseAmount
+
+data Custody = Custody with
+  fixture : Fixture
+  custodian : Party
+  agreementCid : ContractId CustodyAgreement
+  reserveCid : ContractId ProtectedReserve
+
+reserveAtoms : Int
+reserveAtoms = 5000000
+
+-- The provider deposits a Treasury holding into custody for the pool operator.
+custodySetup : Script Custody
+custodySetup = do
+  fixture <- setup
+  custodian <- allocateParty "Custodian"
+  agreementCid <- submit (actAs [fixture.treasuryIssuer, custodian]) $ createCmd CustodyAgreement with
+    instrument = fixture.treasuryInstrument
+    custodian
+    operator = fixture.operator
+  holdingCid <- issueTreasury fixture fixture.provider (amountOf reserveAtoms)
+  agreementDisclosure <- disclosureOf custodian agreementCid
+  reserveCid <- submit (actAs fixture.provider <> discloseMany [agreementDisclosure]) $
+    exerciseCmd agreementCid Deposit with depositor = fixture.provider; holdingCid
+  pure Custody with fixture; custodian; agreementCid; reserveCid
+
+-- Total Treasury value, ordinary and protected, as seen by the issuer who signs both.
+treasurySupplyAtoms : Fixture -> Script Int
+treasurySupplyAtoms fixture = do
+  plain <- instrumentTotalAtoms fixture fixture.treasuryInstrument
+  protected <- query @ProtectedReserve fixture.treasuryIssuer
+  pure (plain + sum (map (\(_, reserve) -> atomsOf reserve.amount) protected))
+
+-- After a rejected attack: the original reserve is the only protected reserve, unchanged, and
+-- no attacker received a holding.
+assertReserveIntact : Custody -> ProtectedReserve -> [Party] -> Int -> Script ()
+assertReserveIntact custody reserveBefore attackers supplyBefore = do
+  Some reserveAfter <- queryContractId custody.custodian custody.reserveCid
+  reserveAfter === reserveBefore
+  reserves <- query @ProtectedReserve custody.custodian
+  map fst reserves === [custody.reserveCid]
+  attackerHoldings <- mapA (\party -> query @Holding party) attackers
+  concat attackerHoldings === []
+  supplyAfter <- treasurySupplyAtoms custody.fixture
+  supplyAfter === supplyBefore
+
+-- Actors: operator, custodian, issuer and an outsider, each acting alone.
+-- Required authority: `Release` needs custodian and operator; implicit `Archive` needs the
+-- signatories, issuer and custodian.
+-- Initial state: a provider-deposited protected Treasury reserve held for the operator.
+-- Attacks: every single party tries to release the full reserve to itself and to archive it.
+-- Expected: each fails with `AuthorizationError`; the outsider fails on visibility until the
+-- reserve is disclosed to it, then on authorization. The reserve and supply are unchanged.
+-- Guarantee: no single party, including the issuer, can move or destroy a protected reserve.
+-- Contrast: Phase 0 showed the operator alone diverting and the issuer alone archiving reserves.
+-- Limitation: on-ledger authorization only; party independence is a deployment assumption.
+protectedReserveRejectsUnilateralMovementAndArchival : Script ()
+protectedReserveRejectsUnilateralMovementAndArchival = do
+  custody@Custody {fixture, custodian, reserveCid} <- custodySetup
+  Some reserveBefore <- queryContractId custodian reserveCid
+  atomsOf reserveBefore.amount === reserveAtoms
+  supplyBefore <- treasurySupplyAtoms fixture
+  supplyBefore === reserveAtoms
+  reserveDisclosure <- disclosureOf custodian reserveCid
+  let releaseTo recipient = exerciseCmd reserveCid Release with
+        recipient
+        releaseAmount = reserveBefore.amount
+
+  operatorRelease <- trySubmit fixture.operator $ releaseTo fixture.operator
+  assertAuthorizationError operatorRelease
+  custodianRelease <- trySubmit custodian $ releaseTo custodian
+  assertAuthorizationError custodianRelease
+  issuerRelease <- trySubmit fixture.treasuryIssuer $ releaseTo fixture.treasuryIssuer
+  assertAuthorizationError issuerRelease
+  outsiderHidden <- trySubmit fixture.other $ releaseTo fixture.other
+  case outsiderHidden of
+    Left ContractNotFound {} -> pure ()
+    otherResult -> abort ("Expected the hidden reserve to be invisible, got " <> show otherResult)
+  outsiderDisclosed <- trySubmit (actAs fixture.other <> discloseMany [reserveDisclosure]) $
+    releaseTo fixture.other
+  assertAuthorizationError outsiderDisclosed
+
+  operatorArchive <- trySubmit fixture.operator $ exerciseCmd reserveCid Archive
+  assertAuthorizationError operatorArchive
+  issuerArchive <- trySubmit fixture.treasuryIssuer $ exerciseCmd reserveCid Archive
+  assertAuthorizationError issuerArchive
+  custodianArchive <- trySubmit custodian $ exerciseCmd reserveCid Archive
+  assertAuthorizationError custodianArchive
+
+  assertReserveIntact custody reserveBefore
+    [fixture.operator, custodian, fixture.treasuryIssuer, fixture.other] supplyBefore
+
+-- Actors: the operator and governance acting together, with every contract they can sign.
+-- Required authority: custodian authority, which only custodian-signed contracts or custodian
+-- exercises can supply.
+-- Initial state: a protected reserve held for the operator.
+-- Attacks: joint direct release and archive; forging a replacement reserve, a custodian mandate
+-- and a custody agreement; approving an operator-created release request without the custodian;
+-- and sweeping the genuine reserve through a coalition-signed pool-like controller.
+-- Expected: every forgery and exercise fails with `AuthorizationError`. The coalition can sign
+-- its own controller, but its choice only carries the coalition's authority, so the nested
+-- `Release` still lacks the custodian. The reserve and supply are unchanged.
+-- Guarantee: the operator/governance coalition cannot spend, destroy or counterfeit protected
+-- reserves. This is the property Option B (operator and governance dual custody) lacks.
+-- Limitation: the coalition can still propose releases; their safety rests on the custodian's
+-- off-ledger review of each request.
+coalitionCannotBypassCustodianAuthority : Script ()
+coalitionCannotBypassCustodianAuthority = do
+  custody@Custody {fixture, custodian, reserveCid} <- custodySetup
+  Some reserveBefore <- queryContractId custodian reserveCid
+  supplyBefore <- treasurySupplyAtoms fixture
+  let coalition = actAs [fixture.operator, fixture.governance]
+
+  jointRelease <- trySubmit coalition $ exerciseCmd reserveCid Release with
+    recipient = fixture.governance
+    releaseAmount = reserveBefore.amount
+  assertAuthorizationError jointRelease
+  jointArchive <- trySubmit coalition $ exerciseCmd reserveCid Archive
+  assertAuthorizationError jointArchive
+
+  forgedReserve <- trySubmit coalition $ createCmd reserveBefore
+  assertAuthorizationError forgedReserve
+  forgedMandate <- trySubmit coalition $ createCmd ReleaseMandate with
+    custodian
+    operator = fixture.operator
+    instrument = fixture.treasuryInstrument
+    beneficiary = fixture.governance
+    remainingAllowance = reserveBefore.amount
+  assertAuthorizationError forgedMandate
+  forgedAgreement <- trySubmit coalition $ createCmd CustodyAgreement with
+    instrument = fixture.treasuryInstrument
+    custodian
+    operator = fixture.operator
+  assertAuthorizationError forgedAgreement
+
+  requestCid <- submit fixture.operator $ createCmd ReleaseRequest with
+    operator = fixture.operator
+    custodian
+    reserveCid
+    recipient = fixture.governance
+    releaseAmount = reserveBefore.amount
+  requestDisclosure <- disclosureOf fixture.operator requestCid
+  selfApproval <- trySubmit (coalition <> discloseMany [requestDisclosure]) $
+    exerciseCmd requestCid ApproveRelease
+  assertAuthorizationError selfApproval
+
+  controllerCid <- submit coalition $ createCmd CoalitionReserveController with
+    operator = fixture.operator
+    governance = fixture.governance
+    reserveCid
+  sweep <- trySubmit coalition $ exerciseCmd controllerCid Sweep with
+    recipient = fixture.governance
+    releaseAmount = reserveBefore.amount
+  assertAuthorizationError sweep
+
+  assertReserveIntact custody reserveBefore [fixture.operator, fixture.governance] supplyBefore
+  Some _ <- queryContractId fixture.operator requestCid
+  Some _ <- queryContractId fixture.operator controllerCid
+  pure ()
+
+-- Actors: the provider depositing, the operator proposing and the custodian approving.
+-- Required authority: the depositor for `Deposit`; operator and custodian for each release,
+-- combined through the request rather than a joint submission, so both may be hosted apart.
+-- Initial state: the provider owns ordinary Treasury holdings.
+-- Actions: the operator tries to deposit the provider's holding, then the provider deposits it;
+-- the operator requests a partial release to the trader and the custodian approves it.
+-- Expected: depositing another party's holding fails with `amm/owner-mismatch` and leaves it
+-- untouched. The approved release consumes the reserve and request, pays the trader exactly
+-- the requested amount, and leaves the rest in a protected remainder.
+-- Guarantee: protected custody stays usable and value is conserved across deposit and release.
+-- Limitation: the custodian approves terms off-ledger; nothing here checks them against a pool.
+custodianApprovedReleaseConservesValue : Script ()
+custodianApprovedReleaseConservesValue = do
+  Custody {fixture, custodian, agreementCid, reserveCid} <- custodySetup
+  agreementDisclosure <- disclosureOf custodian agreementCid
+  providerHoldingCid <- issueTreasury fixture fixture.provider (amountOf 1000)
+  Some providerHolding <- queryContractId fixture.provider providerHoldingCid
+  seizure <- trySubmit (actAs fixture.operator <> readAs fixture.provider <> discloseMany [agreementDisclosure]) $
+    exerciseCmd agreementCid Deposit with depositor = fixture.operator; holdingCid = providerHoldingCid
+  assertFailureId ownerMismatchError seizure
+  Some providerHoldingAfter <- queryContractId fixture.provider providerHoldingCid
+  providerHoldingAfter === providerHolding
+
+  supplyBefore <- treasurySupplyAtoms fixture
+  topUpCid <- submit (actAs fixture.provider <> discloseMany [agreementDisclosure]) $
+    exerciseCmd agreementCid Deposit with depositor = fixture.provider; holdingCid = providerHoldingCid
+  consumedHolding <- queryContractId fixture.provider providerHoldingCid
+  consumedHolding === None
+  Some topUp <- queryContractId custodian topUpCid
+  atomsOf topUp.amount === 1000
+  supplyAfterDeposit <- treasurySupplyAtoms fixture
+  supplyAfterDeposit === supplyBefore
+
+  let releaseAtoms = 1200000
+  requestCid <- submit fixture.operator $ createCmd ReleaseRequest with
+    operator = fixture.operator
+    custodian
+    reserveCid
+    recipient = fixture.trader
+    releaseAmount = amountOf releaseAtoms
+  result <- submit custodian $ exerciseCmd requestCid ApproveRelease
+
+  consumedRequest <- queryContractId fixture.operator requestCid
+  consumedRequest === None
+  consumedReserve <- queryContractId custodian reserveCid
+  consumedReserve === None
+  Some released <- queryContractId fixture.trader result.releasedHoldingCid
+  released.owner === fixture.trader
+  released.instrument === fixture.treasuryInstrument
+  atomsOf released.amount === releaseAtoms
+  Some remainderCid <- pure result.remainderCid
+  Some remainder <- queryContractId custodian remainderCid
+  remainder.custodian === custodian
+  remainder.operator === fixture.operator
+  atomsOf remainder.amount === reserveAtoms - releaseAtoms
+  reserves <- query @ProtectedReserve custodian
+  length reserves === 2
+  traderHoldings <- query @Holding fixture.trader
+  map fst traderHoldings === [result.releasedHoldingCid]
+  bystanders <- mapA (\party -> query @Holding party)
+    [fixture.operator, fixture.governance, custodian, fixture.other]
+  concat bystanders === []
+  supplyAfter <- treasurySupplyAtoms fixture
+  supplyAfter === supplyBefore
+
+-- Actors: the custodian issuing a mandate and the operator drawing on it, then replaying it.
+-- Required authority: the operator alone, with custodian authority from the mandate it signed.
+-- Initial state: a protected reserve and a custodian mandate of 2,000,000 atoms to the trader.
+-- Actions: the coalition forges a larger mandate; the operator overdraws, draws 1,500,000,
+-- replays the consumed mandate by CID and by stale disclosure, draws on the consumed reserve
+-- by stale disclosure, overdraws the successor mandate, then exhausts it.
+-- Expected: forgery fails on authorization; overdraws fail with `amm/insufficient-balance`;
+-- every replay fails as a consumed contract naming the stale CID; legitimate draws pay only
+-- the fixed beneficiary and the mandate is finally consumed.
+-- Guarantee: custodian authority can be delegated as a bounded, single-use allowance the
+-- operator cannot enlarge, redirect or replay on the IDE ledger.
+-- Limitation: stale-disclosure rejection is IDE-ledger behaviour; a Canton participant's
+-- handling of archived disclosed contracts has not been verified here.
+custodianMandateBoundsOperatorAndRejectsReplay : Script ()
+custodianMandateBoundsOperatorAndRejectsReplay = do
+  Custody {fixture, custodian, reserveCid} <- custodySetup
+  supplyBefore <- treasurySupplyAtoms fixture
+  let mandate = ReleaseMandate with
+        custodian
+        operator = fixture.operator
+        instrument = fixture.treasuryInstrument
+        beneficiary = fixture.trader
+        remainingAllowance = amountOf 2000000
+  mandateCid <- submit custodian $ createCmd mandate
+  forgedMandate <- trySubmit (actAs [fixture.operator, fixture.governance]) $ createCmd mandate with
+    beneficiary = fixture.operator
+    remainingAllowance = amountOf reserveAtoms
+  assertAuthorizationError forgedMandate
+
+  overdraw <- trySubmit fixture.operator $ exerciseCmd mandateCid ReleaseUnderMandate with
+    reserveCid
+    releaseAmount = amountOf 2000001
+  assertFailureId insufficientBalanceError overdraw
+
+  staleMandate <- disclosureOf fixture.operator mandateCid
+  staleReserve <- disclosureOf fixture.operator reserveCid
+  first <- submit fixture.operator $ exerciseCmd mandateCid ReleaseUnderMandate with
+    reserveCid
+    releaseAmount = amountOf 1500000
+  Some nextMandateCid <- pure first.nextMandateCid
+  Some nextMandate <- queryContractId fixture.operator nextMandateCid
+  atomsOf nextMandate.remainingAllowance === 500000
+  Some remainderCid <- pure first.release.remainderCid
+  Some remainder <- queryContractId custodian remainderCid
+  atomsOf remainder.amount === reserveAtoms - 1500000
+
+  replayByCid <- trySubmit fixture.operator $ exerciseCmd mandateCid ReleaseUnderMandate with
+    reserveCid = remainderCid
+    releaseAmount = amountOf 1500000
+  assertConsumedContract mandateCid replayByCid
+  replayDisclosedMandate <- trySubmit (actAs fixture.operator <> discloseMany [staleMandate]) $
+    exerciseCmd mandateCid ReleaseUnderMandate with
+      reserveCid = remainderCid
+      releaseAmount = amountOf 1500000
+  assertConsumedContract mandateCid replayDisclosedMandate
+  replayDisclosedReserve <- trySubmit (actAs fixture.operator <> discloseMany [staleReserve]) $
+    exerciseCmd nextMandateCid ReleaseUnderMandate with
+      reserveCid
+      releaseAmount = amountOf 500000
+  assertConsumedContract reserveCid replayDisclosedReserve
+  successorOverdraw <- trySubmit fixture.operator $ exerciseCmd nextMandateCid ReleaseUnderMandate with
+    reserveCid = remainderCid
+    releaseAmount = amountOf 500001
+  assertFailureId insufficientBalanceError successorOverdraw
+
+  Some remainderAfterReplays <- queryContractId custodian remainderCid
+  remainderAfterReplays === remainder
+  Some nextMandateAfterReplays <- queryContractId fixture.operator nextMandateCid
+  nextMandateAfterReplays === nextMandate
+  traderHoldingsAfterReplays <- query @Holding fixture.trader
+  map fst traderHoldingsAfterReplays === [first.release.releasedHoldingCid]
+
+  final <- submit fixture.operator $ exerciseCmd nextMandateCid ReleaseUnderMandate with
+    reserveCid = remainderCid
+    releaseAmount = amountOf 500000
+  final.nextMandateCid === None
+  mandates <- query @ReleaseMandate custodian
+  mandates === []
+  Some finalRemainderCid <- pure final.release.remainderCid
+  Some finalRemainder <- queryContractId custodian finalRemainderCid
+  atomsOf finalRemainder.amount === reserveAtoms - 2000000
+  traderHoldings <- query @Holding fixture.trader
+  atomsOf (sum (map (\(_, holding) -> holding.amount) traderHoldings)) === 2000000
+  operatorHoldings <- query @Holding fixture.operator
+  operatorHoldings === []
+  supplyAfter <- treasurySupplyAtoms fixture
+  supplyAfter === supplyBefore
