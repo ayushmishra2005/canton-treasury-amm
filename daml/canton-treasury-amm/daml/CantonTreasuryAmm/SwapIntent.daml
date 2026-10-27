@@ -1,3 +1,5 @@
+-- LEGACY MVP swap intents for `CantonTreasuryAmm.Pool`, inheriting its operator-custodied
+-- reserves. The Secure V1 equivalent is `CantonTreasuryAmm.SecureV1.SwapIntent`.
 module CantonTreasuryAmm.SwapIntent where
 
 import CantonTreasuryAmm.Errors

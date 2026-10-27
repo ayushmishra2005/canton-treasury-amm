@@ -1,0 +1,95 @@
+-- Secure V1 swap intents for `SecurePool`, parallel to the legacy `SwapIntent` workflow and with
+-- the same roles: the operator and governance sign the factory, the trader submits and cancels,
+-- and the operator and governance jointly execute. Execution carries only the trader's,
+-- operator's and governance's authority; the pool's `SwapExactInput` adds the core signers'
+-- authority inside its own fixed body, which pays the intent's trader and enforces the
+-- intent's deadline, minimum output and expected pool version. An intent is bound to one pool
+-- lineage and genesis and executes only against a live state of that pool.
+module CantonTreasuryAmm.SecureV1.SwapIntent where
+
+import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.SecureV1.Pool
+import CantonTreasuryAmm.Token
+import CantonTreasuryAmm.Types
+
+template SecureSwapIntentFactory
+  with
+    lineage : SecureLineage
+    genesisCid : ContractId SecurePoolCharter
+    authorizedTraders : [Party]
+    complianceObservers : [Party]
+  where
+    signatory lineage.operator, lineage.governance
+    observer authorizedTraders, complianceObservers
+
+    nonconsuming choice SubmitSwapIntent : ContractId SecureSwapIntent
+      with
+        trader : Party
+        poolCid : ContractId SecurePool
+        direction : SwapDirection
+        inputAmount : Decimal
+        minimumAmountOut : Decimal
+        deadline : Time
+        expectedPoolVersion : Int
+      controller trader
+      do
+        requireDomain (trader `elem` authorizedTraders) unauthorizedTraderError
+          "Trader is not authorized by this factory"
+        requireDomain (inputAmount > 0.0) invalidAmountError "Intent input must be positive"
+        requireDomain (inputAmount <= maxReserveAmount) reserveCapError
+          "Intent input exceeds the atom cap"
+        requireDomain (minimumAmountOut >= 0.0) invalidAmountError
+          "Intent minimum output must not be negative"
+        requireDomain (minimumAmountOut <= maxReserveAmount) reserveCapError
+          "Intent minimum output exceeds the atom cap"
+        now <- getTime
+        requireState (now < deadline) deadlineError "Intent deadline has already expired"
+        create SecureSwapIntent with
+          trader
+          lineage
+          genesisCid
+          complianceObservers
+          poolCid
+          direction
+          inputAmount
+          minimumAmountOut
+          deadline
+          expectedPoolVersion
+
+template SecureSwapIntent
+  with
+    trader : Party
+    lineage : SecureLineage
+    genesisCid : ContractId SecurePoolCharter
+    complianceObservers : [Party]
+    poolCid : ContractId SecurePool
+    direction : SwapDirection
+    inputAmount : Decimal
+    minimumAmountOut : Decimal
+    deadline : Time
+    expectedPoolVersion : Int
+  where
+    signatory trader, lineage.operator, lineage.governance
+    observer complianceObservers
+    ensure isPositiveCapped inputAmount && isNonNegativeCapped minimumAmountOut
+
+    choice Cancel : ()
+      controller trader
+      do pure ()
+
+    choice Execute : SecureSwapResult
+      with
+        inputHoldingCid : ContractId Holding
+      controller lineage.operator, lineage.governance
+      do
+        pool <- fetch poolCid
+        requireState (pool.lineage == lineage && pool.genesisCid == genesisCid) poolMismatchError
+          "Intent pool belongs to another pool instance"
+        exercise poolCid SwapExactInput with
+          trader
+          direction
+          inputHoldingCid
+          inputAmount
+          minimumAmountOut
+          deadline
+          expectedVersion = expectedPoolVersion

@@ -1,0 +1,278 @@
+-- Secure V1 swap intents against the production `SecurePool`. Settled intents are checked through
+-- the same full-state helpers as direct swaps; rejections compare the full ledger snapshot and
+-- confirm the intent is still active (or consumed) as stated.
+module CantonTreasuryAmm.Test.SecureV1SwapIntent where
+
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import DA.Optional (isNone, isSome)
+import DA.Time (hours)
+import Daml.Script
+
+import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.SecureV1.Pool
+import CantonTreasuryAmm.SecureV1.SwapIntent
+import CantonTreasuryAmm.Test.Fixtures
+import CantonTreasuryAmm.Test.SecureV1Adversary
+import CantonTreasuryAmm.Test.SecureV1Attacks (openSibling)
+import CantonTreasuryAmm.Test.SecureV1Support
+import CantonTreasuryAmm.Token
+import CantonTreasuryAmm.Types
+
+createSecureFactory : SecureMarket -> [Party] -> Script (ContractId SecureSwapIntentFactory)
+createSecureFactory market authorizedTraders =
+  submit (actAs [market.fixture.operator, market.fixture.governance]) $ createCmd SecureSwapIntentFactory with
+    lineage = market.lineage
+    genesisCid = market.charterCid
+    authorizedTraders
+    complianceObservers = [market.fixture.auditor]
+
+submitIntent : SecureMarket -> ContractId SecureSwapIntentFactory -> ContractId SecurePool -> SwapDirection -> Int -> Int -> Time -> Script (ContractId SecureSwapIntent)
+submitIntent market factoryCid poolCid direction inputAtoms minimumOutAtoms deadline = do
+  Some pool <- queryContractId market.custodian poolCid
+  submit market.fixture.trader $ exerciseCmd factoryCid SubmitSwapIntent with
+    trader = market.fixture.trader
+    poolCid
+    direction
+    inputAmount = amountOf inputAtoms
+    minimumAmountOut = amountOf minimumOutAtoms
+    deadline
+    expectedPoolVersion = pool.stateVersion
+
+executeAs : SecureMarket -> [Party] -> ContractId SecureSwapIntent -> ContractId Holding -> Script (Either SubmitError SecureSwapResult)
+executeAs market parties intentCid inputHoldingCid = do
+  inputDisclosed <- disclosureOf market.fixture.trader inputHoldingCid
+  trySubmit (actAs parties <> discloseMany [inputDisclosed]) $ exerciseCmd intentCid Execute with inputHoldingCid
+
+controllersOf : SecureMarket -> [Party]
+controllersOf market = [market.fixture.operator, market.fixture.governance]
+
+assertIntentActive : SecureMarket -> ContractId SecureSwapIntent -> Script ()
+assertIntentActive market intentCid = do
+  intent <- queryContractId market.fixture.trader intentCid
+  assertMsg "Expected the intent to remain active" (isSome intent)
+
+-- Settles an intent through `Execute` and checks the result against the direct-swap expectations:
+-- the pool transition, the fee counter, the trader's output and change, conserved totals, and
+-- the consumed intent.
+settleIntent : SecureMarket -> ContractId SecureSwapIntent -> ContractId SecurePool -> SwapDirection -> ContractId Holding -> Int -> Int -> Script SecureSwapResult
+settleIntent market intentCid poolCid direction inputCid inputAtoms expectedOut = do
+  let fixture = market.fixture
+  (pool, _, _) <- checkSecurePool market poolCid
+  (reserveIn, reserveOut) <- oriented direction <$> reserveAtomsOf market poolCid
+  let (inputInstrument, outputInstrument) = instrumentsFor market direction
+  inputHeld <- holdingAtoms fixture.trader inputInstrument
+  outputHeld <- holdingAtoms fixture.trader outputInstrument
+  totals <- totalsOf market
+  Right result <- executeAs market (controllersOf market) intentCid inputCid
+  result.amountOut === amountOf expectedOut
+  (next, _, _) <- checkSecurePool market result.poolCid
+  next.stateVersion === pool.stateVersion + 1
+  oriented direction <$> reserveAtomsOf market result.poolCid >>= (=== (reserveIn + inputAtoms, reserveOut - expectedOut))
+  let fee = (inputAtoms * 3 + 999) / 1000
+  case direction of
+    TreasuryForStable -> (atomsOf next.treasuryFeeAmount, next.stableFeeAmount)
+      === (min maxReserveAtoms (atomsOf pool.treasuryFeeAmount + fee), pool.stableFeeAmount)
+    StableForTreasury -> (atomsOf next.stableFeeAmount, next.treasuryFeeAmount)
+      === (min maxReserveAtoms (atomsOf pool.stableFeeAmount + fee), pool.treasuryFeeAmount)
+  Some output <- queryContractId fixture.trader result.outputHoldingCid
+  (output.owner, output.instrument, atomsOf output.amount, output.auditors) === (fixture.trader, outputInstrument, expectedOut, [fixture.auditor])
+  holdingAtoms fixture.trader inputInstrument >>= (=== inputHeld - inputAtoms)
+  holdingAtoms fixture.trader outputInstrument >>= (=== outputHeld + expectedOut)
+  holdingAtoms fixture.operator outputInstrument >>= (=== 0)
+  totalsOf market >>= (=== totals)
+  intent <- queryContractId fixture.trader intentCid
+  assertMsg "Expected the executed intent to be consumed" (isNone intent)
+  pure result
+
+-- Flow: an authorized trader submits intents in both directions; the operator and governance
+-- execute them, the second from a larger holding the operator selects. Expected: 1,000 Treasury
+-- -> 1,993 stablecoin and then 1,000 stablecoin -> 498 Treasury, paid to the trader with the
+-- trader's change returned; fee counters 3 and 3; the compliance observer sees the intent; the
+-- operator receives nothing.
+secureIntentsExecuteInBothDirectionsForTheTrader : Script ()
+secureIntentsExecuteInBothDirectionsForTheTrader = do
+  market <- standardSecureMarket "intent-flow"
+  let fixture = market.fixture
+  factoryCid <- createSecureFactory market [fixture.trader]
+  deadline <- futureDeadline
+  firstIntent <- submitIntent market factoryCid market.initialized.poolCid TreasuryForStable 1000 1993 deadline
+  Some observed <- queryContractId fixture.auditor firstIntent
+  (observed.trader, observed.genesisCid, observed.lineage) === (fixture.trader, market.charterCid, market.lineage)
+  firstInput <- issueTreasury fixture fixture.trader (amountOf 1000)
+  first <- settleIntent market firstIntent market.initialized.poolCid TreasuryForStable firstInput 1000 1993
+  secondIntent <- submitIntent market factoryCid first.poolCid StableForTreasury 1000 0 deadline
+  largerInput <- issueStable fixture fixture.trader (amountOf 5000)
+  second <- settleIntent market secondIntent first.poolCid StableForTreasury largerInput 1000 498
+  Some changeCid <- pure second.inputChangeHoldingCid
+  Some change <- queryContractId fixture.trader changeCid
+  (change.owner, atomsOf change.amount) === (fixture.trader, 4000)
+  Some pool <- queryContractId market.custodian second.poolCid
+  (atomsOf pool.treasuryFeeAmount, atomsOf pool.stableFeeAmount) === (3, 3)
+
+-- Submission validation, as in the legacy factory. Expected: `amm/unauthorized-trader` for a
+-- trader the factory does not list, `amm/invalid-amount` and `amm/reserve-cap` for bad amounts,
+-- `amm/deadline` for a past deadline, and `AuthorizationError` when anyone but the trader submits
+-- in the trader's name; no intent is created.
+secureFactoryRejectsInvalidAndUnauthorizedSubmissions : Script ()
+secureFactoryRejectsInvalidAndUnauthorizedSubmissions = do
+  market <- standardSecureMarket "intent-validation"
+  let fixture = market.fixture
+  factoryCid <- createSecureFactory market [fixture.trader]
+  deadline <- futureDeadline
+  now <- getTime
+  let attempt submitter trader inputAmount minimumAmountOut intentDeadline =
+        trySubmit submitter $ exerciseCmd factoryCid SubmitSwapIntent with
+          trader
+          poolCid = market.initialized.poolCid
+          direction = TreasuryForStable
+          inputAmount
+          minimumAmountOut
+          deadline = intentDeadline
+          expectedPoolVersion = 0
+  factoryDisclosed <- disclosureOf fixture.operator factoryCid
+  attempt (actAs fixture.trader) fixture.trader 0.0 0.0 deadline >>= assertFailureId invalidAmountError
+  attempt (actAs fixture.trader) fixture.trader 1.0 (-1.0) deadline >>= assertFailureId invalidAmountError
+  attempt (actAs fixture.trader) fixture.trader (maxReserveAmount + 1.0) 0.0 deadline >>= assertFailureId reserveCapError
+  attempt (actAs fixture.trader) fixture.trader 1.0 (maxReserveAmount + 1.0) deadline >>= assertFailureId reserveCapError
+  attempt (actAs fixture.trader) fixture.trader 1.0 0.0 now >>= assertFailureId deadlineError
+  trySubmit (actAs fixture.other <> discloseMany [factoryDisclosed]) (exerciseCmd factoryCid SubmitSwapIntent with
+    trader = fixture.other
+    poolCid = market.initialized.poolCid
+    direction = TreasuryForStable
+    inputAmount = 1.0
+    minimumAmountOut = 0.0
+    deadline
+    expectedPoolVersion = 0) >>= assertFailureId unauthorizedTraderError
+  attempt (actAs (controllersOf market)) fixture.trader 1.0 0.0 deadline >>= assertAuthorizationError
+  intents <- query @SecureSwapIntent fixture.operator
+  intents === []
+
+-- Forged intents and forged execution. Actors: the trader alone, the operator and governance
+-- together, and a forged executor both sign. Attempts: the trader creates an intent without the
+-- factory's signers; the operator and governance create one in the trader's name; the operator
+-- and governance swap the trader's holding through their own executor contract. Expected:
+-- `AuthorizationError` for each; nothing changes.
+forgedSecureIntentsAreRejected : Script ()
+forgedSecureIntentsAreRejected = do
+  market <- standardSecureMarket "intent-forgery"
+  let fixture = market.fixture
+  deadline <- futureDeadline
+  inputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  inputDisclosed <- disclosureOf fixture.trader inputCid
+  disclosures <- secureDisclosures market market.initialized.poolCid
+  let forged = SecureSwapIntent with
+        trader = fixture.trader
+        lineage = market.lineage
+        genesisCid = market.charterCid
+        complianceObservers = []
+        poolCid = market.initialized.poolCid
+        direction = TreasuryForStable
+        inputAmount = amountOf 1000
+        minimumAmountOut = 0.0
+        deadline
+        expectedPoolVersion = 0
+  rejectsWith market assertAuthorizationError $ trySubmit fixture.trader $ createCmd forged
+  rejectsWith market assertAuthorizationError $ trySubmit (actAs (controllersOf market)) $ createCmd forged
+  executorCid <- submit (actAs (controllersOf market)) $ createCmd ForgedSwapExecutor with
+    operator = fixture.operator
+    governance = fixture.governance
+  rejectsWith market assertAuthorizationError $
+    trySubmit (actAs (controllersOf market) <> discloseMany (inputDisclosed :: disclosures)) $
+      exerciseCmd executorCid SwapAsVictim with
+        poolCid = market.initialized.poolCid
+        victim = fixture.trader
+        inputHoldingCid = inputCid
+        inputAmount = amountOf 1000
+        deadline
+        expectedVersion = 0
+  intents <- query @SecureSwapIntent fixture.operator
+  intents === []
+
+-- Counterfeit and misrouted pools. An intent submitted through market A's factory names a pool
+-- of a sibling with the same lineage, and one names a coerced non-pool contract. Expected:
+-- execution fails `amm/pool-mismatch` and `WronglyTypedContract`; nothing changes and the
+-- intents stay active for the trader to cancel.
+secureIntentsAreBoundToTheirPool : Script ()
+secureIntentsAreBoundToTheirPool = do
+  market <- standardSecureMarket "intent-binding"
+  sibling <- openSibling market "intent-binding"
+  let fixture = market.fixture
+  factoryCid <- createSecureFactory market [fixture.trader]
+  deadline <- futureDeadline
+  inputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  misrouted <- submitIntent market factoryCid sibling.initialized.poolCid TreasuryForStable 1000 0 deadline
+  rejectsWith market (assertFailureId poolMismatchError) $ executeAs market (controllersOf market) misrouted inputCid
+  assertIntentActive market misrouted
+  coerced <- submit fixture.trader $ exerciseCmd factoryCid SubmitSwapIntent with
+    trader = fixture.trader
+    poolCid = coerceContractId @SecureLiquidityPosition @SecurePool market.initialized.positionCid
+    direction = TreasuryForStable
+    inputAmount = amountOf 1000
+    minimumAmountOut = 0.0
+    deadline
+    expectedPoolVersion = 0
+  rejectsWith market assertWronglyTypedResult $ executeAs market (controllersOf market) coerced inputCid
+  assertIntentActive market coerced
+  forA_ [misrouted, coerced] $ \intentCid -> submit fixture.trader $ exerciseCmd intentCid Cancel
+
+assertWronglyTypedResult : Either SubmitError a -> Script ()
+assertWronglyTypedResult result = case result of
+  Left WronglyTypedContract {} -> pure ()
+  Left otherError -> abort ("Expected WronglyTypedContract, got " <> show otherError)
+  Right _ -> abort "Expected a wrongly typed contract failure"
+
+-- Replay, stale state and expiry. Expected: re-executing a consumed intent fails as
+-- `ContractNotFound` naming it; an intent whose pool state was replaced fails as
+-- `ContractNotFound` naming the consumed state (it cannot follow the pool to a new version);
+-- an intent past its deadline fails `amm/deadline`. Nothing changes in each case.
+secureIntentsCannotReplayGoStaleOrOutliveTheirDeadline : Script ()
+secureIntentsCannotReplayGoStaleOrOutliveTheirDeadline = do
+  market <- standardSecureMarket "intent-replay"
+  let fixture = market.fixture
+  factoryCid <- createSecureFactory market [fixture.trader]
+  deadline <- futureDeadline
+  firstIntent <- submitIntent market factoryCid market.initialized.poolCid TreasuryForStable 1000 0 deadline
+  staleIntent <- submitIntent market factoryCid market.initialized.poolCid TreasuryForStable 1000 0 deadline
+  firstInput <- issueTreasury fixture fixture.trader (amountOf 1000)
+  first <- settleIntent market firstIntent market.initialized.poolCid TreasuryForStable firstInput 1000 1993
+  replayInput <- issueTreasury fixture fixture.trader (amountOf 1000)
+  rejectsWith market (assertConsumedContract firstIntent) $ executeAs market (controllersOf market) firstIntent replayInput
+  rejectsWith market (assertConsumedContract market.initialized.poolCid) $ executeAs market (controllersOf market) staleIntent replayInput
+  assertIntentActive market staleIntent
+
+  expiringIntent <- submitIntent market factoryCid first.poolCid TreasuryForStable 1000 0 deadline
+  passTime (hours 2)
+  rejectsWith market (assertFailureId deadlineError) $ executeAs market (controllersOf market) expiringIntent replayInput
+  assertIntentActive market expiringIntent
+
+-- Slippage, input ownership, controllers and cancellation. Expected: an unreachable minimum
+-- fails `amm/slippage`; a holding the trader does not own (disclosed) fails `amm/owner-mismatch`;
+-- the operator or governance alone, and the trader, cannot execute (`AuthorizationError`); the
+-- operator and governance cannot cancel (`AuthorizationError`); the trader cancels, after which
+-- execution fails as `ContractNotFound`. Nothing changes and the trader keeps its holding.
+secureIntentControlsMatchTheLegacyRoles : Script ()
+secureIntentControlsMatchTheLegacyRoles = do
+  market <- standardSecureMarket "intent-controls"
+  let fixture = market.fixture
+  factoryCid <- createSecureFactory market [fixture.trader]
+  deadline <- futureDeadline
+  inputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  greedy <- submitIntent market factoryCid market.initialized.poolCid TreasuryForStable 1000 1994 deadline
+  rejectsWith market (assertFailureId slippageError) $ executeAs market (controllersOf market) greedy inputCid
+  assertIntentActive market greedy
+
+  intentCid <- submitIntent market factoryCid market.initialized.poolCid TreasuryForStable 1000 0 deadline
+  foreignCid <- issueTreasury fixture fixture.other (amountOf 1000)
+  foreignDisclosed <- disclosureOf fixture.other foreignCid
+  rejectsWith market (assertFailureId ownerMismatchError) $
+    trySubmit (actAs (controllersOf market) <> discloseMany [foreignDisclosed]) $
+      exerciseCmd intentCid Execute with inputHoldingCid = foreignCid
+  forA_ [[fixture.operator], [fixture.governance], [fixture.trader]] $ \parties ->
+    rejectsWith market assertAuthorizationError $ executeAs market parties intentCid inputCid
+  rejectsWith market assertAuthorizationError $ trySubmit (actAs (controllersOf market)) $ exerciseCmd intentCid Cancel
+  assertIntentActive market intentCid
+  submit fixture.trader $ exerciseCmd intentCid Cancel
+  rejectsWith market (assertConsumedContract intentCid) $ executeAs market (controllersOf market) intentCid inputCid
+  Some input <- queryContractId fixture.trader inputCid
+  atomsOf input.amount === 1000

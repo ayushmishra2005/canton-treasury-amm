@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Change-control check for the prototype templates, not a security proof: it lists every choice
-# (and, for the live-reserve model, every interface instance) the compiled prototypes expose and
-# fails when that surface differs from the reviewed one. A difference means the new or changed
-# entry needs a security review before its expected list below is updated. It cannot judge an
-# edited body of an existing choice. Run after `dpm build --all`.
+# Change-control check for the prototype and Secure V1 production templates, not a security
+# proof: it lists every choice and interface instance the compiled DARs expose for those modules
+# and fails when that surface differs from the reviewed one. A difference means the new or
+# changed entry needs a security review before its expected list below is updated. It cannot
+# judge an edited body of an existing choice. Run after `dpm build --all`.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -57,5 +57,27 @@ ReserveHolding consuming AbsorbDeposit
 ReserveHolding consuming Archive
 ReserveHolding consuming Disburse
 ReserveHolding implements Splice.Api.Token.HoldingV1:Holding'
+
+check "Secure V1 production pool" \
+  canton-treasury-amm/.daml/dist/canton-treasury-amm-0.1.0.dar \
+  'CantonTreasuryAmm\.SecureV1\.Pool' \
+  'SecureLiquidityPosition consuming Archive
+SecurePool consuming AddLiquidity
+SecurePool consuming Archive
+SecurePool consuming RemoveLiquidity
+SecurePool consuming SwapExactInput
+SecurePoolCharter consuming Archive
+SecurePoolCharter consuming InitializePool
+SecureReserveHolding consuming Archive
+SecureReserveHolding implements Splice.Api.Token.HoldingV1:Holding'
+
+check "Secure V1 production swap intent" \
+  canton-treasury-amm/.daml/dist/canton-treasury-amm-0.1.0.dar \
+  'CantonTreasuryAmm\.SecureV1\.SwapIntent' \
+  'SecureSwapIntent consuming Archive
+SecureSwapIntent consuming Cancel
+SecureSwapIntent consuming Execute
+SecureSwapIntentFactory consuming Archive
+SecureSwapIntentFactory non-consuming SubmitSwapIntent'
 
 exit $status

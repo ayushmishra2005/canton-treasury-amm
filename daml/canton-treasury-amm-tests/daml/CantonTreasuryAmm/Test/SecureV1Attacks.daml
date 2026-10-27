@@ -1,0 +1,682 @@
+-- Adversarial tests against the Secure V1 production templates. Every rejected attack is wrapped
+-- in `rejectsWith`, which compares the full ledger snapshot (pool states, reserves, positions,
+-- charters, every ordinary holding, instrument totals) before and after. Every submission that
+-- claims missing authorization discloses the contracts it touches, so an `AuthorizationError`
+-- cannot be confused with a `ContractNotFound` caused by visibility; the one visibility case is
+-- asserted separately against contracts that are still active.
+module CantonTreasuryAmm.Test.SecureV1Attacks where
+
+import DA.Action (unless)
+import DA.Assert ((===), (=/=))
+import DA.Foldable (forA_)
+import DA.List (sort)
+import DA.NonEmpty qualified as NonEmpty
+import Daml.Script
+
+import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.SecureV1.Pool
+import CantonTreasuryAmm.Test.Fixtures
+import CantonTreasuryAmm.Test.ProtectedCustodyPrototype qualified as Custody
+import CantonTreasuryAmm.Test.ProtectedPoolPrototypeTests qualified as Prototype
+import CantonTreasuryAmm.Test.ProtectedPoolSettlementTests qualified as Settlement
+import CantonTreasuryAmm.Test.SecureV1Adversary
+import CantonTreasuryAmm.Test.SecureV1Support
+import CantonTreasuryAmm.Token
+import CantonTreasuryAmm.Types
+
+-- A second charter and pool for the same fixture and custodian, initialized by the same provider.
+-- With the same charter reference it has the same lineage and only a different genesis.
+openSibling : SecureMarket -> Text -> Script SecureMarket
+openSibling market charterReference = do
+  let fixture = market.fixture
+  let lineage = secureLineageFor fixture market.custodian charterReference
+  charterCid <- createCharter fixture lineage
+  treasuryHoldingCid <- issueTreasury fixture fixture.provider (amountOf 5000000)
+  stableHoldingCid <- issueStable fixture fixture.provider (amountOf 10000000)
+  initialized <- submit fixture.provider $ exerciseCmd charterCid InitializePool with
+    treasuryHoldingCid
+    stableHoldingCid
+    treasuryAmount = amountOf 5000000
+    stableAmount = amountOf 10000000
+  pure market with lineage; charterCid; initialized
+
+-- A market after one swap, so every reserve and pool reference has been replaced once.
+swappedMarket : Text -> Script (SecureMarket, SecureSwapResult)
+swappedMarket charterReference = do
+  market <- standardSecureMarket charterReference
+  inputCid <- issueTreasury market.fixture market.fixture.trader (amountOf 1000)
+  swapped <- settleSwap market market.fixture.trader market.initialized.poolCid TreasuryForStable inputCid 1000 1993
+  pure (market, swapped)
+
+removeCommand : ContractId SecurePool -> Party -> ContractId SecureLiquidityPosition -> Int -> Int -> Commands SecureRemoveLiquidityResult
+removeCommand poolCid provider positionCid burnAtoms expectedVersion =
+  exerciseCmd poolCid RemoveLiquidity with
+    provider
+    positionCid
+    burnShares = amountOf burnAtoms
+    minimumTreasuryOut = 0.0
+    minimumStableOut = 0.0
+    expectedVersion
+
+addCommand : ContractId SecurePool -> Party -> ContractId Holding -> ContractId Holding -> Int -> Commands SecureAddLiquidityResult
+addCommand poolCid provider treasuryHoldingCid stableHoldingCid expectedVersion =
+  exerciseCmd poolCid AddLiquidity with
+    provider
+    treasuryHoldingCid
+    stableHoldingCid
+    maximumTreasury = amountOf 500000
+    maximumStable = amountOf 1000000
+    minimumShares = 0.0
+    expectedVersion
+
+-- LP supply not backed by any position: zero while every burn went through `RemoveLiquidity`.
+supplyDrift : SecureMarket -> ContractId SecurePool -> Script Int
+supplyDrift market poolCid = do
+  Some pool <- queryContractId market.custodian poolCid
+  positions <- query @SecureLiquidityPosition market.custodian
+  let positionAtoms = sum [atomsOf position.shares | (_, position) <- positions, position.genesisCid == market.charterCid]
+  pure (atomsOf pool.totalShares - lockedSharesAtoms - positionAtoms)
+
+-- `ContractNotFound` for contracts that are still active: the submitter could not see them.
+assertInvisibleActive : SecureMarket -> [Text] -> Either SubmitError a -> Script ()
+assertInvisibleActive market activeCids result = do
+  case result of
+    Left ContractNotFound {unknownContractIds} ->
+      assertMsg "Expected only the invisible active contracts to be unknown"
+        (all (`elem` activeCids) (NonEmpty.toList unknownContractIds))
+    Left otherError -> abort ("Expected ContractNotFound by visibility, got " <> show otherError)
+    Right _ -> abort "Expected the submission to fail on contracts it cannot see"
+  reserves <- query @SecureReserveHolding market.custodian
+  pools <- query @SecurePool market.custodian
+  let active = map (show . fst) reserves ++ map (show . fst) pools
+  assertMsg "The unknown contracts are active" (all (`elem` active) activeCids)
+
+-- ATTACK 1. Actor: the operator alone, with every pool contract and the trader's holding
+-- disclosed. Attempts: archive each reserve and the pool state; settle a swap of the trader's
+-- holding in the trader's name; redeem the provider's position in the provider's name and in its
+-- own; mint itself an ordinary holding; pay itself from a reserve through a counterfeit pool
+-- choice it signs alone; move a reserve with the ordinary holding's `TransferExact`.
+-- Expected: `AuthorizationError` for every authority-backed attempt, `amm/owner-mismatch` for
+-- the own-name redemption, `WronglyTypedContract` for `TransferExact` on a reserve. No change.
+operatorAloneCannotDivertSecureReserves : Script ()
+operatorAloneCannotDivertSecureReserves = do
+  (market, swapped) <- swappedMarket "attack-01"
+  let fixture = market.fixture
+  let operator = fixture.operator
+  (pool, _, _) <- checkSecurePool market swapped.poolCid
+  disclosures <- secureDisclosures market swapped.poolCid
+  traderInputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  inputDisclosed <- disclosureOf fixture.trader traderInputCid
+  positionDisclosed <- disclosureOf fixture.provider market.initialized.positionCid
+  let asOperator = actAs operator <> discloseMany (inputDisclosed :: positionDisclosed :: disclosures)
+  deadline <- futureDeadline
+  counterfeitCid <- submit operator $ createCmd CounterfeitSecurePool with
+    forgers = [operator]
+    reserveCid = pool.treasuryReserveCid
+
+  forA_ [pool.treasuryReserveCid, pool.stableReserveCid] $ \reserveCid ->
+    rejectsWith market assertAuthorizationError $ trySubmit asOperator $ archiveCmd reserveCid
+  rejectsWith market assertAuthorizationError $ trySubmit asOperator $ archiveCmd swapped.poolCid
+  rejectsWith market assertAuthorizationError $ trySubmit asOperator $
+    swapCommand swapped.poolCid fixture.trader TreasuryForStable traderInputCid 1000 0 deadline pool.stateVersion
+  rejectsWith market assertAuthorizationError $ trySubmit asOperator $
+    removeCommand swapped.poolCid fixture.provider market.initialized.positionCid 1000000 pool.stateVersion
+  rejectsWith market (assertFailureId ownerMismatchError) $ trySubmit asOperator $
+    removeCommand swapped.poolCid operator market.initialized.positionCid 1000000 pool.stateVersion
+  rejectsWith market assertAuthorizationError $ trySubmit operator $ createCmd Holding with
+    instrument = fixture.treasuryInstrument
+    owner = operator
+    amount = pool.treasuryReserveAmount
+    auditors = []
+  rejectsWith market assertAuthorizationError $ trySubmit asOperator $
+    exerciseCmd counterfeitCid CounterfeitDrain with recipient = operator; payoutAtoms = 1000000
+  rejectsWith market Prototype.assertWronglyTyped $ trySubmit asOperator $
+    exerciseCmd (coerceContractId @SecureReserveHolding @Holding pool.treasuryReserveCid) TransferExact with
+      newOwner = operator
+      transferAmount = pool.treasuryReserveAmount
+
+-- ATTACK 2. Actors: each issuer alone, the two issuers together, and the issuers with the
+-- custodian, each with the pool contracts disclosed. Attempts: archive the reserve of the
+-- issuer's instrument and the pool state, and pay the issuer from the reserve through a
+-- counterfeit pool it signs. Expected: `AuthorizationError` for all; no change.
+-- Not prevented and out of scope: an issuer can always issue new units of its own instrument.
+issuersCannotArchiveOrSpendSecureReserves : Script ()
+issuersCannotArchiveOrSpendSecureReserves = do
+  (market, swapped) <- swappedMarket "attack-02"
+  let fixture = market.fixture
+  (pool, _, _) <- checkSecurePool market swapped.poolCid
+  disclosures <- secureDisclosures market swapped.poolCid
+  let coalitions =
+        [ ([fixture.treasuryIssuer], pool.treasuryReserveCid)
+        , ([fixture.stableIssuer], pool.stableReserveCid)
+        , ([fixture.treasuryIssuer, fixture.stableIssuer], pool.treasuryReserveCid)
+        , ([fixture.treasuryIssuer, fixture.stableIssuer, market.custodian], pool.stableReserveCid)
+        ]
+  forA_ coalitions $ \(parties, reserveCid) -> do
+    let asCoalition = actAs parties <> discloseMany disclosures
+    rejectsWith market assertAuthorizationError $ trySubmit asCoalition $ archiveCmd reserveCid
+    rejectsWith market assertAuthorizationError $ trySubmit asCoalition $ archiveCmd swapped.poolCid
+    counterfeitCid <- submit (actAs parties) $ createCmd CounterfeitSecurePool with forgers = parties; reserveCid
+    recipient <- case parties of
+      party :: _ -> pure party
+      [] -> abort "Coalitions are non-empty"
+    rejectsWith market assertAuthorizationError $ trySubmit asCoalition $
+      exerciseCmd counterfeitCid CounterfeitDrain with recipient; payoutAtoms = 1000
+
+-- ATTACK 3. Actors: the operator and governance together, with everything disclosed.
+-- Attempts: archive the reserves and pool state; replicate the pool state; create a reserve;
+-- settle a swap in the trader's name directly and through a forged executor contract they both
+-- sign; draw from and retire a reserve under a mandate they both grant to the operator.
+-- Expected: `AuthorizationError` for all; no change. Governance holds no reserve authority.
+operatorGovernanceCollusionCannotMoveReserves : Script ()
+operatorGovernanceCollusionCannotMoveReserves = do
+  (market, swapped) <- swappedMarket "attack-03"
+  let fixture = market.fixture
+  let colluders = [fixture.operator, fixture.governance]
+  (pool, treasuryReserve, _) <- checkSecurePool market swapped.poolCid
+  disclosures <- secureDisclosures market swapped.poolCid
+  traderInputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  inputDisclosed <- disclosureOf fixture.trader traderInputCid
+  let asColluders = actAs colluders <> discloseMany (inputDisclosed :: disclosures)
+  deadline <- futureDeadline
+  executorCid <- submit (actAs colluders) $ createCmd ForgedSwapExecutor with
+    operator = fixture.operator
+    governance = fixture.governance
+  mandateCid <- submit (actAs colluders) $ createCmd SecureReserveMandate with
+    grantors = colluders
+    holder = fixture.operator
+
+  forA_ [pool.treasuryReserveCid, pool.stableReserveCid] $ \reserveCid ->
+    rejectsWith market assertAuthorizationError $ trySubmit asColluders $ archiveCmd reserveCid
+  rejectsWith market assertAuthorizationError $ trySubmit asColluders $ archiveCmd swapped.poolCid
+  rejectsWith market assertAuthorizationError $ trySubmit asColluders $ createCmd pool
+  rejectsWith market assertAuthorizationError $ trySubmit asColluders $ createCmd treasuryReserve
+  rejectsWith market assertAuthorizationError $ trySubmit asColluders $
+    swapCommand swapped.poolCid fixture.trader TreasuryForStable traderInputCid 1000 0 deadline pool.stateVersion
+  rejectsWith market assertAuthorizationError $ trySubmit asColluders $
+    exerciseCmd executorCid SwapAsVictim with
+      poolCid = swapped.poolCid
+      victim = fixture.trader
+      inputHoldingCid = traderInputCid
+      inputAmount = amountOf 1000
+      deadline
+      expectedVersion = pool.stateVersion
+  rejectsWith market assertAuthorizationError $ trySubmit asColluders $
+    exerciseCmd mandateCid DrawReserve with
+      reserveCid = pool.treasuryReserveCid
+      recipient = fixture.operator
+      payoutAtoms = 1000000
+  rejectsWith market assertAuthorizationError $ trySubmit asColluders $
+    exerciseCmd mandateCid RetireReserve with reserveCid = pool.stableReserveCid
+
+-- ATTACK 4. Actors: the operator, governance and an LP. Attempts: mint a position with the
+-- operator and governance; mint one with the LP's consent too; mint one with three of the four
+-- core signers and the LP; redeem the genuine LP's position as a second LP, with the position
+-- disclosed. Expected: `AuthorizationError` for every forged mint, `amm/owner-mismatch` for the
+-- redemption; no change. Positions exist only through `InitializePool` and `AddLiquidity`.
+forgedLpPositionsCannotBeIssuedOrRedeemed : Script ()
+forgedLpPositionsCannotBeIssuedOrRedeemed = do
+  (market, swapped) <- swappedMarket "attack-04"
+  let fixture = market.fixture
+  let provider2 = market.secondProvider
+  (pool, _, _) <- checkSecurePool market swapped.poolCid
+  disclosures <- secureDisclosures market swapped.poolCid
+  positionDisclosed <- disclosureOf fixture.provider market.initialized.positionCid
+  let forged provider = SecureLiquidityPosition with
+        lineage = market.lineage
+        genesisCid = market.charterCid
+        provider
+        shares = amountOf 1000000
+        auditors = [fixture.auditor]
+  rejectsWith market assertAuthorizationError $
+    trySubmit (actAs [fixture.operator, fixture.governance]) $ createCmd (forged fixture.operator)
+  rejectsWith market assertAuthorizationError $
+    trySubmit (actAs [provider2, fixture.operator, fixture.governance]) $ createCmd (forged provider2)
+  rejectsWith market assertAuthorizationError $
+    trySubmit (actAs [provider2, market.custodian, fixture.operator, fixture.treasuryIssuer]) $ createCmd (forged provider2)
+  rejectsWith market (assertFailureId ownerMismatchError) $
+    trySubmit (actAs provider2 <> discloseMany (positionDisclosed :: disclosures)) $
+      removeCommand swapped.poolCid provider2 market.initialized.positionCid 1000000 pool.stateVersion
+
+-- ATTACK 5. Actors: the operator with governance, and three of the four core signers (missing
+-- the stablecoin issuer). Each signs a counterfeit pool that references a genuine reserve and
+-- pays out of it with the production disbursement helper; the first also signs a counterfeit
+-- `SecurePool` state. Expected: `AuthorizationError` for every payout and for the counterfeit
+-- state (it needs all four core signers); no change.
+counterfeitPoolsCannotDrainSecureReserves : Script ()
+counterfeitPoolsCannotDrainSecureReserves = do
+  (market, swapped) <- swappedMarket "attack-05"
+  let fixture = market.fixture
+  (pool, _, _) <- checkSecurePool market swapped.poolCid
+  disclosures <- secureDisclosures market swapped.poolCid
+  forA_ [[fixture.operator, fixture.governance], [market.custodian, fixture.operator, fixture.treasuryIssuer]] $ \forgers -> do
+    counterfeitCid <- submit (actAs forgers) $ createCmd CounterfeitSecurePool with
+      forgers
+      reserveCid = pool.treasuryReserveCid
+    rejectsWith market assertAuthorizationError $
+      trySubmit (actAs forgers <> discloseMany disclosures) $
+        exerciseCmd counterfeitCid CounterfeitDrain with recipient = fixture.operator; payoutAtoms = 1000000
+  rejectsWith market assertAuthorizationError $
+    trySubmit (actAs [fixture.operator, fixture.governance]) $ createCmd pool with stateVersion = 0
+
+-- ATTACK 6. Actors: the trader, a second LP and the initial provider, each with the foreign
+-- holding disclosed. Attempts: swap another party's holding in one's own name; add liquidity
+-- from the trader's holdings; swap with the wrong instrument; initialize a fresh charter from
+-- another party's holdings. Expected: `amm/owner-mismatch` for foreign holdings and
+-- `amm/instrument-mismatch` for the wrong instrument; no change.
+foreignOrWrongHoldingsAreRejected : Script ()
+foreignOrWrongHoldingsAreRejected = do
+  (market, swapped) <- swappedMarket "attack-06"
+  let fixture = market.fixture
+  (pool, _, _) <- checkSecurePool market swapped.poolCid
+  disclosures <- secureDisclosures market swapped.poolCid
+  deadline <- futureDeadline
+  foreignTreasury <- issueTreasury fixture fixture.other (amountOf 500000)
+  foreignStable <- issueStable fixture fixture.other (amountOf 1000000)
+  traderStable <- issueStable fixture fixture.trader (amountOf 1000)
+  foreignDisclosed <- mapA (disclosureOf fixture.other) [foreignTreasury, foreignStable]
+  let disclosed party = actAs party <> discloseMany (foreignDisclosed ++ disclosures)
+  rejectsWith market (assertFailureId ownerMismatchError) $ trySubmit (disclosed fixture.trader) $
+    swapCommand swapped.poolCid fixture.trader TreasuryForStable foreignTreasury 1000 0 deadline pool.stateVersion
+  rejectsWith market (assertFailureId ownerMismatchError) $ trySubmit (disclosed market.secondProvider) $
+    addCommand swapped.poolCid market.secondProvider foreignTreasury foreignStable pool.stateVersion
+  rejectsWith market (assertFailureId instrumentMismatchError) $ trySubmit (disclosed fixture.trader) $
+    swapCommand swapped.poolCid fixture.trader TreasuryForStable traderStable 1000 0 deadline pool.stateVersion
+
+  let freshLineage = secureLineageFor fixture market.custodian "attack-06-fresh"
+  freshCharterCid <- createCharter fixture freshLineage
+  rejectsWith market (assertFailureId ownerMismatchError) $ trySubmit (disclosed fixture.provider) $
+    exerciseCmd freshCharterCid InitializePool with
+      treasuryHoldingCid = foreignTreasury
+      stableHoldingCid = foreignStable
+      treasuryAmount = amountOf 500000
+      stableAmount = amountOf 1000000
+
+-- ATTACK 7. Actors: the full core set fabricates pool states of the genuine genesis that point
+-- at another pool's reserve (a sibling with a different charter reference), at a sibling with
+-- the same lineage, and at the two reserves swapped, each recording the referenced reserve's
+-- exact amount so only the lineage, genesis and instrument binding can reject it; and one at the
+-- genuine reserves with an inflated recorded amount. A trader then swaps against each. Expected: `amm/reserve-mismatch` from the
+-- pool's own validation in every case; nothing changes. These states need the trusted
+-- coalition, so this is defence in depth that keeps a pool state from spending another
+-- genesis's reserves or reporting a reserve it does not hold.
+reserveLineageMismatchIsRejected : Script ()
+reserveLineageMismatchIsRejected = do
+  (market, swapped) <- swappedMarket "attack-07"
+  let fixture = market.fixture
+  otherLineage <- openSibling market "attack-07-other"
+  sameLineage <- openSibling market "attack-07"
+  (pool, _, _) <- checkSecurePool market swapped.poolCid
+  Some otherPool <- queryContractId market.custodian otherLineage.initialized.poolCid
+  Some samePool <- queryContractId market.custodian sameLineage.initialized.poolCid
+  let forgeries =
+        [ pool with
+            treasuryReserveCid = otherPool.treasuryReserveCid
+            treasuryReserveAmount = otherPool.treasuryReserveAmount
+        , pool with
+            stableReserveCid = samePool.stableReserveCid
+            stableReserveAmount = samePool.stableReserveAmount
+        , pool with
+            treasuryReserveCid = pool.stableReserveCid
+            stableReserveCid = pool.treasuryReserveCid
+            treasuryReserveAmount = pool.stableReserveAmount
+            stableReserveAmount = pool.treasuryReserveAmount
+        , pool with treasuryReserveAmount = pool.treasuryReserveAmount + 1.0
+        ]
+  forA_ forgeries $ \forgery -> do
+    forgedCid <- submit (actAs (coreOf market)) $ createCmd forgery
+    forgedDisclosure <- disclosureOf market.custodian forgedCid
+    reserveDisclosures <- mapA (disclosureOf market.custodian)
+      [forgery.treasuryReserveCid, forgery.stableReserveCid]
+    inputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+    deadline <- futureDeadline
+    rejectsWith market (assertFailureId reserveMismatchError) $
+      trySubmit (actAs fixture.trader <> discloseMany (forgedDisclosure :: reserveDisclosures)) $
+        swapCommand forgedCid fixture.trader TreasuryForStable inputCid 1000 0 deadline pool.stateVersion
+    submit (actAs (coreOf market)) $ archiveCmd forgedCid
+  _ <- checkSecurePool market swapped.poolCid
+  pure ()
+
+-- ATTACK 8. Actors: the provider, holding positions in two pools of the same lineage (the core
+-- charters a sibling with the same reference). Attempts: redeem each pool's position against the
+-- other pool. Expected: `amm/position` from the genesis binding; nothing changes and each
+-- position then redeems in its own pool.
+positionGenesisMismatchIsRejected : Script ()
+positionGenesisMismatchIsRejected = do
+  market <- standardSecureMarket "attack-08"
+  sibling <- openSibling market "attack-08"
+  let provider = market.fixture.provider
+  sibling.lineage === market.lineage
+  sibling.charterCid =/= market.charterCid
+  forA_ [(market, sibling), (sibling, market)] $ \(home, away) -> do
+    disclosures <- secureDisclosures away away.initialized.poolCid
+    rejectsWith market (assertFailureId positionError) $
+      trySubmit (actAs provider <> discloseMany disclosures) $
+        removeCommand away.initialized.poolCid provider home.initialized.positionCid 1000 0
+  _ <- settleRemove market provider market.initialized.poolCid market.initialized.positionCid 1000 707 1414
+  _ <- settleRemove sibling provider sibling.initialized.poolCid sibling.initialized.positionCid 1000 707 1414
+  pure ()
+
+-- ATTACK 9. Actors: a trader and both LPs submitting against the active state with the
+-- predecessor's version. Expected: `amm/stale-state` for swap, add and remove; nothing changes.
+stalePoolVersionIsRejected : Script ()
+stalePoolVersionIsRejected = do
+  (market, swapped) <- swappedMarket "attack-09"
+  let fixture = market.fixture
+  disclosures <- secureDisclosures market swapped.poolCid
+  deadline <- futureDeadline
+  inputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  treasuryCid <- issueTreasury fixture market.secondProvider (amountOf 500000)
+  stableCid <- issueStable fixture market.secondProvider (amountOf 1000000)
+  let staleVersion = 0
+  rejectsWith market (assertFailureId staleStateError) $ trySubmit (actAs fixture.trader <> discloseMany disclosures) $
+    swapCommand swapped.poolCid fixture.trader TreasuryForStable inputCid 1000 0 deadline staleVersion
+  rejectsWith market (assertFailureId staleStateError) $ trySubmit (actAs market.secondProvider <> discloseMany disclosures) $
+    addCommand swapped.poolCid market.secondProvider treasuryCid stableCid staleVersion
+  rejectsWith market (assertFailureId staleStateError) $ trySubmit (actAs fixture.provider <> discloseMany disclosures) $
+    removeCommand swapped.poolCid fixture.provider market.initialized.positionCid 1000 staleVersion
+
+-- ATTACK 10. Actors: a trader and the provider replaying consumed contracts: the identical first
+-- swap (consumed pool and input), the consumed input on the current state, the consumed charter,
+-- and a fully redeemed position. Expected: `ContractNotFound` naming only consumed contracts
+-- (`LOCAL_VERDICT_INACTIVE_CONTRACTS` on a participant); nothing changes.
+consumedContractsCannotBeReplayed : Script ()
+consumedContractsCannotBeReplayed = do
+  market <- standardSecureMarket "attack-10"
+  let fixture = market.fixture
+  firstDisclosures <- secureDisclosures market market.initialized.poolCid
+  Some initialPool <- queryContractId market.custodian market.initialized.poolCid
+  firstInputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  deadline <- futureDeadline
+  let firstSwap = swapCommand market.initialized.poolCid fixture.trader TreasuryForStable firstInputCid 1000 0 deadline 0
+  first <- submit (actAs fixture.trader <> discloseMany firstDisclosures) firstSwap
+  currentDisclosures <- secureDisclosures market first.poolCid
+  let consumedByFirst =
+        [show market.initialized.poolCid, show firstInputCid]
+          ++ map show [initialPool.treasuryReserveCid, initialPool.stableReserveCid]
+  rejectsWith market (Settlement.assertConsumedAmong consumedByFirst) $
+    trySubmit (actAs fixture.trader <> discloseMany firstDisclosures) firstSwap
+  rejectsWith market (Settlement.assertConsumedAmong [show firstInputCid]) $
+    trySubmit (actAs fixture.trader <> discloseMany currentDisclosures) $
+      swapCommand first.poolCid fixture.trader TreasuryForStable firstInputCid 1000 0 deadline 1
+  replacementT <- issueTreasury fixture fixture.provider (amountOf 5000000)
+  replacementS <- issueStable fixture fixture.provider (amountOf 10000000)
+  rejectsWith market (Settlement.assertConsumedAmong [show market.charterCid]) $
+    trySubmit fixture.provider $ exerciseCmd market.charterCid InitializePool with
+      treasuryHoldingCid = replacementT
+      stableHoldingCid = replacementS
+      treasuryAmount = amountOf 5000000
+      stableAmount = amountOf 10000000
+  exit <- settleRemove market fixture.provider first.poolCid market.initialized.positionCid 7071066 5000999 9998005
+  exitDisclosures <- secureDisclosures market exit.poolCid
+  rejectsWith market (Settlement.assertConsumedAmong [show market.initialized.positionCid]) $
+    trySubmit (actAs fixture.provider <> discloseMany exitDisclosures) $
+      removeCommand exit.poolCid fixture.provider market.initialized.positionCid 1 2
+
+-- ATTACK 11. Actor: a trader with disclosures taken before the previous swap. Attempts: the
+-- consumed predecessor with its stale disclosures; the current state with the current pool
+-- disclosed but stale reserve disclosures in place of the current reserves. Expected: the first
+-- fails as `ContractNotFound` naming consumed contracts; the second as `ContractNotFound` naming
+-- only the current reserves, which are active but invisible to the trader: a visibility
+-- failure, not an authorization result. Stale reserve data cannot stand in for the live reserves.
+staleDisclosuresCannotSettle : Script ()
+staleDisclosuresCannotSettle = do
+  market <- standardSecureMarket "attack-11"
+  let fixture = market.fixture
+  staleDisclosures <- secureDisclosures market market.initialized.poolCid
+  Some stalePool <- queryContractId market.custodian market.initialized.poolCid
+  firstInputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  first <- settleSwap market fixture.trader market.initialized.poolCid TreasuryForStable firstInputCid 1000 1993
+  Some currentPool <- queryContractId market.custodian first.poolCid
+  currentPoolDisclosure <- disclosureOf market.custodian first.poolCid
+  inputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  deadline <- futureDeadline
+  rejectsWith market (Settlement.assertConsumedAmong (map show [market.initialized.poolCid] ++ map show [stalePool.treasuryReserveCid, stalePool.stableReserveCid])) $
+    trySubmit (actAs fixture.trader <> discloseMany staleDisclosures) $
+      swapCommand market.initialized.poolCid fixture.trader TreasuryForStable inputCid 1000 0 deadline 0
+  let staleReserveDisclosures = drop 1 staleDisclosures
+  rejectsWith market (assertInvisibleActive market (map show [currentPool.treasuryReserveCid, currentPool.stableReserveCid])) $
+    trySubmit (actAs fixture.trader <> discloseMany (currentPoolDisclosure :: staleReserveDisclosures)) $
+      swapCommand first.poolCid fixture.trader TreasuryForStable inputCid 1000 0 deadline 1
+
+-- ATTACK 12. Actors: the operator and custodian with Stage 1.1 custody controls and a generic
+-- Secure V1 mandate. Attempts: a custodian `ReleaseMandate`, a custodian-approved
+-- `ReleaseRequest`, a joint `Release`, and a coalition `Sweep` aimed at a secure reserve; a
+-- generic mandate granted by three core signers to an outsider, drawing and retiring.
+-- Expected: the custody paths fail as `WronglyTypedContract` (they act only on
+-- `ProtectedReserve`), the generic mandate with `AuthorizationError`; nothing changes.
+genericCustodyMandatesCannotBypassThePool : Script ()
+genericCustodyMandatesCannotBypassThePool = do
+  (market, swapped) <- swappedMarket "attack-12"
+  let fixture = market.fixture
+  let custodian = market.custodian
+  (pool, _, _) <- checkSecurePool market swapped.poolCid
+  disclosures <- secureDisclosures market swapped.poolCid
+  let asReserve = coerceContractId @SecureReserveHolding @Custody.ProtectedReserve pool.treasuryReserveCid
+  let disclosed parties = actAs parties <> discloseMany disclosures
+  mandateCid <- submit custodian $ createCmd Custody.ReleaseMandate with
+    custodian
+    operator = fixture.operator
+    instrument = fixture.treasuryInstrument
+    beneficiary = fixture.operator
+    remainingAllowance = pool.treasuryReserveAmount
+  rejectsWith market Prototype.assertWronglyTyped $ trySubmit (disclosed [fixture.operator]) $
+    exerciseCmd mandateCid Custody.ReleaseUnderMandate with
+      reserveCid = asReserve
+      releaseAmount = pool.treasuryReserveAmount
+  requestCid <- submit fixture.operator $ createCmd Custody.ReleaseRequest with
+    operator = fixture.operator
+    custodian
+    reserveCid = asReserve
+    recipient = fixture.operator
+    releaseAmount = pool.treasuryReserveAmount
+  rejectsWith market Prototype.assertWronglyTyped $ trySubmit (disclosed [custodian]) $
+    exerciseCmd requestCid Custody.ApproveRelease
+  rejectsWith market Prototype.assertWronglyTyped $ trySubmit (disclosed [custodian, fixture.operator]) $
+    exerciseCmd asReserve Custody.Release with recipient = fixture.operator; releaseAmount = pool.treasuryReserveAmount
+  controllerCid <- submit (actAs [fixture.operator, fixture.governance]) $ createCmd Custody.CoalitionReserveController with
+    operator = fixture.operator
+    governance = fixture.governance
+    reserveCid = asReserve
+  rejectsWith market Prototype.assertWronglyTyped $ trySubmit (disclosed [fixture.operator]) $
+    exerciseCmd controllerCid Custody.Sweep with recipient = fixture.operator; releaseAmount = pool.treasuryReserveAmount
+
+  let threeCore = [custodian, fixture.operator, fixture.treasuryIssuer]
+  genericCid <- submit (actAs threeCore) $ createCmd SecureReserveMandate with
+    grantors = threeCore
+    holder = fixture.other
+  rejectsWith market assertAuthorizationError $ trySubmit (disclosed [fixture.other]) $
+    exerciseCmd genericCid DrawReserve with
+      reserveCid = pool.treasuryReserveCid
+      recipient = fixture.other
+      payoutAtoms = 1000000
+  rejectsWith market assertAuthorizationError $ trySubmit (disclosed [fixture.other]) $
+    exerciseCmd genericCid RetireReserve with reserveCid = pool.treasuryReserveCid
+
+-- ATTACK 13. Actors: an LP with privileged coalitions. Attempts: archive the LP's position
+-- directly and through a burner contract with the operator and governance, and with three core
+-- signers. Expected: `AuthorizationError` for each; nothing changes and supply reconciles. A
+-- burn outside `RemoveLiquidity` needs the provider and all four core signers (see the trust
+-- test, where it is shown to be detectable as supply drift).
+unaccountedLpBurnIsRejected : Script ()
+unaccountedLpBurnIsRejected = do
+  (market, swapped) <- swappedMarket "attack-13"
+  let fixture = market.fixture
+  positionDisclosed <- disclosureOf fixture.provider market.initialized.positionCid
+  forA_ [[fixture.provider, fixture.operator, fixture.governance], [fixture.provider, market.custodian, fixture.operator, fixture.stableIssuer]] $ \parties -> do
+    rejectsWith market assertAuthorizationError $
+      trySubmit (actAs parties <> discloseMany [positionDisclosed]) $ archiveCmd market.initialized.positionCid
+    burnerCid <- submit (actAs parties) $ createCmd PositionBurner with grantors = parties; holder = fixture.operator
+    rejectsWith market assertAuthorizationError $
+      trySubmit (actAs fixture.operator <> discloseMany [positionDisclosed]) $
+        exerciseCmd burnerCid BurnOutsidePool with positionCid = market.initialized.positionCid
+  supplyDrift market swapped.poolCid >>= (=== 0)
+
+-- ATTACK 14. Actor: a trader whose own contract settles a genuine swap and then fails later in
+-- the same transaction (a second swap with an unreachable minimum). Expected: `amm/slippage`;
+-- the whole transaction rolls back, so the first swap's reserve, pool and holding changes are
+-- absent and the original state then settles normally.
+lateFailureRollsBackTheWholeSettlement : Script ()
+lateFailureRollsBackTheWholeSettlement = do
+  market <- standardSecureMarket "attack-14"
+  let fixture = market.fixture
+  probeCid <- submit fixture.trader $ createCmd LateFailureProbe with trader = fixture.trader
+  firstInputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  secondInputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  disclosures <- secureDisclosures market market.initialized.poolCid
+  deadline <- futureDeadline
+  rejectsWith market (assertFailureId slippageError) $
+    trySubmit (actAs fixture.trader <> discloseMany disclosures) $
+      exerciseCmd probeCid SwapThenFail with
+        poolCid = market.initialized.poolCid
+        inputHoldingCid = firstInputCid
+        inputAmount = amountOf 1000
+        followUpHoldingCid = secondInputCid
+        deadline
+        expectedVersion = 0
+  _ <- settleSwap market fixture.trader market.initialized.poolCid TreasuryForStable firstInputCid 1000 1993
+  pure ()
+
+-- ATTACK 15. Actors: the operator, governance and a second LP trying to send pool value to a
+-- destination other than the trader or redeeming LP. Attempts: a generic mandate with three core
+-- signers paying the operator; a forged executor naming a victim trader; redeeming another LP's
+-- position to oneself. Expected: `AuthorizationError`, `AuthorizationError` and
+-- `amm/owner-mismatch`; nothing changes. Then a genuine swap and redemption pay exactly the
+-- trader and the LP (checked by the settlement helpers).
+payoutsGoOnlyToTheTraderOrRedeemingLp : Script ()
+payoutsGoOnlyToTheTraderOrRedeemingLp = do
+  (market, swapped) <- swappedMarket "attack-15"
+  let fixture = market.fixture
+  (pool, _, _) <- checkSecurePool market swapped.poolCid
+  disclosures <- secureDisclosures market swapped.poolCid
+  traderInputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  inputDisclosed <- disclosureOf fixture.trader traderInputCid
+  positionDisclosed <- disclosureOf fixture.provider market.initialized.positionCid
+  deadline <- futureDeadline
+  let grantors = [market.custodian, fixture.operator, fixture.stableIssuer]
+  mandateCid <- submit (actAs grantors) $ createCmd SecureReserveMandate with grantors; holder = fixture.governance
+  rejectsWith market assertAuthorizationError $
+    trySubmit (actAs fixture.governance <> discloseMany disclosures) $
+      exerciseCmd mandateCid DrawReserve with
+        reserveCid = pool.stableReserveCid
+        recipient = fixture.operator
+        payoutAtoms = 1000000
+  executorCid <- submit (actAs [fixture.operator, fixture.governance]) $ createCmd ForgedSwapExecutor with
+    operator = fixture.operator
+    governance = fixture.governance
+  rejectsWith market assertAuthorizationError $
+    trySubmit (actAs fixture.operator <> discloseMany (inputDisclosed :: disclosures)) $
+      exerciseCmd executorCid SwapAsVictim with
+        poolCid = swapped.poolCid
+        victim = fixture.trader
+        inputHoldingCid = traderInputCid
+        inputAmount = amountOf 1000
+        deadline
+        expectedVersion = pool.stateVersion
+  rejectsWith market (assertFailureId ownerMismatchError) $
+    trySubmit (actAs market.secondProvider <> discloseMany (positionDisclosed :: disclosures)) $
+      removeCommand swapped.poolCid market.secondProvider market.initialized.positionCid 1000 pool.stateVersion
+  next <- settleSwap market fixture.trader swapped.poolCid TreasuryForStable traderInputCid 1000 1992
+  _ <- settleRemove market fixture.provider next.poolCid market.initialized.positionCid 1000 707 1413
+  pure ()
+
+-- ATTACK 16, TRUST LIMIT. Actors: the full core set (custodian, operator, both issuers).
+-- Demonstrated, not prevented: it can create an unbacked pool state carrying the genuine genesis,
+-- so one genesis has two active states; mint the operator a position and redeem it from the
+-- genuine reserves; burn an LP position outside `RemoveLiquidity` together with that LP, which
+-- reconciliation reports as supply drift; and archive the reserves and the pool, freezing it.
+-- Still prevented with that coalition: a swap of the trader's holding without the trader
+-- (`AuthorizationError`), and redeeming a forged position for the pool's whole supply
+-- (`amm/position`, the locked-share guard).
+fullCoreCoalitionRemainsTrusted : Script ()
+fullCoreCoalitionRemainsTrusted = do
+  (market, swapped) <- swappedMarket "attack-16"
+  let fixture = market.fixture
+  let core = coreOf market
+  (pool, _, _) <- checkSecurePool market swapped.poolCid
+  disclosures <- secureDisclosures market swapped.poolCid
+  deadline <- futureDeadline
+  traderInputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  inputDisclosed <- disclosureOf fixture.trader traderInputCid
+  rejectsWith market assertAuthorizationError $
+    trySubmit (actAs (fixture.governance :: core) <> discloseMany (inputDisclosed :: disclosures)) $
+      swapCommand swapped.poolCid fixture.trader TreasuryForStable traderInputCid 1000 0 deadline pool.stateVersion
+  let forgedPosition shareAtoms = SecureLiquidityPosition with
+        lineage = market.lineage
+        genesisCid = market.charterCid
+        provider = fixture.operator
+        shares = amountOf shareAtoms
+        auditors = [fixture.auditor]
+  oversizedCid <- submit (actAs core) $ createCmd (forgedPosition (atomsOf pool.totalShares))
+  rejectsWith market (assertFailureId positionError) $
+    trySubmit fixture.operator $
+      removeCommand swapped.poolCid fixture.operator oversizedCid (atomsOf pool.totalShares) pool.stateVersion
+  submit (actAs core) $ archiveCmd oversizedCid
+
+  totalsBefore <- totalsOf market
+  unbackedCid <- submit (actAs core) $ createCmd pool with stateVersion = 100
+  states <- query @SecurePool market.custodian
+  sort [cid | (cid, state) <- states, state.genesisCid == market.charterCid] === sort [swapped.poolCid, unbackedCid]
+  submit (actAs core) $ archiveCmd unbackedCid
+
+  forgedCid <- submit (actAs core) $ createCmd (forgedPosition 1000000)
+  drained <- submit fixture.operator $
+    removeCommand swapped.poolCid fixture.operator forgedCid 1000000 pool.stateVersion
+  assert (atomsOf drained.treasuryOut > 0 && atomsOf drained.stableOut > 0)
+  holdingAtoms fixture.operator fixture.treasuryInstrument >>= (=== atomsOf drained.treasuryOut)
+  totalsOf market >>= (=== totalsBefore)
+  supplyDrift market drained.poolCid >>= (=== -1000000)
+
+  submit (actAs (fixture.provider :: core)) $ archiveCmd market.initialized.positionCid
+  supplyDrift market drained.poolCid >>= (=== 7071066 - 1000000)
+
+  Some drainedPool <- queryContractId market.custodian drained.poolCid
+  submit (actAs core) $
+    archiveCmd drainedPool.treasuryReserveCid *> archiveCmd drainedPool.stableReserveCid *> archiveCmd drained.poolCid
+  totalsAfter <- totalsOf market
+  totalsAfter === Totals with
+    treasury = totalsBefore.treasury - atomsOf drainedPool.treasuryReserveAmount
+    stable = totalsBefore.stable - atomsOf drainedPool.stableReserveAmount
+
+-- PARTIAL COALITIONS. Actors: each of the 31 non-empty subsets of the custodian, operator,
+-- governance and both issuers, with the pool contracts, the LP position and the trader's input
+-- disclosed. Attempts for every subset: archive the LP position; swap the trader's holding in the
+-- trader's name; swap it in a member's own name. For the 29 subsets missing a core signer, also:
+-- archive each reserve and the pool state, replicate the pool state and a reserve, and mint a
+-- position for a member. Expected: `AuthorizationError` everywhere except the own-name swap,
+-- which fails `amm/owner-mismatch`; nothing changes.
+everyPartialCoalitionIsRejected : Script ()
+everyPartialCoalitionIsRejected = do
+  (market, swapped) <- swappedMarket "partial"
+  let fixture = market.fixture
+  (pool, treasuryReserve, _) <- checkSecurePool market swapped.poolCid
+  disclosures <- secureDisclosures market swapped.poolCid
+  traderInputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  inputDisclosed <- disclosureOf fixture.trader traderInputCid
+  positionDisclosed <- disclosureOf fixture.provider market.initialized.positionCid
+  deadline <- futureDeadline
+  let candidates = filter (not . null) (Settlement.subsetsOf (privilegedOf market))
+  length candidates === 31
+  length (filter (not . coversCore market) candidates) === 29
+  forA_ candidates $ \subset -> do
+    member <- case subset of
+      party :: _ -> pure party
+      [] -> abort "Candidate subsets are non-empty"
+    let disclosed = actAs subset <> discloseMany (inputDisclosed :: positionDisclosed :: disclosures)
+    let swapAs trader = trySubmit disclosed $
+          swapCommand swapped.poolCid trader TreasuryForStable traderInputCid 1000 0 deadline pool.stateVersion
+    rejectsWith market assertAuthorizationError $ trySubmit disclosed $ archiveCmd market.initialized.positionCid
+    rejectsWith market assertAuthorizationError $ swapAs fixture.trader
+    rejectsWith market (assertFailureId ownerMismatchError) $ swapAs member
+    unless (coversCore market subset) $ do
+      forA_ [pool.treasuryReserveCid, pool.stableReserveCid] $ \reserveCid ->
+        rejectsWith market assertAuthorizationError $ trySubmit disclosed $ archiveCmd reserveCid
+      rejectsWith market assertAuthorizationError $ trySubmit disclosed $ archiveCmd swapped.poolCid
+      rejectsWith market assertAuthorizationError $ trySubmit (actAs subset) $ createCmd pool
+      rejectsWith market assertAuthorizationError $ trySubmit (actAs subset) $ createCmd treasuryReserve
+      rejectsWith market assertAuthorizationError $ trySubmit (actAs subset) $ createCmd SecureLiquidityPosition with
+        lineage = market.lineage
+        genesisCid = market.charterCid
+        provider = member
+        shares = amountOf 1000000
+        auditors = [fixture.auditor]

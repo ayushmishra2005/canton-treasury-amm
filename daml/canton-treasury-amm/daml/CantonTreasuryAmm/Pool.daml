@@ -1,3 +1,7 @@
+-- LEGACY MVP pool. Reserves are ordinary operator-owned `Holding` contracts that the operator
+-- can move or archive outside any pool choice, and the operator with governance can create
+-- arbitrary pool and position state. Not a secure reserve model; see `CantonTreasuryAmm.SecureV1`
+-- and `SECURE_V1.md`. Kept unchanged for existing contracts and characterization tests.
 module CantonTreasuryAmm.Pool where
 
 import CantonTreasuryAmm.Errors

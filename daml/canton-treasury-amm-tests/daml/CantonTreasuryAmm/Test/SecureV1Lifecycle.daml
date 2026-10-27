@@ -1,0 +1,346 @@
+-- Secure V1 production lifecycle tests. Each test runs the same operations on a legacy `Pool`
+-- and a `SecurePool` in one ledger and compares their accounting (reserves, LP supply, locked
+-- share, both fee counters and state version) after every step, besides checking every secure
+-- transition in full through the `SecureV1Support` settlement helpers.
+module CantonTreasuryAmm.Test.SecureV1Lifecycle where
+
+import DA.Assert ((===))
+import DA.Action ((>=>), foldlA)
+import DA.Foldable (forA_, mapA_)
+import DA.Optional (isSome)
+import DA.TextMap qualified as TextMap
+import Daml.Script
+
+import Splice.Api.Token.HoldingV1 qualified as TokenStandard
+import Splice.Api.Token.MetadataV1 (Metadata (..))
+
+import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.Math
+import CantonTreasuryAmm.Pool qualified as Legacy
+import CantonTreasuryAmm.SecureV1.Pool
+import CantonTreasuryAmm.Test.Fixtures
+import CantonTreasuryAmm.Test.SecureV1Support
+import CantonTreasuryAmm.Token
+import CantonTreasuryAmm.Types
+
+sees : (Template t, HasEnsure t) => Party -> ContractId t -> Script Bool
+sees party cid = isSome <$> queryContractId party cid
+
+assertSameAccounting : Party -> ContractId SecurePool -> ContractId Legacy.Pool -> Script PoolAccounting
+assertSameAccounting reader secureCid legacyCid = do
+  Some secure <- queryContractId reader secureCid
+  Some legacy <- queryContractId reader legacyCid
+  secureAccounting secure === legacyAccounting legacy
+  pure (secureAccounting secure)
+
+-- Flow A. The provider deposits from larger holdings. Expected: reserves 5,000,000 / 10,000,000
+-- created from the deposits, change 1,000,000 / 2,000,000 returned with its auditors, supply
+-- floor(sqrt(5e13)) = 7,071,067 with one locked share and a 7,071,066-share position, zero fee
+-- counters, and the same accounting as a legacy pool initialized with the same amounts.
+secureInitializationMatchesLegacyAccounting : Script ()
+secureInitializationMatchesLegacyAccounting = do
+  fixture <- setup
+  custodian <- allocateParty "SecureCustodian"
+  let lineage = secureLineageFor fixture custodian "secure-init"
+  charterCid <- createCharter fixture lineage
+  treasuryCid <- issueTreasury fixture fixture.provider (amountOf 6000000)
+  stableCid <- issueStable fixture fixture.provider (amountOf 12000000)
+  totals <- totalsFor fixture
+  initialized <- submit fixture.provider $ exerciseCmd charterCid InitializePool with
+    treasuryHoldingCid = treasuryCid
+    stableHoldingCid = stableCid
+    treasuryAmount = amountOf 5000000
+    stableAmount = amountOf 10000000
+  let market = SecureMarket with
+        fixture; custodian; secondProvider = fixture.other; lineage; charterCid; initialized
+  (pool, treasuryReserve, stableReserve) <- checkSecurePool market initialized.poolCid
+  assertArchived custodian charterCid
+  mapA_ (assertArchived fixture.provider) [treasuryCid, stableCid]
+  (treasuryReserve.genesisCid, stableReserve.genesisCid, pool.genesisCid) === (charterCid, charterCid, charterCid)
+  secureAccounting pool === PoolAccounting with
+    treasuryReserveAtoms = 5000000
+    stableReserveAtoms = 10000000
+    totalShareAtoms = 7071067
+    lockedShareAtoms = 1
+    treasuryFeeAtoms = 0
+    stableFeeAtoms = 0
+    stateVersion = 0
+  Some position <- queryContractId fixture.provider initialized.positionCid
+  (position.provider, atomsOf position.shares, position.auditors) === (fixture.provider, 7071066, [fixture.auditor])
+  forA_ [(initialized.treasuryChangeHoldingCid, fixture.treasuryInstrument, 1000000), (initialized.stableChangeHoldingCid, fixture.stableInstrument, 2000000)] $
+    \(changeCid, instrument, atoms) -> do
+      Some cid <- pure changeCid
+      Some change <- queryContractId fixture.provider cid
+      (change.owner, change.instrument, atomsOf change.amount, change.auditors) === (fixture.provider, instrument, atoms, [fixture.auditor])
+  totalsFor fixture >>= (=== totals)
+
+  legacy <- initializePool fixture "legacy-init" (amountOf 5000000) (amountOf 10000000)
+  _ <- assertSameAccounting fixture.operator initialized.poolCid legacy.poolCid
+  Some legacyPosition <- queryContractId fixture.provider legacy.positionCid
+  legacyPosition.shares === position.shares
+  Some legacyPool <- queryContractId fixture.operator legacy.poolCid
+  Some legacyReserve <- queryContractId fixture.operator legacyPool.treasuryReserveHoldingCid
+  legacyReserve.owner === fixture.operator
+  holdingAtoms fixture.operator fixture.treasuryInstrument >>= (=== 5000000)
+  holdingAtoms custodian fixture.treasuryInstrument >>= (=== 0)
+
+-- Flows B-E end to end, side by side with a legacy pool: Treasury-for-stablecoin 1,000 -> 1,993;
+-- stablecoin-for-Treasury 5,000 -> 2,492; an add with maxima 500,000 / 1,000,000 minting 706,894
+-- for 499,701 / 1,000,000 (Treasury change 299); a removal of 353,553 paying 249,925 / 500,149;
+-- Treasury-for-stablecoin 2,000 -> 3,988; removal of the remaining 353,341 paying 249,870 /
+-- 499,660; the initial provider's exit of 7,071,066 paying 5,000,413 / 9,999,208. Fee counters:
+-- Treasury 3 then 9, stablecoin 15. After every step the secure and legacy accounting are equal,
+-- and the secure pool ends with the locked share, 1 / 2 atoms of dust and no positions.
+secureLifecycleMatchesLegacyStepByStep : Script ()
+secureLifecycleMatchesLegacyStepByStep = do
+  market <- standardSecureMarket "secure-parity"
+  let fixture = market.fixture
+  let trader = fixture.trader
+  let provider2 = market.secondProvider
+  legacy <- initializePool fixture "legacy-parity" (amountOf 5000000) (amountOf 10000000)
+  _ <- assertSameAccounting fixture.operator market.initialized.poolCid legacy.poolCid
+
+  secureIn1 <- issueTreasury fixture trader (amountOf 1000)
+  legacyIn1 <- issueTreasury fixture trader (amountOf 1000)
+  step1 <- settleSwap market trader market.initialized.poolCid TreasuryForStable secureIn1 1000 1993
+  legacy1 <- submitDirectSwap fixture legacy.poolCid trader TreasuryForStable legacyIn1 (amountOf 1000) 0.0
+  legacy1.amountOut === step1.amountOut
+  accounting1 <- assertSameAccounting fixture.operator step1.poolCid legacy1.poolCid
+  (accounting1.treasuryFeeAtoms, accounting1.stableFeeAtoms) === (3, 0)
+
+  secureIn2 <- issueStable fixture trader (amountOf 5000)
+  legacyIn2 <- issueStable fixture trader (amountOf 5000)
+  step2 <- settleSwap market trader step1.poolCid StableForTreasury secureIn2 5000 2492
+  legacy2 <- submitDirectSwap fixture legacy1.poolCid trader StableForTreasury legacyIn2 (amountOf 5000) 0.0
+  legacy2.amountOut === step2.amountOut
+  accounting2 <- assertSameAccounting fixture.operator step2.poolCid legacy2.poolCid
+  (accounting2.treasuryReserveAtoms, accounting2.stableReserveAtoms) === (4998508, 10003007)
+  (accounting2.treasuryFeeAtoms, accounting2.stableFeeAtoms) === (3, 15)
+
+  secureT <- issueTreasury fixture provider2 (amountOf 500000)
+  secureS <- issueStable fixture provider2 (amountOf 1000000)
+  legacyT <- issueTreasury fixture provider2 (amountOf 500000)
+  legacyS <- issueStable fixture provider2 (amountOf 1000000)
+  step3 <- settleAdd market provider2 step2.poolCid secureT secureS 500000 1000000 706894 499701 1000000
+  legacy3 <- submitAddLiquidity fixture legacy2.poolCid provider2 legacyT legacyS (amountOf 500000) (amountOf 1000000) 0.0
+  (legacy3.mintedShares, legacy3.usedTreasury, legacy3.usedStable) === (step3.mintedShares, step3.usedTreasury, step3.usedStable)
+  Some secureChangeCid <- pure step3.treasuryChangeHoldingCid
+  Some legacyChangeCid <- pure legacy3.treasuryChangeHoldingCid
+  Some secureChange <- queryContractId provider2 secureChangeCid
+  Some legacyChange <- queryContractId provider2 legacyChangeCid
+  (atomsOf secureChange.amount, secureChange.auditors) === (299, legacyChange.auditors)
+  legacyChange.amount === secureChange.amount
+  (step3.stableChangeHoldingCid, legacy3.stableChangeHoldingCid) === (None, None)
+  accounting3 <- assertSameAccounting fixture.operator step3.poolCid legacy3.poolCid
+  accounting3.totalShareAtoms === 7071067 + 706894
+
+  step4 <- settleRemove market provider2 step3.poolCid step3.positionCid 353553 249925 500149
+  legacy4 <- submitRemoveLiquidity fixture legacy3.poolCid provider2 legacy3.positionCid (amountOf 353553) 0.0 0.0
+  (legacy4.treasuryOut, legacy4.stableOut) === (step4.treasuryOut, step4.stableOut)
+  _ <- assertSameAccounting fixture.operator step4.poolCid legacy4.poolCid
+
+  secureIn5 <- issueTreasury fixture trader (amountOf 2000)
+  legacyIn5 <- issueTreasury fixture trader (amountOf 2000)
+  step5 <- settleSwap market trader step4.poolCid TreasuryForStable secureIn5 2000 3988
+  legacy5 <- submitDirectSwap fixture legacy4.poolCid trader TreasuryForStable legacyIn5 (amountOf 2000) 0.0
+  legacy5.amountOut === step5.amountOut
+  accounting5 <- assertSameAccounting fixture.operator step5.poolCid legacy5.poolCid
+  (accounting5.treasuryFeeAtoms, accounting5.stableFeeAtoms) === (9, 15)
+
+  Some secureRest <- pure step4.remainingPositionCid
+  Some legacyRest <- pure legacy4.remainingPositionCid
+  step6 <- settleRemove market provider2 step5.poolCid secureRest 353341 249870 499660
+  legacy6 <- submitRemoveLiquidity fixture legacy5.poolCid provider2 legacyRest (amountOf 353341) 0.0 0.0
+  (legacy6.treasuryOut, legacy6.stableOut) === (step6.treasuryOut, step6.stableOut)
+  _ <- assertSameAccounting fixture.operator step6.poolCid legacy6.poolCid
+
+  step7 <- settleRemove market fixture.provider step6.poolCid market.initialized.positionCid 7071066 5000413 9999208
+  legacy7 <- submitRemoveLiquidity fixture legacy6.poolCid fixture.provider legacy.positionCid (amountOf 7071066) 0.0 0.0
+  (legacy7.treasuryOut, legacy7.stableOut) === (step7.treasuryOut, step7.stableOut)
+  final <- assertSameAccounting fixture.operator step7.poolCid legacy7.poolCid
+  final === PoolAccounting with
+    treasuryReserveAtoms = 1
+    stableReserveAtoms = 2
+    totalShareAtoms = 1
+    lockedShareAtoms = 1
+    treasuryFeeAtoms = 9
+    stableFeeAtoms = 15
+    stateVersion = 7
+  positions <- query @SecureLiquidityPosition market.custodian
+  positions === []
+
+-- Fee rounding on inputs that are not multiples of 1000 / 3, side by side with a legacy pool.
+-- Expected: Treasury-for-stablecoin 1 and 333 each credit ceil(0.003) = ceil(0.999) = 1 to the
+-- Treasury counter; stablecoin-for-Treasury 1,001 credits ceil(3.003) = 4 to the stablecoin
+-- counter; outputs and accounting equal the legacy pool's after each swap.
+secureFeeRoundingMatchesLegacy : Script ()
+secureFeeRoundingMatchesLegacy = do
+  market <- standardSecureMarket "secure-fee-rounding"
+  let fixture = market.fixture
+  legacy <- initializePool fixture "legacy-fee-rounding" (amountOf 5000000) (amountOf 10000000)
+  let step (securePoolCid, legacyPoolCid) (direction, inputAtoms) = do
+        (reserveIn, reserveOut) <- oriented direction <$> reserveAtomsOf market securePoolCid
+        let issue = if direction == TreasuryForStable then issueTreasury else issueStable
+        secureIn <- issue fixture fixture.trader (amountOf inputAtoms)
+        legacyIn <- issue fixture fixture.trader (amountOf inputAtoms)
+        secureResult <- settleSwap market fixture.trader securePoolCid direction secureIn inputAtoms (swapOutputAtoms reserveIn reserveOut inputAtoms)
+        legacyResult <- submitDirectSwap fixture legacyPoolCid fixture.trader direction legacyIn (amountOf inputAtoms) 0.0
+        legacyResult.amountOut === secureResult.amountOut
+        _ <- assertSameAccounting fixture.operator secureResult.poolCid legacyResult.poolCid
+        pure (secureResult.poolCid, legacyResult.poolCid)
+  (finalCid, _) <- foldlA step (market.initialized.poolCid, legacy.poolCid)
+    [(TreasuryForStable, 1), (TreasuryForStable, 333), (StableForTreasury, 1001)]
+  Some final <- queryContractId market.custodian finalCid
+  (atomsOf final.treasuryFeeAmount, atomsOf final.stableFeeAmount) === (2, 4)
+
+-- Fee counters near the cap, mirroring the legacy saturation test: the core signers replace the
+-- pool state with counters at cap - 1 (a trusted-coalition action, used only to reach the
+-- boundary). Expected: the input instrument's counter saturates at the cap while the other is
+-- untouched, swaps keep settling with growing raw k, and a legacy pool given the same counters
+-- reports identical accounting after each swap.
+secureFeeCountersSaturateLikeLegacy : Script ()
+secureFeeCountersSaturateLikeLegacy = do
+  market <- standardSecureMarket "secure-fee-cap"
+  let fixture = market.fixture
+  let trader = fixture.trader
+  (pool, _, _) <- checkSecurePool market market.initialized.poolCid
+  nearCapCid <- submit (actAs (coreOf market)) $
+    archiveCmd market.initialized.poolCid *> createCmd pool with
+      treasuryFeeAmount = amountOf (maxReserveAtoms - 1)
+      stableFeeAmount = amountOf (maxReserveAtoms - 1)
+  legacy <- initializePool fixture "legacy-fee-cap" (amountOf 5000000) (amountOf 10000000)
+  Some legacyPool <- queryContractId fixture.operator legacy.poolCid
+  legacyNearCapCid <- submit (actAs [fixture.operator, fixture.governance]) $
+    archiveCmd legacy.poolCid *> createCmd legacyPool with
+      treasuryFeeAmount = amountOf (maxReserveAtoms - 1)
+      stableFeeAmount = amountOf (maxReserveAtoms - 1)
+  _ <- assertSameAccounting fixture.operator nearCapCid legacyNearCapCid
+  let swapBoth securePoolCid legacyPoolCid direction = do
+        (reserveIn, reserveOut) <- oriented direction <$> reserveAtomsOf market securePoolCid
+        let issue = if direction == TreasuryForStable then issueTreasury else issueStable
+        secureIn <- issue fixture trader (amountOf 1000)
+        legacyIn <- issue fixture trader (amountOf 1000)
+        secureResult <- settleSwap market trader securePoolCid direction secureIn 1000 (swapOutputAtoms reserveIn reserveOut 1000)
+        legacyResult <- submitDirectSwap fixture legacyPoolCid trader direction legacyIn (amountOf 1000) 0.0
+        legacyResult.amountOut === secureResult.amountOut
+        accounting <- assertSameAccounting fixture.operator secureResult.poolCid legacyResult.poolCid
+        pure (secureResult.poolCid, legacyResult.poolCid, accounting)
+  (secure1, legacy1, first) <- swapBoth nearCapCid legacyNearCapCid TreasuryForStable
+  (first.treasuryFeeAtoms, first.stableFeeAtoms) === (maxReserveAtoms, maxReserveAtoms - 1)
+  (secure2, legacy2, second) <- swapBoth secure1 legacy1 TreasuryForStable
+  (second.treasuryFeeAtoms, second.stableFeeAtoms) === (maxReserveAtoms, maxReserveAtoms - 1)
+  (_, _, third) <- swapBoth secure2 legacy2 StableForTreasury
+  (third.treasuryFeeAtoms, third.stableFeeAtoms) === (maxReserveAtoms, maxReserveAtoms)
+
+-- Auditors and privacy after settlement. Expected: like the legacy pool, the pool auditor
+-- observes the pool state, every position and (as the holdings' auditor) both reserves and every
+-- payout, and stops seeing a state once it is consumed; the auditor can authorize nothing.
+-- Unlike the legacy pool, the custodian and both issuers sign, and so see, every pool state,
+-- reserve and position. Traders and outsiders see none of them without disclosure. The reserve's
+-- standard view reports the custodian, the exact amount and a lock held by the four core signers.
+secureAuditorsAndStakeholdersSeeWhatLegacyAuditorsSee : Script ()
+secureAuditorsAndStakeholdersSeeWhatLegacyAuditorsSee = do
+  market <- standardSecureMarket "secure-audit"
+  let fixture = market.fixture
+  legacy <- initializePool fixture "legacy-audit" (amountOf 5000000) (amountOf 10000000)
+  secureIn <- issueTreasury fixture fixture.trader (amountOf 1000)
+  legacyIn <- issueTreasury fixture fixture.trader (amountOf 1000)
+  swapped <- settleSwap market fixture.trader market.initialized.poolCid TreasuryForStable secureIn 1000 1993
+  legacySwapped <- submitDirectSwap fixture legacy.poolCid fixture.trader TreasuryForStable legacyIn (amountOf 1000) 0.0
+  (pool, _, _) <- checkSecurePool market swapped.poolCid
+  Some legacyPool <- queryContractId fixture.operator legacySwapped.poolCid
+  let securePoolSeen party = do
+        poolSeen <- sees party swapped.poolCid
+        treasurySeen <- sees party pool.treasuryReserveCid
+        stableSeen <- sees party pool.stableReserveCid
+        positionSeen <- sees party market.initialized.positionCid
+        pure (poolSeen, treasurySeen, stableSeen, positionSeen)
+  let legacyPoolSeen party = do
+        poolSeen <- sees party legacySwapped.poolCid
+        treasurySeen <- sees party legacyPool.treasuryReserveHoldingCid
+        stableSeen <- sees party legacyPool.stableReserveHoldingCid
+        positionSeen <- sees party legacy.positionCid
+        pure (poolSeen, treasurySeen, stableSeen, positionSeen)
+  securePoolSeen fixture.auditor >>= (=== (True, True, True, True))
+  legacyPoolSeen fixture.auditor >>= (=== (True, True, True, True))
+  sees fixture.auditor swapped.outputHoldingCid >>= (=== True)
+  sees fixture.auditor legacySwapped.outputHoldingCid >>= (=== True)
+  sees fixture.auditor market.initialized.poolCid >>= (=== False)
+  sees fixture.auditor legacy.poolCid >>= (=== False)
+  forA_ (fixture.governance :: coreOf market) $ securePoolSeen >=> (=== (True, True, True, True))
+  forA_ [fixture.treasuryIssuer, fixture.stableIssuer] $ \issuer -> do
+    (legacyPoolVisible, _, _, legacyPositionVisible) <- legacyPoolSeen issuer
+    (legacyPoolVisible, legacyPositionVisible) === (False, False)
+  forA_ [fixture.trader, fixture.other] $ securePoolSeen >=> (=== (False, False, False, False))
+  securePoolSeen fixture.provider >>= (=== (False, False, False, True))
+
+  disclosures <- secureDisclosures market swapped.poolCid
+  auditorArchive <- trySubmit (actAs fixture.auditor <> discloseMany disclosures) $ archiveCmd pool.treasuryReserveCid
+  assertAuthorizationError auditorArchive
+  auditorRemove <- trySubmit (actAs fixture.auditor <> discloseMany disclosures) $ exerciseCmd swapped.poolCid RemoveLiquidity with
+    provider = fixture.provider
+    positionCid = market.initialized.positionCid
+    burnShares = amountOf 1000
+    minimumTreasuryOut = 0.0
+    minimumStableOut = 0.0
+    expectedVersion = pool.stateVersion
+  assertAuthorizationError auditorRemove
+
+  Some view <- queryInterfaceContractId @TokenStandard.Holding fixture.auditor
+    (toInterfaceContractId @TokenStandard.Holding pool.treasuryReserveCid)
+  view.owner === market.custodian
+  view.instrumentId === standardInstrumentId fixture.treasuryInstrument
+  atomsOf view.amount === 5001000
+  view.lock === Some TokenStandard.Lock with
+    holders = coreOf market
+    expiresAt = None
+    expiresAfter = None
+    context = Some "AMM pool reserve; moves only through pool settlement"
+  view.meta === Metadata with values = TextMap.fromList [("canton-treasury-amm/charter-reference", "secure-audit")]
+  Some payoutView <- queryInterfaceContractId @TokenStandard.Holding fixture.trader
+    (toInterfaceContractId @TokenStandard.Holding swapped.outputHoldingCid)
+  payoutView.lock === None
+
+-- A deposit that discloses to different auditors than the reserve, the case the legacy reserve
+-- `Merge` rejects. Expected: `amm/incompatible-holdings` from both the secure and the legacy
+-- swap, for the secure liquidity leg as well, and no state change.
+depositsWithForeignAuditorsAreRejectedLikeLegacy : Script ()
+depositsWithForeignAuditorsAreRejectedLikeLegacy = do
+  market <- standardSecureMarket "secure-auditor-mismatch"
+  let fixture = market.fixture
+  legacy <- initializePool fixture "legacy-auditor-mismatch" (amountOf 5000000) (amountOf 10000000)
+  let unaudited owner instrument atoms = submit instrument.issuer $ createCmd Holding with
+        instrument
+        owner
+        amount = amountOf atoms
+        auditors = []
+  secureIn <- unaudited fixture.trader fixture.treasuryInstrument 1000
+  legacyIn <- unaudited fixture.trader fixture.treasuryInstrument 1000
+  disclosures <- secureDisclosures market market.initialized.poolCid
+  deadline <- futureDeadline
+  rejectsWith market (assertFailureId incompatibleHoldingsError) $
+    trySubmit (actAs fixture.trader <> discloseMany disclosures) $
+      swapCommand market.initialized.poolCid fixture.trader TreasuryForStable secureIn 1000 0 deadline 0
+  legacyDisclosures <- poolDisclosures fixture legacy.poolCid
+  legacyResult <- trySubmit (actAs fixture.trader <> discloseMany legacyDisclosures) $
+    exerciseCmd legacy.poolCid Legacy.SwapExactInput with
+      trader = fixture.trader
+      direction = TreasuryForStable
+      inputHoldingCid = legacyIn
+      inputAmount = amountOf 1000
+      minimumAmountOut = 0.0
+      deadline
+      expectedVersion = 0
+  assertFailureId incompatibleHoldingsError legacyResult
+  treasuryCid <- issueTreasury fixture market.secondProvider (amountOf 500000)
+  stableCid <- unaudited market.secondProvider fixture.stableInstrument 1000000
+  rejectsWith market (assertFailureId incompatibleHoldingsError) $
+    trySubmit (actAs market.secondProvider <> discloseMany disclosures) $
+      exerciseCmd market.initialized.poolCid AddLiquidity with
+        provider = market.secondProvider
+        treasuryHoldingCid = treasuryCid
+        stableHoldingCid = stableCid
+        maximumTreasury = amountOf 500000
+        maximumStable = amountOf 1000000
+        minimumShares = 0.0
+        expectedVersion = 0

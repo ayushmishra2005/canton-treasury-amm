@@ -1,0 +1,366 @@
+-- Shared support for the Secure V1 production tests. Legitimate transitions go through
+-- settlement helpers that check every amount, contract ID, fee counter and total before and
+-- after; rejections compare a full ledger snapshot before and after.
+module CantonTreasuryAmm.Test.SecureV1Support where
+
+import DA.Assert ((===))
+import DA.Foldable (mapA_)
+import DA.List (sortOn)
+import DA.Optional (isNone)
+import Daml.Script
+
+import CantonTreasuryAmm.Math
+import CantonTreasuryAmm.Pool qualified as Legacy
+import CantonTreasuryAmm.SecureV1.Pool
+import CantonTreasuryAmm.Test.Fixtures
+import CantonTreasuryAmm.Token
+import CantonTreasuryAmm.Types
+
+data SecureMarket = SecureMarket with
+  fixture : Fixture
+  custodian : Party
+  secondProvider : Party
+  lineage : SecureLineage
+  charterCid : ContractId SecurePoolCharter
+  initialized : SecureInitializeResult
+
+secureLineageFor : Fixture -> Party -> Text -> SecureLineage
+secureLineageFor fixture custodian charterReference = SecureLineage with
+  custodian
+  operator = fixture.operator
+  governance = fixture.governance
+  treasuryInstrument = fixture.treasuryInstrument
+  stableInstrument = fixture.stableInstrument
+  charterReference
+
+-- Allocates the custodian and a second provider on top of the shared fixture, has the core
+-- create a charter that the auditor observes, and has the provider initialize it.
+openSecureMarket : Text -> Int -> Int -> Script SecureMarket
+openSecureMarket charterReference treasuryAtoms stableAtoms = do
+  fixture <- setup
+  custodian <- allocateParty "SecureCustodian"
+  secondProvider <- allocateParty "SecondProvider"
+  let lineage = secureLineageFor fixture custodian charterReference
+  charterCid <- createCharter fixture lineage
+  treasuryHoldingCid <- issueTreasury fixture fixture.provider (amountOf treasuryAtoms)
+  stableHoldingCid <- issueStable fixture fixture.provider (amountOf stableAtoms)
+  initialized <- submit fixture.provider $ exerciseCmd charterCid InitializePool with
+    treasuryHoldingCid
+    stableHoldingCid
+    treasuryAmount = amountOf treasuryAtoms
+    stableAmount = amountOf stableAtoms
+  pure SecureMarket with fixture; custodian; secondProvider; lineage; charterCid; initialized
+
+createCharter : Fixture -> SecureLineage -> Script (ContractId SecurePoolCharter)
+createCharter fixture lineage = submit (actAs (coreSignatories lineage)) $ createCmd SecurePoolCharter with
+  lineage
+  initialProvider = fixture.provider
+  auditors = [fixture.auditor]
+
+standardSecureMarket : Text -> Script SecureMarket
+standardSecureMarket charterReference = openSecureMarket charterReference 5000000 10000000
+
+coreOf : SecureMarket -> [Party]
+coreOf market = coreSignatories market.lineage
+
+-- Every party that can authorize anything over the pool: the four core signers and governance.
+privilegedOf : SecureMarket -> [Party]
+privilegedOf market = market.lineage.governance :: coreOf market
+
+coversCore : SecureMarket -> [Party] -> Bool
+coversCore market parties = all (`elem` parties) (coreOf market)
+
+secureDisclosures : SecureMarket -> ContractId SecurePool -> Script [Disclosure]
+secureDisclosures market poolCid = do
+  Some pool <- queryContractId market.custodian poolCid
+  poolDisclosure <- disclosureOf market.custodian poolCid
+  treasuryDisclosure <- disclosureOf market.custodian pool.treasuryReserveCid
+  stableDisclosure <- disclosureOf market.custodian pool.stableReserveCid
+  pure [poolDisclosure, treasuryDisclosure, stableDisclosure]
+
+assertArchived : (Template t, HasEnsure t) => Party -> ContractId t -> Script ()
+assertArchived reader cid = do
+  result <- queryContractId reader cid
+  assertMsg "Expected the contract to be archived" (isNone result)
+
+data Totals = Totals with
+  treasury : Int
+  stable : Int
+    deriving (Eq, Show)
+
+-- Ordinary holdings (including legacy operator-owned reserves) plus protected reserves, read by
+-- each issuer, which signs both templates.
+totalsFor : Fixture -> Script Totals
+totalsFor fixture = do
+  treasury <- instrumentUnits fixture.treasuryInstrument
+  stable <- instrumentUnits fixture.stableInstrument
+  pure Totals with treasury; stable
+
+totalsOf : SecureMarket -> Script Totals
+totalsOf market = totalsFor market.fixture
+
+instrumentUnits : InstrumentId -> Script Int
+instrumentUnits instrument = do
+  holdings <- query @Holding instrument.issuer
+  reserves <- query @SecureReserveHolding instrument.issuer
+  pure $
+    sum [atomsOf holding.amount | (_, holding) <- holdings, holding.instrument == instrument]
+      + sum [atomsOf reserve.amount | (_, reserve) <- reserves, reserve.instrument == instrument]
+
+holdingAtoms : Party -> InstrumentId -> Script Int
+holdingAtoms owner instrument = do
+  holdings <- query @Holding instrument.issuer
+  pure (sum [atomsOf holding.amount | (_, holding) <- holdings, holding.owner == owner, holding.instrument == instrument])
+
+data Snapshot = Snapshot with
+  pools : [(ContractId SecurePool, SecurePool)]
+  reserves : [(ContractId SecureReserveHolding, SecureReserveHolding)]
+  positions : [(ContractId SecureLiquidityPosition, SecureLiquidityPosition)]
+  charters : [(ContractId SecurePoolCharter, SecurePoolCharter)]
+  holdings : [(ContractId Holding, Holding)]
+  totals : Totals
+    deriving (Eq, Show)
+
+snapshotOf : SecureMarket -> Script Snapshot
+snapshotOf market = do
+  pools <- query @SecurePool market.custodian
+  reserves <- query @SecureReserveHolding market.custodian
+  positions <- query @SecureLiquidityPosition market.custodian
+  charters <- query @SecurePoolCharter market.custodian
+  treasuryHoldings <- query @Holding market.fixture.treasuryIssuer
+  stableHoldings <- query @Holding market.fixture.stableIssuer
+  totals <- totalsOf market
+  pure Snapshot with
+    pools = sortOn (show . fst) pools
+    reserves = sortOn (show . fst) reserves
+    positions = sortOn (show . fst) positions
+    charters = sortOn (show . fst) charters
+    holdings = sortOn (show . fst) (treasuryHoldings ++ stableHoldings)
+    totals
+
+assertUnchanged : SecureMarket -> Snapshot -> Script ()
+assertUnchanged market before = do
+  after <- snapshotOf market
+  after === before
+
+rejectsWith : SecureMarket -> (Either SubmitError a -> Script ()) -> Script (Either SubmitError a) -> Script ()
+rejectsWith market check submission = do
+  before <- snapshotOf market
+  submission >>= check
+  assertUnchanged market before
+
+-- The pool's genesis has exactly one active state; its two references are exactly the live
+-- reserves of that genesis, of the right instruments and auditors, with the recorded amounts; LP
+-- supply reconciles with the positions; and the custodian keeps no ordinary holding.
+checkSecurePool : SecureMarket -> ContractId SecurePool -> Script (SecurePool, SecureReserveHolding, SecureReserveHolding)
+checkSecurePool market poolCid = do
+  let genesis = market.charterCid
+  pools <- query @SecurePool market.custodian
+  [cid | (cid, state) <- pools, state.genesisCid == genesis] === [poolCid]
+  Some pool <- queryContractId market.custodian poolCid
+  pool.lineage === market.lineage
+  pool.auditors === [market.fixture.auditor]
+  pool.lockedShares === amountOf lockedSharesAtoms
+  reserves <- query @SecureReserveHolding market.custodian
+  sortOn show [cid | (cid, reserve) <- reserves, reserve.genesisCid == genesis]
+    === sortOn show [pool.treasuryReserveCid, pool.stableReserveCid]
+  Some treasuryReserve <- queryContractId market.custodian pool.treasuryReserveCid
+  Some stableReserve <- queryContractId market.custodian pool.stableReserveCid
+  (treasuryReserve.instrument, stableReserve.instrument) === (market.lineage.treasuryInstrument, market.lineage.stableInstrument)
+  (treasuryReserve.lineage, stableReserve.lineage) === (market.lineage, market.lineage)
+  (treasuryReserve.auditors, stableReserve.auditors) === ([market.fixture.auditor], [market.fixture.auditor])
+  (treasuryReserve.amount, stableReserve.amount) === (pool.treasuryReserveAmount, pool.stableReserveAmount)
+  positions <- query @SecureLiquidityPosition market.custodian
+  let positionAtoms = sum [atomsOf position.shares | (_, position) <- positions, position.genesisCid == genesis]
+  atomsOf pool.totalShares === positionAtoms + lockedSharesAtoms
+  custodianTreasury <- holdingAtoms market.custodian market.lineage.treasuryInstrument
+  custodianStable <- holdingAtoms market.custodian market.lineage.stableInstrument
+  (custodianTreasury, custodianStable) === (0, 0)
+  pure (pool, treasuryReserve, stableReserve)
+
+reserveAtomsOf : SecureMarket -> ContractId SecurePool -> Script (Int, Int)
+reserveAtomsOf market poolCid = do
+  (_, treasuryReserve, stableReserve) <- checkSecurePool market poolCid
+  pure (atomsOf treasuryReserve.amount, atomsOf stableReserve.amount)
+
+oriented : SwapDirection -> (Int, Int) -> (Int, Int)
+oriented TreasuryForStable reserves = reserves
+oriented StableForTreasury (treasuryAtoms, stableAtoms) = (stableAtoms, treasuryAtoms)
+
+instrumentsFor : SecureMarket -> SwapDirection -> (InstrumentId, InstrumentId)
+instrumentsFor market TreasuryForStable = (market.lineage.treasuryInstrument, market.lineage.stableInstrument)
+instrumentsFor market StableForTreasury = (market.lineage.stableInstrument, market.lineage.treasuryInstrument)
+
+swapCommand : ContractId SecurePool -> Party -> SwapDirection -> ContractId Holding -> Int -> Int -> Time -> Int -> Commands SecureSwapResult
+swapCommand poolCid trader direction inputHoldingCid inputAtoms minimumOutAtoms deadline expectedVersion =
+  exerciseCmd poolCid SwapExactInput with
+    trader
+    direction
+    inputHoldingCid
+    inputAmount = amountOf inputAtoms
+    minimumAmountOut = amountOf minimumOutAtoms
+    deadline
+    expectedVersion
+
+-- The reporting fields a legacy and a secure pool state share, for step-by-step comparison.
+data PoolAccounting = PoolAccounting with
+  treasuryReserveAtoms : Int
+  stableReserveAtoms : Int
+  totalShareAtoms : Int
+  lockedShareAtoms : Int
+  treasuryFeeAtoms : Int
+  stableFeeAtoms : Int
+  stateVersion : Int
+    deriving (Eq, Show)
+
+secureAccounting : SecurePool -> PoolAccounting
+secureAccounting pool = PoolAccounting with
+  treasuryReserveAtoms = atomsOf pool.treasuryReserveAmount
+  stableReserveAtoms = atomsOf pool.stableReserveAmount
+  totalShareAtoms = atomsOf pool.totalShares
+  lockedShareAtoms = atomsOf pool.lockedShares
+  treasuryFeeAtoms = atomsOf pool.treasuryFeeAmount
+  stableFeeAtoms = atomsOf pool.stableFeeAmount
+  stateVersion = pool.stateVersion
+
+legacyAccounting : Legacy.Pool -> PoolAccounting
+legacyAccounting pool = PoolAccounting with
+  treasuryReserveAtoms = atomsOf pool.treasuryReserveAmount
+  stableReserveAtoms = atomsOf pool.stableReserveAmount
+  totalShareAtoms = atomsOf pool.totalShares
+  lockedShareAtoms = atomsOf pool.lockedShares
+  treasuryFeeAtoms = atomsOf pool.treasuryFeeAmount
+  stableFeeAtoms = atomsOf pool.stableFeeAmount
+  stateVersion = pool.stateVersion
+
+-- A swap by its trader over its own holding, with the minimum output set to the expected amount.
+settleSwap : SecureMarket -> Party -> ContractId SecurePool -> SwapDirection -> ContractId Holding -> Int -> Int -> Script SecureSwapResult
+settleSwap market trader poolCid direction inputCid inputAtoms expectedOut = do
+  (pool, treasuryReserve, stableReserve) <- checkSecurePool market poolCid
+  let (reserveIn, reserveOut) = oriented direction (atomsOf treasuryReserve.amount, atomsOf stableReserve.amount)
+  let (inputInstrument, outputInstrument) = instrumentsFor market direction
+  Some input <- queryContractId trader inputCid
+  inputHeld <- holdingAtoms trader inputInstrument
+  outputHeld <- holdingAtoms trader outputInstrument
+  totals <- totalsOf market
+  disclosures <- secureDisclosures market poolCid
+  deadline <- futureDeadline
+  result <- submit (actAs trader <> discloseMany disclosures) $
+    swapCommand poolCid trader direction inputCid inputAtoms expectedOut deadline pool.stateVersion
+  result.amountOut === amountOf expectedOut
+  (next, _, _) <- checkSecurePool market result.poolCid
+  next.stateVersion === pool.stateVersion + 1
+  next.totalShares === pool.totalShares
+  let feeAtoms = (inputAtoms * 3 + 999) / 1000
+  case direction of
+    TreasuryForStable -> (atomsOf next.treasuryFeeAmount, next.stableFeeAmount)
+      === (min maxReserveAtoms (atomsOf pool.treasuryFeeAmount + feeAtoms), pool.stableFeeAmount)
+    StableForTreasury -> (atomsOf next.stableFeeAmount, next.treasuryFeeAmount)
+      === (min maxReserveAtoms (atomsOf pool.stableFeeAmount + feeAtoms), pool.treasuryFeeAmount)
+  mapA_ (assertArchived market.custodian) [pool.treasuryReserveCid, pool.stableReserveCid]
+  assertArchived market.custodian poolCid
+  (nextIn, nextOut) <- oriented direction <$> reserveAtomsOf market result.poolCid
+  (nextIn, nextOut) === (reserveIn + inputAtoms, reserveOut - expectedOut)
+  adjustedInvariantHolds reserveIn reserveOut inputAtoms expectedOut === True
+  rawInvariantGrows reserveIn reserveOut inputAtoms expectedOut === True
+  assertArchived trader inputCid
+  case result.inputChangeHoldingCid of
+    Some changeCid -> do
+      Some change <- queryContractId trader changeCid
+      (change.owner, change.instrument, change.auditors) === (trader, inputInstrument, input.auditors)
+      atomsOf change.amount === atomsOf input.amount - inputAtoms
+    None -> atomsOf input.amount === inputAtoms
+  Some output <- queryContractId trader result.outputHoldingCid
+  (output.owner, output.instrument, output.auditors) === (trader, outputInstrument, [market.fixture.auditor])
+  atomsOf output.amount === expectedOut
+  holdingAtoms trader inputInstrument >>= (=== inputHeld - inputAtoms)
+  holdingAtoms trader outputInstrument >>= (=== outputHeld + expectedOut)
+  totalsOf market >>= (=== totals)
+  pure result
+
+settleAdd : SecureMarket -> Party -> ContractId SecurePool -> ContractId Holding -> ContractId Holding -> Int -> Int -> Int -> Int -> Int -> Script SecureAddLiquidityResult
+settleAdd market provider poolCid treasuryCid stableCid maximumTreasury maximumStable expectedMint expectedTreasury expectedStable = do
+  (pool, _, _) <- checkSecurePool market poolCid
+  (treasuryReserve, stableReserve) <- reserveAtomsOf market poolCid
+  treasuryHeld <- holdingAtoms provider market.lineage.treasuryInstrument
+  stableHeld <- holdingAtoms provider market.lineage.stableInstrument
+  positionsBefore <- query @SecureLiquidityPosition market.custodian
+  totals <- totalsOf market
+  disclosures <- secureDisclosures market poolCid
+  result <- submit (actAs provider <> discloseMany disclosures) $ exerciseCmd poolCid AddLiquidity with
+    provider
+    treasuryHoldingCid = treasuryCid
+    stableHoldingCid = stableCid
+    maximumTreasury = amountOf maximumTreasury
+    maximumStable = amountOf maximumStable
+    minimumShares = amountOf expectedMint
+    expectedVersion = pool.stateVersion
+  (result.mintedShares, result.usedTreasury, result.usedStable)
+    === (amountOf expectedMint, amountOf expectedTreasury, amountOf expectedStable)
+  (next, _, _) <- checkSecurePool market result.poolCid
+  next.stateVersion === pool.stateVersion + 1
+  atomsOf next.totalShares === atomsOf pool.totalShares + expectedMint
+  (next.treasuryFeeAmount, next.stableFeeAmount) === (pool.treasuryFeeAmount, pool.stableFeeAmount)
+  reserveAtomsOf market result.poolCid >>= (=== (treasuryReserve + expectedTreasury, stableReserve + expectedStable))
+  mapA_ (assertArchived market.custodian) [pool.treasuryReserveCid, pool.stableReserveCid]
+  assertArchived market.custodian poolCid
+  mapA_ (assertArchived provider) [treasuryCid, stableCid]
+  Some position <- queryContractId provider result.positionCid
+  (position.provider, position.genesisCid, position.lineage, position.auditors)
+    === (provider, market.charterCid, market.lineage, [market.fixture.auditor])
+  atomsOf position.shares === expectedMint
+  positionsAfter <- query @SecureLiquidityPosition market.custodian
+  sortOn (show . fst) positionsAfter === sortOn (show . fst) ((result.positionCid, position) :: positionsBefore)
+  holdingAtoms provider market.lineage.treasuryInstrument >>= (=== treasuryHeld - expectedTreasury)
+  holdingAtoms provider market.lineage.stableInstrument >>= (=== stableHeld - expectedStable)
+  totalsOf market >>= (=== totals)
+  pure result
+
+settleRemove : SecureMarket -> Party -> ContractId SecurePool -> ContractId SecureLiquidityPosition -> Int -> Int -> Int -> Script SecureRemoveLiquidityResult
+settleRemove market provider poolCid positionCid burnAtoms expectedTreasury expectedStable = do
+  (pool, _, _) <- checkSecurePool market poolCid
+  (treasuryReserve, stableReserve) <- reserveAtomsOf market poolCid
+  Some position <- queryContractId provider positionCid
+  treasuryHeld <- holdingAtoms provider market.lineage.treasuryInstrument
+  stableHeld <- holdingAtoms provider market.lineage.stableInstrument
+  positionsBefore <- query @SecureLiquidityPosition market.custodian
+  totals <- totalsOf market
+  disclosures <- secureDisclosures market poolCid
+  result <- submit (actAs provider <> discloseMany disclosures) $ exerciseCmd poolCid RemoveLiquidity with
+    provider
+    positionCid
+    burnShares = amountOf burnAtoms
+    minimumTreasuryOut = amountOf expectedTreasury
+    minimumStableOut = amountOf expectedStable
+    expectedVersion = pool.stateVersion
+  (result.treasuryOut, result.stableOut) === (amountOf expectedTreasury, amountOf expectedStable)
+  (next, _, _) <- checkSecurePool market result.poolCid
+  next.stateVersion === pool.stateVersion + 1
+  atomsOf next.totalShares === atomsOf pool.totalShares - burnAtoms
+  (next.treasuryFeeAmount, next.stableFeeAmount) === (pool.treasuryFeeAmount, pool.stableFeeAmount)
+  reserveAtomsOf market result.poolCid >>= (=== (treasuryReserve - expectedTreasury, stableReserve - expectedStable))
+  assertArchived market.custodian poolCid
+  assertArchived provider positionCid
+  remaining <- case result.remainingPositionCid of
+    Some remainingCid -> do
+      Some remainder <- queryContractId provider remainingCid
+      remainder === position with shares = amountOf (atomsOf position.shares - burnAtoms)
+      pure [(remainingCid, remainder)]
+    None -> do
+      atomsOf position.shares === burnAtoms
+      pure []
+  positionsAfter <- query @SecureLiquidityPosition market.custodian
+  sortOn (show . fst) positionsAfter
+    === sortOn (show . fst) (remaining ++ filter ((/= positionCid) . fst) positionsBefore)
+  let checkPayout payoutCid instrument atoms = case payoutCid of
+        Some cid -> do
+          Some payout <- queryContractId provider cid
+          (payout.owner, payout.instrument, atomsOf payout.amount, payout.auditors)
+            === (provider, instrument, atoms, [market.fixture.auditor])
+        None -> atoms === 0
+  checkPayout result.treasuryOutputHoldingCid market.lineage.treasuryInstrument expectedTreasury
+  checkPayout result.stableOutputHoldingCid market.lineage.stableInstrument expectedStable
+  holdingAtoms provider market.lineage.treasuryInstrument >>= (=== treasuryHeld + expectedTreasury)
+  holdingAtoms provider market.lineage.stableInstrument >>= (=== stableHeld + expectedStable)
+  totalsOf market >>= (=== totals)
+  pure result

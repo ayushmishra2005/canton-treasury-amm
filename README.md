@@ -52,9 +52,15 @@ Traders are not permanent pool observers. Read visibility is supplied per transa
 
 ## Trust model
 
-The operator owns the reserve `Holding` contracts. Holding transfers are controlled by the owner, so the operator can transfer or archive a reserve outside any `Pool` choice. Governance is required to create `Pool` state but does not prevent that unilateral movement. Moving or archiving a referenced reserve bricks the affected pool state, and the resulting failure may surface as an engine-level inactive-contract error rather than a domain rejection.
+This section describes the legacy MVP templates (`Pool`, `LiquidityPosition`, `SwapIntent`), which are not a secure reserve model. The operator owns the reserve `Holding` contracts. Holding transfers are controlled by the owner, so the operator can transfer or archive a reserve outside any `Pool` choice. Governance is required to create `Pool` state but does not prevent that unilateral movement. Moving or archiving a referenced reserve bricks the affected pool state, and the resulting failure may surface as an engine-level inactive-contract error rather than a domain rejection.
 
 This MVP therefore trusts the operator as reserve custodian. It also trusts the operator and governance not to collude: jointly they can create arbitrary `Pool` and `LiquidityPosition` state, including share supplies that dilute existing providers. The model deliberately contains no recovery mechanism for either case.
+
+## Secure V1 pool
+
+`CantonTreasuryAmm.SecureV1.Pool` and `CantonTreasuryAmm.SecureV1.SwapIntent` are a parallel implementation with protected reserves. Every pool state, reserve and LP position is signed by an independent custodian, the operator and both issuers. Reserves have no choices and change only inside the pool's own swap and liquidity choices, which bind them to the pool's lineage and genesis. Governance observes but holds no reserve authority, and no coalition smaller than those four signers can move reserves, forge positions or settle in another party's name. That full coalition remains trusted. Pricing, rounding, both fee counters, auditor visibility and the swap-intent roles match the legacy pool, which the tests check step by step. Arbitrary Token Standard holdings are not supported as reserves or deposits.
+
+Secure V1 is not deployed, and no migration from legacy pools is implemented. See [`daml/canton-treasury-amm/SECURE_V1.md`](daml/canton-treasury-amm/SECURE_V1.md) for the trust model, privacy changes, test coverage, migration impact and deployment prerequisites.
 
 ## Build and test
 
@@ -88,7 +94,7 @@ export PATH="$HOME/.dpm/bin:$PATH"
 dpm script --dar daml/canton-treasury-amm-tests/.daml/dist/canton-treasury-amm-tests-0.1.0.dar --all --ledger-host localhost --ledger-port 6865 --upload-dar true -w
 ```
 
-Restart the sandbox before uploading a changed DAR with the same package name and version. Canton uses wall-clock time; if static-time control is unavailable, only the expired-deadline script may be excluded with `--skip-script-name CantonTreasuryAmm.Test.SwapIntent:expiredDeadlinesRejectDirectSwapAndIntent`.
+Restart the sandbox before uploading a changed DAR with the same package name and version. Canton uses wall-clock time; if static-time control is unavailable, only the two expiry scripts may be excluded with `--skip-script-name CantonTreasuryAmm.Test.SwapIntent:expiredDeadlinesRejectDirectSwapAndIntent` and `--skip-script-name CantonTreasuryAmm.Test.SecureV1SwapIntent:secureIntentsCannotReplayGoStaleOrOutliveTheirDeadline`.
 
 ## License
 

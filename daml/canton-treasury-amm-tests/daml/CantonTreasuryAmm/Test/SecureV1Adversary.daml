@@ -1,0 +1,131 @@
+-- Test-only adversary templates for the Secure V1 production contracts. Any coalition can write,
+-- upload and sign contracts like these; their choices carry only the signers' and controllers'
+-- authority, so they show what that authority alone can reach. They are not part of the
+-- deployable production package.
+module CantonTreasuryAmm.Test.SecureV1Adversary where
+
+import CantonTreasuryAmm.SecureV1.Pool
+import CantonTreasuryAmm.Token
+import CantonTreasuryAmm.Types
+
+-- A pool-like state referencing genuine reserves, signed by forgers, that tries to pay out of a
+-- reserve with the production disbursement helper.
+template CounterfeitSecurePool
+  with
+    forgers : [Party]
+    reserveCid : ContractId SecureReserveHolding
+  where
+    signatory forgers
+
+    choice CounterfeitDrain : (ContractId Holding, ContractId SecureReserveHolding)
+      with
+        recipient : Party
+        payoutAtoms : Int
+      controller forgers
+      do
+        reserve <- fetch reserveCid
+        disburseReserve reserveCid reserve recipient payoutAtoms
+
+-- A generic standing authorization in the style of a custody mandate: the grantors
+-- pre-authorize the holder to draw from or retire any reserve.
+template SecureReserveMandate
+  with
+    grantors : [Party]
+    holder : Party
+  where
+    signatory grantors
+    observer holder
+
+    nonconsuming choice DrawReserve : (ContractId Holding, ContractId SecureReserveHolding)
+      with
+        reserveCid : ContractId SecureReserveHolding
+        recipient : Party
+        payoutAtoms : Int
+      controller holder
+      do
+        reserve <- fetch reserveCid
+        disburseReserve reserveCid reserve recipient payoutAtoms
+
+    nonconsuming choice RetireReserve : ()
+      with
+        reserveCid : ContractId SecureReserveHolding
+      controller holder
+      do archive reserveCid
+
+-- A standing authorization to burn LP positions outside `RemoveLiquidity`.
+template PositionBurner
+  with
+    grantors : [Party]
+    holder : Party
+  where
+    signatory grantors
+    observer holder
+
+    nonconsuming choice BurnOutsidePool : ()
+      with
+        positionCid : ContractId SecureLiquidityPosition
+      controller holder
+      do archive positionCid
+
+-- Signed by the operator and governance: tries to settle a swap in a victim trader's name, the
+-- way a forged intent would.
+template ForgedSwapExecutor
+  with
+    operator : Party
+    governance : Party
+  where
+    signatory operator, governance
+
+    nonconsuming choice SwapAsVictim : SecureSwapResult
+      with
+        poolCid : ContractId SecurePool
+        victim : Party
+        inputHoldingCid : ContractId Holding
+        inputAmount : Decimal
+        deadline : Time
+        expectedVersion : Int
+      controller operator
+      do
+        exercise poolCid SwapExactInput with
+          trader = victim
+          direction = TreasuryForStable
+          inputHoldingCid
+          inputAmount
+          minimumAmountOut = 0.0
+          deadline
+          expectedVersion
+
+-- Signed by the trader alone: settles a genuine swap, then fails later in the same transaction.
+template LateFailureProbe
+  with
+    trader : Party
+  where
+    signatory trader
+
+    nonconsuming choice SwapThenFail : ()
+      with
+        poolCid : ContractId SecurePool
+        inputHoldingCid : ContractId Holding
+        inputAmount : Decimal
+        followUpHoldingCid : ContractId Holding
+        deadline : Time
+        expectedVersion : Int
+      controller trader
+      do
+        first <- exercise poolCid SwapExactInput with
+          trader
+          direction = TreasuryForStable
+          inputHoldingCid
+          inputAmount
+          minimumAmountOut = 0.0
+          deadline
+          expectedVersion
+        _ <- exercise first.poolCid SwapExactInput with
+          trader
+          direction = TreasuryForStable
+          inputHoldingCid = followUpHoldingCid
+          inputAmount
+          minimumAmountOut = maxReserveAmount
+          deadline
+          expectedVersion = expectedVersion + 1
+        pure ()

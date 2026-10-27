@@ -51,6 +51,9 @@ reserveMismatchError = "amm/reserve-mismatch"
 invariantError : Text
 invariantError = "amm/invariant"
 
+poolMismatchError : Text
+poolMismatchError = "amm/pool-mismatch"
+
 reject : Text -> Text -> Update a
 reject errorId message =
   failWithStatus (FailureStatus errorId InvalidIndependentOfSystemState message TextMap.empty)

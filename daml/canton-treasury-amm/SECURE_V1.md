@@ -1,0 +1,223 @@
+# Secure V1 pool (protected live reserves)
+
+`CantonTreasuryAmm.SecureV1.Pool` and `CantonTreasuryAmm.SecureV1.SwapIntent` are a parallel,
+versioned implementation of the AMM in which pool reserves are protected contracts rather than
+operator-owned holdings. They integrate the Stage 2.1 "model B" prototype into the production
+package. The legacy `Pool`, `LiquidityPosition` and `SwapIntent` templates are unchanged apart
+from header comments and remain the legacy MVP model; they are not a secure reserve model.
+
+Nothing here is deployed, and no migration of existing contracts is implemented. See
+[Deployment prerequisites](#deployment-prerequisites).
+
+## Architecture and trust
+
+| Template | Signatories | Observers | Choices |
+| --- | --- | --- | --- |
+| `SecurePoolCharter` | custodian, operator, Treasury issuer, stablecoin issuer (the core) | initial provider, governance, pool auditors | `InitializePool` (initial provider), single use |
+| `SecurePool` | core | governance, pool auditors | `SwapExactInput` (trader), `AddLiquidity` (provider), `RemoveLiquidity` (provider) |
+| `SecureReserveHolding` | core | governance, holding auditors | none; implements `HoldingV1.Holding` as a view |
+| `SecureLiquidityPosition` | provider and core | governance, pool auditors | none |
+| `SecureSwapIntentFactory` | operator, governance | authorized traders, compliance observers | `SubmitSwapIntent` (trader), non-consuming |
+| `SecureSwapIntent` | trader, operator, governance | compliance observers | `Cancel` (trader), `Execute` (operator and governance) |
+
+- **Reserves have no choices.** Every reserve is archived and recreated only inside a pool
+  choice. Those choices run with the core's authority (the pool's signatories) and enforce the
+  pool's accounting transition in their own fixed body. No template in the package exposes an
+  externally exercisable choice that can pay out a reserve. Only the implicit `Archive` remains,
+  and it needs all four core signers.
+- **Binding.** Every reserve and position records the pool's `SecureLineage` and its genesis
+  (the charter's contract ID). Before every operation, each pool choice checks that both
+  referenced reserves are live reserves of its own lineage, genesis and instrument, and that
+  their amounts equal the pool's recorded amounts (`amm/reserve-mismatch`). `RemoveLiquidity`
+  accepts only positions of the same lineage and genesis (`amm/position`).
+- **Deposits** must be the depositor's own `Holding` of the reserve's instrument
+  (`amm/owner-mismatch`, `amm/instrument-mismatch`). They must also disclose to the same
+  auditors as the reserve (`amm/incompatible-holdings`), the condition the legacy reserve
+  `Merge` imposes. A deposit is moved to the custodian with the owner-controlled `TransferExact`
+  and retired in the same transaction, so the custodian never keeps an ordinary holding.
+- **Payouts** are new ordinary `Holding`s for the trader or the redeeming provider only, and
+  they disclose to the reserve's auditors. A payout never empties a reserve.
+- **Governance** observes everything but is not a signatory or controller of any reserve,
+  pool state or position. It has no reserve-spending authority.
+- **Trusted:** the full core coalition. Acting together, the four core signers can create pool
+  states, reserves and positions without backing, and redeem them. They can archive reserves,
+  which freezes the pool and destroys on-ledger value, and they can co-burn a position with its
+  provider. The tests demonstrate each of these. Every smaller coalition, including the
+  operator with governance, is rejected (all 31 subsets are tested).
+- **Unsupported:** ordinary `Holding`s as reserves, arbitrary Token Standard holdings,
+  third-party holding implementations, transfer instructions, allocations, and multi-input
+  settlement. `SecureReserveHolding`'s standard view reports the custodian as owner, the exact
+  amount, and a lock held by the core, with context "AMM pool reserve; moves only through pool
+  settlement". That view is informational only.
+
+## Operations
+
+Pricing, rounding and limits reuse the production `Math`, `Errors` and `Pool.validateSwap` code
+unchanged, as does the 30 bps fee (`997/1000`): payouts round down, contributions round up,
+the initial supply is `floor(sqrt(x*y))` with one locked share and a 10^6 minimum, and the
+reserve cap is 10^17 atoms.
+
+- `InitializePool` is controlled by the initial provider and runs once per charter. It checks
+  amounts, instruments, owners, balances and the minimum supply, then retires both deposits and
+  returns their change. It creates both reserves (with the deposits' auditors), the pool state
+  at version 0 with zero fee counters, and the provider's position.
+- `SwapExactInput` works in either direction. The trader is the controller and must own the
+  input holding; the payout goes to the trader. It checks the version, deadline, amounts, cap
+  and slippage. The input is absorbed into its reserve and the output is paid from the other.
+- `AddLiquidity` uses the legacy share formula and maxima, returns change, mints a new position
+  and leaves the fee counters unchanged.
+- `RemoveLiquidity` is controlled by the position's provider. It applies the locked-share guard
+  and the burn ≤ position check, archives the position and creates any remainder, pays the
+  provider, and leaves the fee counters unchanged.
+
+Every operation consumes the pool state and creates exactly one successor with
+`stateVersion + 1`.
+
+## Fee accounting equivalence
+
+`treasuryFeeAmount` and `stableFeeAmount` behave exactly as in the legacy `Pool`:
+- They start at 0.
+- A swap credits `ceil(input * 3 / 1000)` to the counter of the input instrument
+  (Treasury-for-stablecoin credits `treasuryFeeAmount`; stablecoin-for-Treasury credits
+  `stableFeeAmount`).
+- They saturate at the reserve cap.
+- Add and remove leave them unchanged.
+- Every successor carries them.
+
+The tests compare the secure and legacy pools after every step, field by field: both reserves,
+LP supply, the locked share, both counters and the version.
+
+| Step on a 5,000,000 / 10,000,000 pool | Output | Treasury fee | Stablecoin fee |
+| --- | --- | --- | --- |
+| Initialize | 7,071,066 shares (supply 7,071,067) | 0 | 0 |
+| Treasury → stablecoin 1,000 | 1,993 | 3 | 0 |
+| Stablecoin → Treasury 5,000 | 2,492 | 3 | 15 |
+| Add with maxima 500,000 / 1,000,000 | 706,894 shares for 499,701 / 1,000,000 | 3 | 15 |
+| Remove 353,553 | 249,925 / 500,149 | 3 | 15 |
+| Treasury → stablecoin 2,000 | 3,988 | 9 | 15 |
+| Remove 353,341 | 249,870 / 499,660 | 9 | 15 |
+| Remove 7,071,066 | 5,000,413 / 9,999,208 | 9 | 15 |
+
+The sequence ends with reserves 1 / 2, supply 1 (the locked share) and version 7, identical to
+the legacy pool. The rounding test covers inputs that are not multiples of 1000/3: inputs 1 and
+333 (Treasury to stablecoin) each credit 1, and 1,001 (stablecoin to Treasury) credits 4. With
+counters set to cap − 1, the input instrument's counter saturates and the other stays
+unchanged, exactly as in the legacy pool.
+
+## Auditors and privacy
+
+- **Pool auditors** are listed on the charter. They observe the charter, every pool state and
+  every position. Holding auditors come from the deposits: each reserve keeps its deposit's
+  auditors, and every payout discloses to them, as transfers out of a legacy reserve do. With
+  the standard fixtures, the auditor therefore sees the pool, both reserves, every position and
+  every payout, the same set it sees for the legacy pool.
+- **Auditors have no authority.** They are never signatories or controllers, and an auditor's
+  archive or removal attempt fails with `AuthorizationError`.
+- **Change from legacy:** the custodian and both issuers sign, and therefore see, every pool
+  state, reserve and position (provider identities and share amounts included). In the legacy
+  model, the issuers saw only the reserve holdings.
+- Traders and outsiders see nothing without explicit disclosure. A direct swap, add or remove
+  needs the pool and both reserves disclosed by a core party. `SecureSwapIntent` execution
+  needs the trader's input holding disclosed to the operator and governance.
+
+## Swap intents
+
+The roles are the same as in the legacy workflow. The factory validates the trader, amounts,
+cap and deadline. Only the trader cancels; only the operator and governance together execute.
+An intent is bound to the factory's lineage and genesis: `Execute` rejects any other pool
+(`amm/pool-mismatch`) and then runs the pool's `SwapExactInput` with the intent's trader,
+direction, amount, minimum output, deadline and expected version, so the payout goes to the
+trader.
+
+Tested rejections:
+- forged intents and forged executors (`AuthorizationError`);
+- a coerced non-pool contract (`WronglyTypedContract`);
+- replay of a consumed intent, and an intent whose pool state was replaced (`ContractNotFound`);
+- expiry (`amm/deadline`, needs static time);
+- slippage;
+- foreign input (`amm/owner-mismatch`);
+- single-controller execution and cancellation by anyone other than the trader
+  (`AuthorizationError`).
+
+As in the legacy workflow, the executors choose which of the trader's holdings to spend. It
+must be the trader's own holding of the input instrument with enough balance, and the change is
+returned to the trader.
+
+## Error classes in the tests
+
+| Class | Meaning |
+| --- | --- |
+| `AuthorizationError` | Missing signatory or controller authority. Every such case discloses the touched contracts, so it is not a visibility failure. |
+| `ContractNotFound` (consumed) | Replay of an archived contract. A Canton participant may report `LOCAL_VERDICT_INACTIVE_CONTRACTS` instead. |
+| `ContractNotFound` (visibility) | An active contract the submitter cannot see. Asserted separately: stale reserve disclosures cannot stand in for the live reserves. |
+| `WronglyTypedContract` | A Secure V1 contract passed to Stage 1.1 custody controls or to a legacy `Holding` choice. |
+| `FailureStatusError` | A domain rejection with a stable `amm/...` error ID. |
+
+## Tests
+
+- `SecureV1Lifecycle`: legacy equivalence for initialization, the full sequence, rounding and
+  saturation; auditors and privacy; the auditor-compatibility check.
+- `SecureV1Attacks`: attacks 1–16 and all 31 partial coalitions.
+- `SecureV1SwapIntent`: intents.
+
+Shared invariant and settlement checks live in `SecureV1Support`; test-only adversary
+templates are in `SecureV1Adversary`. After every transition, the checks cover:
+- exactly one active state per genesis;
+- reserve set and amounts;
+- instrument totals (ordinary holdings plus reserves);
+- the input instrument's fee counter, computed independently, with the other counter
+  unchanged;
+- raw and adjusted invariants;
+- LP supply reconciliation and the locked share;
+- archived predecessors and payout owners.
+
+Rejections compare the full ledger snapshot before and after. The Phase 0 legacy
+characterization tests and the Stage 1.1/2.1 prototype tests are kept as they were.
+
+`scripts/check-prototype-choice-surface.sh` also lists the compiled Secure V1 choices and fails
+on any change. It is a change-control check, not a semantic proof.
+
+## Migration impact
+
+No migration is implemented or authorized. Moving value from a legacy pool into Secure V1
+would involve the following:
+
+- **Schemas.** Legacy `Pool` and `LiquidityPosition` are signed by the operator and governance;
+  their reserves are operator-owned `Holding`s. Secure V1 states are signed by the four core
+  parties; positions also carry the provider's signature. There is no on-ledger conversion
+  between them, and none can be added without each LP's authority.
+- **Existing LP claims.** Legacy positions have no provider signature, so they cannot become
+  Secure V1 positions without the provider's consent. The safe path is for each LP to redeem
+  through the legacy `RemoveLiquidity` (provider-controlled) and deposit the proceeds through
+  `InitializePool` or `AddLiquidity`. The locked share and its dust stay in the legacy pool.
+- **Old operator-owned reserves.** The operator alone can still move them. Any direct transfer
+  of legacy reserves into a secure pool would bypass LP accounting and must not be used. Until
+  the legacy pool is drained, its reserves remain exposed to the Phase 0 operator-custody
+  weaknesses.
+- **Cutover authorization.** A new custodian party, the operator and both issuers must sign each
+  charter. The issuers newly become signatories (and confirmers) of every pool transaction.
+  Governance only observes.
+- **Off-ledger coordination.** Custodian onboarding; issuer approval to co-sign pool state; party
+  hosting and participant topology for all four core parties; LP communication of a withdrawal
+  window, price and slippage expectations; and a decision on the legacy pool's residual dust.
+- **Unavailable signers.** Every pool transaction needs confirmation from all four core
+  parties' participants. If any of them is unavailable, swaps and liquidity operations halt,
+  and there is no unilateral or governance bypass by design. This has not been tested on a
+  multi-participant topology.
+- **Rollback limits.** There is no on-ledger path back. LPs can exit a secure pool and re-enter
+  a legacy one, but the only emergency stop is archival by the full core, which destroys the
+  reserves' on-ledger value and requires off-ledger reissuance.
+- **Not implemented:** migration templates or scripts, legacy-pool pause or drain tooling,
+  position conversion, a package version bump, upgrade checks, multi-participant testing, and
+  any deployment.
+
+## Deployment prerequisites
+
+The Secure V1 modules are in the `canton-treasury-amm` 0.1.0 package, so this DAR has a
+different package ID from any previously built 0.1.0 DAR. It must not be uploaded alongside an
+existing 0.1.0 deployment. Before any deployment, choose one of these:
+- bump the version and pass the Smart Contract Upgrade checks for the unchanged legacy
+  templates; or
+- move Secure V1 into its own package.
+
+Either way, complete a security review of this stage and a multi-participant test.
