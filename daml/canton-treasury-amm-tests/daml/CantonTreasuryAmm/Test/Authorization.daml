@@ -1,6 +1,7 @@
 module CantonTreasuryAmm.Test.Authorization where
 
 import DA.Assert ((===))
+import DA.NonEmpty qualified as NonEmpty
 import Daml.Script
 
 import CantonTreasuryAmm.Errors
@@ -223,3 +224,91 @@ poolPrivacyRequiresExplicitDisclosure = do
   result <- submitDirectSwap fixture initialized.poolCid fixture.trader TreasuryForStable
     inputHoldingCid (amountOf 1000) 0.0
   atomsOf result.amountOut === 1993
+
+-- Characterizes CURRENT VULNERABLE BEHAVIOUR; it passes because the weakness exists.
+-- Attacker: the pool operator. Required authority: the operator alone, which owns both reserves
+-- because `Initialize` transfers them to `poolId.operator`, and `TransferExact` is controlled
+-- by `owner`. Neither governance nor any Pool choice is involved.
+-- Initial state: a legitimately initialized pool and a trader holding Treasury input.
+-- Attack: the operator transfers the entire stablecoin reserve to a party of its choosing.
+-- Expected: the transfer succeeds, the Pool stays active but references a consumed reserve, and
+-- every later swap against it fails at the engine level with `ContractNotFound` (not the domain
+-- `amm/stale-state` error, since the expected version is correct) without touching trader funds.
+-- Implication: reserve custody depends entirely on operator honesty; `validatePoolState` can
+-- only detect a diversion after the fact, so it yields pool liveness loss rather than protection.
+-- Limitation: shows a full single-reserve diversion by an operator party on the IDE ledger. It
+-- does not exercise partial diversion or `Merge`, issuer `Archive` authority, or governance.
+operatorAloneCanDivertReserveAndFreezePool : Script ()
+operatorAloneCanDivertReserveAndFreezePool = do
+  Initialized {fixture, initialized} <- standardPool
+  poolBefore <- assertActivePool fixture initialized.poolCid
+  let treasuryReserveCid = poolBefore.treasuryReserveHoldingCid
+  let stableReserveCid = poolBefore.stableReserveHoldingCid
+  Some treasuryReserveBefore <- queryContractId fixture.operator treasuryReserveCid
+  Some stableReserveBefore <- queryContractId fixture.operator stableReserveCid
+  stableReserveBefore.owner === fixture.operator
+  stableReserveBefore.amount === poolBefore.stableReserveAmount
+  stableTotalBefore <- instrumentTotalAtoms fixture fixture.stableInstrument
+  recipientHoldingsBefore <- query @Holding fixture.other
+  recipientHoldingsBefore === []
+
+  diversion <- submit fixture.operator $ exerciseCmd stableReserveCid TransferExact with
+    newOwner = fixture.other
+    transferAmount = stableReserveBefore.amount
+
+  stableReserveAfterDiversion <- queryContractId fixture.operator stableReserveCid
+  stableReserveAfterDiversion === None
+  diversion.changeHoldingCid === None
+  poolAfterDiversion <- assertActivePool fixture initialized.poolCid
+  poolAfterDiversion === poolBefore
+  poolAfterDiversion.stableReserveHoldingCid === stableReserveCid
+  Some divertedHolding <- queryContractId fixture.other diversion.movedHoldingCid
+  divertedHolding === (stableReserveBefore with owner = fixture.other)
+  stableTotalAfterDiversion <- instrumentTotalAtoms fixture fixture.stableInstrument
+  stableTotalAfterDiversion === stableTotalBefore
+
+  inputHoldingCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  Some inputHoldingBefore <- queryContractId fixture.trader inputHoldingCid
+  treasuryTotalBefore <- instrumentTotalAtoms fixture fixture.treasuryInstrument
+  poolDisclosure <- disclosureOf fixture.operator initialized.poolCid
+  treasuryReserveDisclosure <- disclosureOf fixture.operator treasuryReserveCid
+  deadline <- futureDeadline
+  let swap = exerciseCmd initialized.poolCid SwapExactInput with
+        trader = fixture.trader
+        direction = TreasuryForStable
+        inputHoldingCid
+        inputAmount = amountOf 1000
+        minimumAmountOut = 0.0
+        deadline
+        expectedVersion = poolBefore.stateVersion
+
+  disclosedAttempt <- trySubmit
+    (actAs fixture.trader <> discloseMany [poolDisclosure, treasuryReserveDisclosure]) swap
+  assertConsumedContract stableReserveCid disclosedAttempt
+  -- Reading as the operator rules out the trader merely lacking visibility of the reserve.
+  operatorVisibleAttempt <- trySubmit (actAs fixture.trader <> readAs fixture.operator) swap
+  assertConsumedContract stableReserveCid operatorVisibleAttempt
+
+  poolAfterSwap <- assertActivePool fixture initialized.poolCid
+  poolAfterSwap === poolBefore
+  Some treasuryReserveAfter <- queryContractId fixture.operator treasuryReserveCid
+  treasuryReserveAfter === treasuryReserveBefore
+  Some inputHoldingAfter <- queryContractId fixture.trader inputHoldingCid
+  inputHoldingAfter === inputHoldingBefore
+  traderHoldings <- query @Holding fixture.trader
+  map fst traderHoldings === [inputHoldingCid]
+  Some divertedHoldingAfter <- queryContractId fixture.other diversion.movedHoldingCid
+  divertedHoldingAfter === divertedHolding
+  operatorHoldings <- query @Holding fixture.operator
+  map fst operatorHoldings === [treasuryReserveCid]
+  treasuryTotalAfter <- instrumentTotalAtoms fixture fixture.treasuryInstrument
+  treasuryTotalAfter === treasuryTotalBefore
+  stableTotalAfter <- instrumentTotalAtoms fixture fixture.stableInstrument
+  stableTotalAfter === stableTotalBefore
+
+assertConsumedContract : ContractId t -> Either SubmitError a -> Script ()
+assertConsumedContract consumedCid result = case result of
+  Left ContractNotFound {unknownContractIds}
+    | show consumedCid `elem` NonEmpty.toList unknownContractIds -> pure ()
+  Left otherError -> abort ("Expected ContractNotFound for the consumed contract, got " <> show otherError)
+  Right _ -> abort "Expected the swap to fail on a consumed reserve"
