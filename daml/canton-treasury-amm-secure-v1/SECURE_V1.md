@@ -1,13 +1,21 @@
 # Secure V1 pool (protected live reserves)
 
-`CantonTreasuryAmm.SecureV1.Pool` and `CantonTreasuryAmm.SecureV1.SwapIntent` are a parallel,
-versioned implementation of the AMM in which pool reserves are protected contracts rather than
-operator-owned holdings. They integrate the Stage 2.1 "model B" prototype into the production
-package. The legacy `Pool`, `LiquidityPosition` and `SwapIntent` templates are unchanged apart
-from header comments and remain the legacy MVP model; they are not a secure reserve model.
+`CantonTreasuryAmm.SecureV1.Pool` and `CantonTreasuryAmm.SecureV1.SwapIntent` are a parallel
+implementation of the AMM in which pool reserves are protected contracts rather than
+operator-owned holdings. They are the Stage 2.1 "model B" prototype, productionized. They live
+in their own package, `canton-treasury-amm-secure-v1` 0.1.0, which data-depends on the legacy
+`canton-treasury-amm` 0.1.0 DAR (package ID `d8cadd3c…`) for `Holding`, `Math`, `Errors`,
+`Types` and `Pool.validateSwap`. The legacy package is byte-identical to its Phase 0 build. Its
+`Pool`, `LiquidityPosition` and `SwapIntent` templates remain the legacy MVP model, which is not
+a secure reserve model.
 
-Nothing here is deployed, and no migration of existing contracts is implemented. See
-[Deployment prerequisites](#deployment-prerequisites).
+Nothing here is deployed, audited or deployment-ready, and no migration of existing contracts is
+implemented. Related documents in this package:
+- [`SECURITY.md`](SECURITY.md): the legacy and Secure V1 security model, residual full-core
+  trust, emergency operations and Token Standard compatibility.
+- [`RELEASE_READINESS.md`](RELEASE_READINESS.md): packaging and coexistence, CI, multi-participant
+  Canton evidence, mutation testing and deployment blockers.
+- [`MIGRATION.md`](MIGRATION.md): the legacy-to-Secure V1 cutover design.
 
 ## Architecture and trust
 
@@ -140,8 +148,11 @@ Tested rejections:
   (`AuthorizationError`).
 
 As in the legacy workflow, the executors choose which of the trader's holdings to spend. It
-must be the trader's own holding of the input instrument with enough balance, and the change is
-returned to the trader.
+must be the trader's own holding of the input instrument, with the reserve's auditors and enough
+balance. Exactly the intent's input amount is debited and the change is returned to the trader.
+`executorsChooseOnlyAmongTheTradersEligibleHoldings` pins this boundary. See
+[`SECURITY.md`](SECURITY.md#secure-swapintent-scope) for why it is accepted as a low-severity
+residual.
 
 ## Error classes in the tests
 
@@ -153,12 +164,26 @@ returned to the trader.
 | `WronglyTypedContract` | A Secure V1 contract passed to Stage 1.1 custody controls or to a legacy `Holding` choice. |
 | `FailureStatusError` | A domain rejection with a stable `amm/...` error ID. |
 
+On the local multi-participant Canton network, the same cases surface as Canton error codes:
+
+| Canton code | Case |
+| --- | --- |
+| `DAML_AUTHORIZATION_ERROR` | Missing signatory or controller authority, detected while the submitting participant interprets the command. |
+| `CONTRACT_NOT_FOUND` | Replay of a consumed contract. |
+| `NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT` | A participant submitting for a party it does not host, including one that claims every core signer. |
+| `MEDIATOR_SAYS_TX_TIMED_OUT` | A required confirming participant (a disconnected issuer's) did not respond; nothing is committed. |
+
 ## Tests
 
 - `SecureV1Lifecycle`: legacy equivalence for initialization, the full sequence, rounding and
-  saturation; auditors and privacy; the auditor-compatibility check.
+  saturation; exact fee counters across mixed swaps and liquidity changes; auditors and
+  privacy; the auditor-compatibility check; legacy operator diversion leaving Secure V1
+  reserves untouched.
 - `SecureV1Attacks`: attacks 1–16 and all 31 partial coalitions.
-- `SecureV1SwapIntent`: intents.
+- `SecureV1SwapIntent`: intents, including the executor's holder-selection boundary.
+- `MultiParticipant`: the multi-participant Canton scenarios. Its scripts take arguments, so
+  `dpm test` does not run them; `scripts/run-multi-participant.sh` runs them on a local
+  eight-participant network (see [`RELEASE_READINESS.md`](RELEASE_READINESS.md)).
 
 Shared invariant and settlement checks live in `SecureV1Support`; test-only adversary
 templates are in `SecureV1Adversary`. After every transition, the checks cover:
@@ -174,50 +199,24 @@ templates are in `SecureV1Adversary`. After every transition, the checks cover:
 Rejections compare the full ledger snapshot before and after. The Phase 0 legacy
 characterization tests and the Stage 1.1/2.1 prototype tests are kept as they were.
 
-`scripts/check-prototype-choice-surface.sh` also lists the compiled Secure V1 choices and fails
-on any change. It is a change-control check, not a semantic proof.
+## Structural checks and semantic review
 
-## Migration impact
+`scripts/check-prototype-choice-surface.sh` in the tests package lists the templates of every
+deployable package and the choices of every reviewed template, and fails on any change. A new
+template is caught even if it has no choices, as is an added reserve-release or position-burn
+choice. `scripts/check-packages.sh` pins the Secure V1 package ID, so any source change,
+including a comment, fails CI until it is reviewed.
 
-No migration is implemented or authorized. Moving value from a legacy pool into Secure V1
-would involve the following:
+These are change-control checks, not a semantic proof. They cannot show that the body of a
+permitted choice is safe. Every change to a choice body, a signatory or observer list, an
+`ensure` clause or a helper used by a choice needs a manual review against the threat model in
+[`SECURITY.md`](SECURITY.md), plus the matching attack test, before the expected lists or the
+pinned package ID are updated.
 
-- **Schemas.** Legacy `Pool` and `LiquidityPosition` are signed by the operator and governance;
-  their reserves are operator-owned `Holding`s. Secure V1 states are signed by the four core
-  parties; positions also carry the provider's signature. There is no on-ledger conversion
-  between them, and none can be added without each LP's authority.
-- **Existing LP claims.** Legacy positions have no provider signature, so they cannot become
-  Secure V1 positions without the provider's consent. The safe path is for each LP to redeem
-  through the legacy `RemoveLiquidity` (provider-controlled) and deposit the proceeds through
-  `InitializePool` or `AddLiquidity`. The locked share and its dust stay in the legacy pool.
-- **Old operator-owned reserves.** The operator alone can still move them. Any direct transfer
-  of legacy reserves into a secure pool would bypass LP accounting and must not be used. Until
-  the legacy pool is drained, its reserves remain exposed to the Phase 0 operator-custody
-  weaknesses.
-- **Cutover authorization.** A new custodian party, the operator and both issuers must sign each
-  charter. The issuers newly become signatories (and confirmers) of every pool transaction.
-  Governance only observes.
-- **Off-ledger coordination.** Custodian onboarding; issuer approval to co-sign pool state; party
-  hosting and participant topology for all four core parties; LP communication of a withdrawal
-  window, price and slippage expectations; and a decision on the legacy pool's residual dust.
-- **Unavailable signers.** Every pool transaction needs confirmation from all four core
-  parties' participants. If any of them is unavailable, swaps and liquidity operations halt,
-  and there is no unilateral or governance bypass by design. This has not been tested on a
-  multi-participant topology.
-- **Rollback limits.** There is no on-ledger path back. LPs can exit a secure pool and re-enter
-  a legacy one, but the only emergency stop is archival by the full core, which destroys the
-  reserves' on-ledger value and requires off-ledger reissuance.
-- **Not implemented:** migration templates or scripts, legacy-pool pause or drain tooling,
-  position conversion, a package version bump, upgrade checks, multi-participant testing, and
-  any deployment.
+## Migration and deployment
 
-## Deployment prerequisites
-
-The Secure V1 modules are in the `canton-treasury-amm` 0.1.0 package, so this DAR has a
-different package ID from any previously built 0.1.0 DAR. It must not be uploaded alongside an
-existing 0.1.0 deployment. Before any deployment, choose one of these:
-- bump the version and pass the Smart Contract Upgrade checks for the unchanged legacy
-  templates; or
-- move Secure V1 into its own package.
-
-Either way, complete a security review of this stage and a multi-participant test.
+No migration is implemented or authorized, and Secure V1 is not deployment-ready.
+[`MIGRATION.md`](MIGRATION.md) describes the cutover design: a parallel deployment in which each
+LP redeems through the legacy `RemoveLiquidity` and deposits into Secure V1, with no conversion
+of legacy contracts. [`RELEASE_READINESS.md`](RELEASE_READINESS.md) lists what is verified and
+what still blocks a deployment.

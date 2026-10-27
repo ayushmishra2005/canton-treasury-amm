@@ -1,0 +1,26 @@
+// Bootstraps the synchronizer as the SDK 3.5.5 sandbox does, connects every participant and
+// uploads and vets the test DAR (which carries the legacy and Secure V1 packages) on each.
+import com.digitalasset.canton.config.RequireTypes.PositiveInt
+import com.digitalasset.canton.version.ProtocolVersion
+
+val staticParameters = StaticSynchronizerParameters.defaults(
+  sequencer1.config.crypto,
+  ProtocolVersion.forSynchronizer,
+  topologyChangeDelay = NonNegativeFiniteDuration.Zero
+)
+bootstrap.synchronizer(
+  "amm",
+  Seq(sequencer1),
+  Seq(mediator1),
+  Seq(sequencer1, mediator1),
+  PositiveInt.one,
+  staticParameters
+)
+
+participants.local.foreach(_.synchronizers.connect_local(sequencer1, "amm"))
+val testDar = sys.env("AMM_TEST_DAR")
+participants.local.foreach(_.dars.upload(testDar))
+participants.local.foreach { p =>
+  println(s"participant ${p.name} ledger-api ${p.config.ledgerApi.port.unwrap} connected=${p.synchronizers.list_connected().map(_.synchronizerAlias.unwrap).mkString(",")}")
+}
+println("AMM multi-participant topology ready")

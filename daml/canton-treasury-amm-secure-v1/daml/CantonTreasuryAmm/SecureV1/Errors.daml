@@ -1,0 +1,6 @@
+-- Error identifiers introduced by Secure V1. Shared identifiers come from the legacy package's
+-- `CantonTreasuryAmm.Errors`, which must stay byte-identical to keep its package ID.
+module CantonTreasuryAmm.SecureV1.Errors where
+
+poolMismatchError : Text
+poolMismatchError = "amm/pool-mismatch"

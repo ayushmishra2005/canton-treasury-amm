@@ -8,6 +8,7 @@
 module CantonTreasuryAmm.SecureV1.SwapIntent where
 
 import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.SecureV1.Errors
 import CantonTreasuryAmm.SecureV1.Pool
 import CantonTreasuryAmm.Token
 import CantonTreasuryAmm.Types

@@ -1,0 +1,7 @@
+// Disconnects or reconnects the local stable-issuer participant, per AMM_STABLE_ISSUER_CONNECTION.
+sys.env("AMM_STABLE_ISSUER_CONNECTION") match {
+  case "disconnect" => stable_issuer.synchronizers.disconnect("amm")
+  case "reconnect" => stable_issuer.synchronizers.reconnect("amm")
+  case other => throw new IllegalArgumentException(s"Unknown connection action: $other")
+}
+println(s"stable_issuer connected=${stable_issuer.synchronizers.list_connected().map(_.synchronizerAlias.unwrap).mkString(",")}")

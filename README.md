@@ -60,7 +60,12 @@ This MVP therefore trusts the operator as reserve custodian. It also trusts the 
 
 `CantonTreasuryAmm.SecureV1.Pool` and `CantonTreasuryAmm.SecureV1.SwapIntent` are a parallel implementation with protected reserves. Every pool state, reserve and LP position is signed by an independent custodian, the operator and both issuers. Reserves have no choices and change only inside the pool's own swap and liquidity choices, which bind them to the pool's lineage and genesis. Governance observes but holds no reserve authority, and no coalition smaller than those four signers can move reserves, forge positions or settle in another party's name. That full coalition remains trusted. Pricing, rounding, both fee counters, auditor visibility and the swap-intent roles match the legacy pool, which the tests check step by step. Arbitrary Token Standard holdings are not supported as reserves or deposits.
 
-Secure V1 is not deployed, and no migration from legacy pools is implemented. See [`daml/canton-treasury-amm/SECURE_V1.md`](daml/canton-treasury-amm/SECURE_V1.md) for the trust model, privacy changes, test coverage, migration impact and deployment prerequisites.
+Secure V1 is a separate package, `canton-treasury-amm-secure-v1` 0.1.0, in [`daml/canton-treasury-amm-secure-v1`](daml/canton-treasury-amm-secure-v1). It data-depends on the unchanged legacy `canton-treasury-amm` 0.1.0 DAR, so the legacy package keeps its package ID and both can be vetted on one participant. Secure V1 is not deployed, has not been audited and is not ready for deployment. No migration from legacy pools is implemented or authorized. See:
+
+- [`SECURE_V1.md`](daml/canton-treasury-amm-secure-v1/SECURE_V1.md) for the design, fee accounting, privacy and tests;
+- [`SECURITY.md`](daml/canton-treasury-amm-secure-v1/SECURITY.md) for the legacy and Secure V1 security model, residual trust, emergency operations and compatibility;
+- [`RELEASE_READINESS.md`](daml/canton-treasury-amm-secure-v1/RELEASE_READINESS.md) for packaging, CI, multi-participant Canton evidence and the remaining deployment blockers;
+- [`MIGRATION.md`](daml/canton-treasury-amm-secure-v1/MIGRATION.md) for the legacy cutover design.
 
 ## Build and test
 
@@ -71,14 +76,26 @@ export PATH="$HOME/.dpm/bin:$PATH"
 dpm build --all
 ```
 
-Lint both packages and run the Daml Script suite:
+Lint every package and run the Daml Script suite:
 
 ```sh
 export PATH="$HOME/.dpm/bin:$PATH"
-(cd daml/canton-treasury-amm && dpm damlc lint)
-(cd daml/canton-treasury-amm-tests && dpm damlc lint)
+for package in canton-treasury-amm canton-treasury-amm-secure-v1 canton-treasury-amm-live-reserve-prototype canton-treasury-amm-tests; do
+  (cd "daml/$package" && dpm damlc lint)
+done
 (cd daml/canton-treasury-amm-tests && dpm test)
 ```
+
+The release checks used by CI live in `daml/canton-treasury-amm-tests/scripts` and run from the repository root after `dpm build --all`:
+
+| Script | Fails when |
+| --- | --- |
+| `run-tests-strict.sh` | any test fails, or the set of passing tests differs from the `Script` values declared in the test sources (so a skipped or missing test fails) |
+| `check-prototype-choice-surface.sh` | a production or prototype package gains, loses or renames a template, or a reviewed template's choices change |
+| `check-packages.sh` | the legacy or Secure V1 package ID, name, version or legacy dependency differs from the reviewed values, a deployable package depends on Daml Script, or `dpm upgrade-check` rejects the two packages side by side |
+| `run-multi-participant.sh` | the local multi-participant Canton scenarios in `MultiParticipant.daml` do not behave as specified |
+
+`run-multi-participant.sh` starts a local Canton 3.5.12 network (one sequencer, one mediator and eight in-memory participants) from the SDK's Canton jar, using `daml/canton-treasury-amm-tests/multi-participant`. It writes its logs to `AMM_MP_LOG_DIR` (a temporary directory by default) and stops the network on exit. The [Secure V1 validation workflow](.github/workflows/secure-v1-validation.yml) runs all of these on GitHub Actions with read-only permissions.
 
 To verify the generated test DAR against Canton, start the sandbox in one shell:
 

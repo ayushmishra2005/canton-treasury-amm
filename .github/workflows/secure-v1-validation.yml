@@ -1,0 +1,88 @@
+# Build, lint and test every package on the pinned SDK, check the reviewed template and choice
+# surfaces and package IDs, and run the local multi-participant Canton validation. Read-only:
+# no secrets, no deployment, no upload to any ledger outside the job's own in-memory nodes.
+name: Secure V1 validation
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: secure-v1-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      DPM_SDK_VERSION: 3.5.5
+      # SHA-256 of https://get.digitalasset.com/install/install.sh as reviewed for this pin.
+      DPM_INSTALLER_SHA256: e5f20449dffefcf3b90f9b4941ce42d37832b300c6a6142b9a92b1cd5db9b139
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install dpm with SDK ${{ env.DPM_SDK_VERSION }}
+        run: |
+          curl -fsSL https://get.digitalasset.com/install/install.sh -o "$RUNNER_TEMP/dpm-install.sh"
+          echo "$DPM_INSTALLER_SHA256  $RUNNER_TEMP/dpm-install.sh" | sha256sum --check --strict
+          sh "$RUNNER_TEMP/dpm-install.sh" "$DPM_SDK_VERSION"
+          echo "$HOME/.dpm/bin" >> "$GITHUB_PATH"
+
+      - name: Toolchain versions
+        run: |
+          dpm version
+          java -version
+          for config in daml/*/daml.yaml; do
+            grep -qx "sdk-version: $DPM_SDK_VERSION" "$config" || { echo "$config is not pinned to $DPM_SDK_VERSION"; exit 1; }
+          done
+
+      - name: Build every package
+        run: dpm build --all --no-cache
+
+      - name: Lint every package
+        run: |
+          for package in canton-treasury-amm canton-treasury-amm-secure-v1 \
+            canton-treasury-amm-live-reserve-prototype canton-treasury-amm-tests; do
+            echo "== $package"
+            (cd "daml/$package" && dpm damlc lint)
+          done
+
+      - name: Full test suite, no skipped or missing tests
+        run: bash daml/canton-treasury-amm-tests/scripts/run-tests-strict.sh "$RUNNER_TEMP/dpm-test.log"
+
+      - name: Template inventory and choice surfaces
+        run: bash daml/canton-treasury-amm-tests/scripts/check-prototype-choice-surface.sh
+
+      - name: Package IDs, dependencies and upgrade check
+        run: bash daml/canton-treasury-amm-tests/scripts/check-packages.sh
+
+      - name: Multi-participant Canton validation
+        env:
+          AMM_MP_LOG_DIR: ${{ runner.temp }}/multi-participant
+        run: bash daml/canton-treasury-amm-tests/scripts/run-multi-participant.sh
+
+      - name: Keep logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: secure-v1-validation-logs
+          path: |
+            ${{ runner.temp }}/dpm-test.log
+            ${{ runner.temp }}/multi-participant
+          if-no-files-found: warn
+          retention-days: 14

@@ -1,0 +1,706 @@
+-- Secure V1 on a real multi-participant Canton topology (`multi-participant/canton.conf`), one
+-- participant per role. Run only through `scripts/run-multi-participant.sh`; every script here
+-- takes an argument so `dpm test` does not run it against the IDE ledger.
+--
+-- A Canton submission must come from a participant hosting every `actAs` party, so the
+-- multi-signatory steps that the IDE tests submit at once are split into the test-only approval
+-- contracts below. Each carries exactly the authority of the parties that signed it, as
+-- `SecureV1Adversary` does. Production has no such onboarding workflow yet.
+module CantonTreasuryAmm.Test.MultiParticipant where
+
+import DA.Action ((>=>), unless)
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import DA.List (sort, unique)
+import DA.Optional (isNone, isSome)
+import DA.Text (isInfixOf)
+import DA.Time (milliseconds)
+import Daml.Script
+
+import CantonTreasuryAmm.SecureV1.Pool
+import CantonTreasuryAmm.SecureV1.SwapIntent
+import CantonTreasuryAmm.Test.Fixtures
+import CantonTreasuryAmm.Test.ProtectedPoolSettlementTests qualified as Settlement
+import CantonTreasuryAmm.Test.SecureV1Attacks (assertInvisibleActive)
+import CantonTreasuryAmm.Test.SecureV1Support
+import CantonTreasuryAmm.Token
+import CantonTreasuryAmm.Types
+
+-- Collects the four core signatures for a charter, one participant at a time.
+template CharterProposal
+  with
+    charter : SecurePoolCharter
+    approved : [Party]
+  where
+    signatory approved
+    observer coreSignatories charter.lineage
+    ensure
+      not (null approved)
+        && unique approved
+        && all (`elem` coreSignatories charter.lineage) approved
+
+    choice ApproveCharter : ContractId CharterProposal
+      with
+        approver : Party
+      controller approver
+      do
+        assertMsg "Approver is not a missing core signer"
+          (approver `elem` coreSignatories charter.lineage && approver `notElem` approved)
+        create this with approved = approver :: approved
+
+    choice FinalizeCharter : ContractId SecurePoolCharter
+      with
+        finalizer : Party
+      controller finalizer
+      do
+        assertMsg "Finalizer has not approved" (finalizer `elem` approved)
+        assertMsg "Every core signer must approve" (sort approved == sort (coreSignatories charter.lineage))
+        create charter
+
+-- The operator proposes a swap-intent factory; governance co-signs it by accepting.
+template FactoryProposal
+  with
+    factory : SecureSwapIntentFactory
+  where
+    signatory factory.lineage.operator
+    observer factory.lineage.governance
+
+    choice AcceptFactory : ContractId SecureSwapIntentFactory
+      controller factory.lineage.governance
+      do create factory
+
+-- Governance approves one execution of one intent with one input holding; the operator then
+-- exercises `Execute` with both controllers' authority.
+template ExecutionApproval
+  with
+    operator : Party
+    governance : Party
+    intentCid : ContractId SecureSwapIntent
+    inputHoldingCid : ContractId Holding
+  where
+    signatory governance
+    observer operator
+
+    choice ExecuteApproved : SecureSwapResult
+      controller operator
+      do exercise intentCid Execute with inputHoldingCid
+
+-- Governance lends the operator its authority for anything: the strongest operator and
+-- governance collusion that involves neither the custodian nor an issuer.
+template GovernanceProxy
+  with
+    operator : Party
+    governance : Party
+  where
+    signatory governance
+    observer operator
+
+    nonconsuming choice ProxyArchiveReserve : ()
+      with
+        reserveCid : ContractId SecureReserveHolding
+      controller operator
+      do archive reserveCid
+
+    nonconsuming choice ProxyArchivePool : ()
+      with
+        poolCid : ContractId SecurePool
+      controller operator
+      do archive poolCid
+
+    nonconsuming choice ProxyCreatePool : ContractId SecurePool
+      with
+        pool : SecurePool
+      controller operator
+      do create pool
+
+    nonconsuming choice ProxyMintPosition : ContractId SecureLiquidityPosition
+      with
+        position : SecureLiquidityPosition
+      controller operator
+      do create position
+
+    nonconsuming choice ProxySwapAsTrader : SecureSwapResult
+      with
+        poolCid : ContractId SecurePool
+        trader : Party
+        inputHoldingCid : ContractId Holding
+        inputAmount : Decimal
+        deadline : Time
+        expectedVersion : Int
+      controller operator
+      do
+        exercise poolCid SwapExactInput with
+          trader
+          direction = TreasuryForStable
+          inputHoldingCid
+          inputAmount
+          minimumAmountOut = 0.0
+          deadline
+          expectedVersion
+
+data MpParties = MpParties with
+  custodian : Party
+  operator : Party
+  governance : Party
+  treasuryIssuer : Party
+  stableIssuer : Party
+  trader : Party
+  provider : Party
+  auditor : Party
+    deriving (Eq, Show)
+
+-- Participant names as in `multi-participant/canton.conf` and the participant config.
+hostingPlan : MpParties -> [(Text, Party)]
+hostingPlan parties =
+  [ ("custodian", parties.custodian)
+  , ("operator", parties.operator)
+  , ("governance", parties.governance)
+  , ("treasury_issuer", parties.treasuryIssuer)
+  , ("stable_issuer", parties.stableIssuer)
+  , ("trader", parties.trader)
+  , ("provider", parties.provider)
+  , ("auditor", parties.auditor)
+  ]
+
+allParties : MpParties -> [Party]
+allParties parties = map snd (hostingPlan parties)
+
+data MpState = MpState with
+  parties : MpParties
+  lineage : SecureLineage
+  treasuryInstrumentCid : ContractId TokenInstrument
+  stableInstrumentCid : ContractId TokenInstrument
+  charterCid : ContractId SecurePoolCharter
+  initialized : SecureInitializeResult
+  poolCid : ContractId SecurePool
+    deriving (Eq, Show)
+
+data MpLiveness = MpLiveness with
+  state : MpState
+  inputCid : ContractId Holding
+    deriving (Eq, Show)
+
+-- The shared Secure V1 checks take a `SecureMarket`. `other` and `secondProvider` are not read
+-- by those checks.
+marketOf : MpState -> SecureMarket
+marketOf state = SecureMarket with
+  fixture = Fixture with
+    treasuryIssuer = state.parties.treasuryIssuer
+    stableIssuer = state.parties.stableIssuer
+    operator = state.parties.operator
+    governance = state.parties.governance
+    provider = state.parties.provider
+    trader = state.parties.trader
+    other = state.parties.auditor
+    auditor = state.parties.auditor
+    treasuryInstrument = state.lineage.treasuryInstrument
+    stableInstrument = state.lineage.stableInstrument
+    treasuryInstrumentCid = state.treasuryInstrumentCid
+    stableInstrumentCid = state.stableInstrumentCid
+  custodian = state.parties.custodian
+  secondProvider = state.parties.provider
+  lineage = state.lineage
+  charterCid = state.charterCid
+  initialized = state.initialized
+
+-- Each participant applies a committed transaction on its own, so a read on a participant other
+-- than the submitter's first waits for that transaction.
+poll : Text -> Int -> Script Bool -> Script ()
+poll what attempts probe = do
+  done <- probe
+  unless done $
+    if attempts <= 0
+      then abort ("Participants did not converge: " <> what)
+      else do
+        sleep (milliseconds 250)
+        poll what (attempts - 1) probe
+
+awaitActive : (Template t, HasEnsure t) => [Party] -> ContractId t -> Script ()
+awaitActive readers cid = forA_ readers $ \reader ->
+  poll ("active " <> show cid <> " for " <> show reader) 120 (isSome <$> queryContractId reader cid)
+
+awaitArchived : (Template t, HasEnsure t) => [Party] -> ContractId t -> Script ()
+awaitArchived readers cid = forA_ readers $ \reader ->
+  poll ("archived " <> show cid <> " for " <> show reader) 120 (isNone <$> queryContractId reader cid)
+
+-- Every role that sees pool states. A transaction is applied atomically on each participant, so
+-- once each of them sees the new state it has applied the whole transaction.
+poolReaders : SecureMarket -> [Party]
+poolReaders market =
+  [ market.custodian
+  , market.fixture.operator
+  , market.fixture.governance
+  , market.fixture.treasuryIssuer
+  , market.fixture.stableIssuer
+  , market.fixture.auditor
+  ]
+
+-- Issued on the issuer's participant; returns once the owner's and auditor's participants have it.
+issueFrom : Party -> ContractId TokenInstrument -> Party -> Party -> Int -> Script (ContractId Holding)
+issueFrom issuer instrumentCid auditor owner atoms = do
+  holdingCid <- submit issuer $ exerciseCmd instrumentCid Issue with owner; amount = amountOf atoms
+  awaitActive [owner, auditor] holdingCid
+  pure holdingCid
+
+issue : SecureMarket -> InstrumentId -> Party -> Int -> Script (ContractId Holding)
+issue market instrument owner atoms = do
+  let instrumentCid =
+        if instrument == market.lineage.treasuryInstrument
+          then market.fixture.treasuryInstrumentCid
+          else market.fixture.stableInstrumentCid
+  issueFrom instrument.issuer instrumentCid market.fixture.auditor owner atoms
+
+feeFor : Int -> Int
+feeFor inputAtoms = (inputAtoms * 3 + 999) / 1000
+
+-- A Treasury-for-stablecoin swap submitted from the trader's participant with the pool
+-- disclosed by the custodian's participant, checked on every participant that sees it.
+mpSwap : SecureMarket -> ContractId SecurePool -> ContractId Holding -> Int -> Int -> Script SecureSwapResult
+mpSwap market poolCid inputCid inputAtoms expectedOut = do
+  let trader = market.fixture.trader
+  (pool, treasuryReserve, stableReserve) <- checkSecurePool market poolCid
+  totals <- totalsOf market
+  treasuryHeld <- holdingAtoms trader market.lineage.treasuryInstrument
+  stableHeld <- holdingAtoms trader market.lineage.stableInstrument
+  disclosures <- secureDisclosures market poolCid
+  deadline <- futureDeadline
+  result <- submit (actAs trader <> discloseMany disclosures) $
+    swapCommand poolCid trader TreasuryForStable inputCid inputAtoms expectedOut deadline pool.stateVersion
+  awaitActive (poolReaders market) result.poolCid
+  awaitActive [trader] result.outputHoldingCid
+  result.amountOut === amountOf expectedOut
+  (next, nextTreasury, nextStable) <- checkSecurePool market result.poolCid
+  (atomsOf nextTreasury.amount, atomsOf nextStable.amount)
+    === (atomsOf treasuryReserve.amount + inputAtoms, atomsOf stableReserve.amount - expectedOut)
+  (atomsOf next.treasuryFeeAmount, next.stableFeeAmount)
+    === (atomsOf pool.treasuryFeeAmount + feeFor inputAtoms, pool.stableFeeAmount)
+  (next.stateVersion, next.totalShares) === (pool.stateVersion + 1, pool.totalShares)
+  assertArchived trader inputCid
+  holdingAtoms trader market.lineage.treasuryInstrument >>= (=== treasuryHeld - inputAtoms)
+  holdingAtoms trader market.lineage.stableInstrument >>= (=== stableHeld + expectedOut)
+  totalsOf market >>= (=== totals)
+  pure result
+
+-- A deposit of at most 500,000 Treasury and 1,000,000 stablecoin atoms from the provider's
+-- participant; it must mint exactly `expectedMint` for exactly the stated contribution.
+mpAdd : SecureMarket -> ContractId SecurePool -> ContractId Holding -> ContractId Holding -> Int -> Int -> Int -> Script SecureAddLiquidityResult
+mpAdd market poolCid treasuryCid stableCid expectedMint expectedTreasury expectedStable = do
+  let provider = market.fixture.provider
+  (pool, treasuryReserve, stableReserve) <- checkSecurePool market poolCid
+  totals <- totalsOf market
+  disclosures <- secureDisclosures market poolCid
+  result <- submit (actAs provider <> discloseMany disclosures) $ exerciseCmd poolCid AddLiquidity with
+    provider
+    treasuryHoldingCid = treasuryCid
+    stableHoldingCid = stableCid
+    maximumTreasury = amountOf 500000
+    maximumStable = amountOf 1000000
+    minimumShares = amountOf expectedMint
+    expectedVersion = pool.stateVersion
+  awaitActive (poolReaders market) result.poolCid
+  awaitActive [provider] result.positionCid
+  (result.mintedShares, result.usedTreasury, result.usedStable)
+    === (amountOf expectedMint, amountOf expectedTreasury, amountOf expectedStable)
+  (next, nextTreasury, nextStable) <- checkSecurePool market result.poolCid
+  (atomsOf nextTreasury.amount, atomsOf nextStable.amount)
+    === (atomsOf treasuryReserve.amount + expectedTreasury, atomsOf stableReserve.amount + expectedStable)
+  atomsOf next.totalShares === atomsOf pool.totalShares + expectedMint
+  (next.treasuryFeeAmount, next.stableFeeAmount, next.stateVersion)
+    === (pool.treasuryFeeAmount, pool.stableFeeAmount, pool.stateVersion + 1)
+  Some position <- queryContractId provider result.positionCid
+  (position.provider, atomsOf position.shares, position.genesisCid) === (provider, expectedMint, market.charterCid)
+  totalsOf market >>= (=== totals)
+  pure result
+
+-- A withdrawal from the provider's participant that must pay exactly the stated amounts.
+mpRemove : SecureMarket -> ContractId SecurePool -> ContractId SecureLiquidityPosition -> Int -> Int -> Int -> Script SecureRemoveLiquidityResult
+mpRemove market poolCid positionCid burnAtoms expectedTreasury expectedStable = do
+  let provider = market.fixture.provider
+  (pool, treasuryReserve, stableReserve) <- checkSecurePool market poolCid
+  Some position <- queryContractId provider positionCid
+  totals <- totalsOf market
+  treasuryHeld <- holdingAtoms provider market.lineage.treasuryInstrument
+  stableHeld <- holdingAtoms provider market.lineage.stableInstrument
+  disclosures <- secureDisclosures market poolCid
+  result <- submit (actAs provider <> discloseMany disclosures) $ exerciseCmd poolCid RemoveLiquidity with
+    provider
+    positionCid
+    burnShares = amountOf burnAtoms
+    minimumTreasuryOut = amountOf expectedTreasury
+    minimumStableOut = amountOf expectedStable
+    expectedVersion = pool.stateVersion
+  awaitActive (poolReaders market) result.poolCid
+  (result.treasuryOut, result.stableOut) === (amountOf expectedTreasury, amountOf expectedStable)
+  (next, nextTreasury, nextStable) <- checkSecurePool market result.poolCid
+  (atomsOf nextTreasury.amount, atomsOf nextStable.amount)
+    === (atomsOf treasuryReserve.amount - expectedTreasury, atomsOf stableReserve.amount - expectedStable)
+  atomsOf next.totalShares === atomsOf pool.totalShares - burnAtoms
+  (next.treasuryFeeAmount, next.stableFeeAmount, next.stateVersion)
+    === (pool.treasuryFeeAmount, pool.stableFeeAmount, pool.stateVersion + 1)
+  Some remainingCid <- pure result.remainingPositionCid
+  awaitActive [provider] remainingCid
+  Some remaining <- queryContractId provider remainingCid
+  atomsOf remaining.shares === atomsOf position.shares - burnAtoms
+  assertArchived provider positionCid
+  holdingAtoms provider market.lineage.treasuryInstrument >>= (=== treasuryHeld + expectedTreasury)
+  holdingAtoms provider market.lineage.stableInstrument >>= (=== stableHeld + expectedStable)
+  totalsOf market >>= (=== totals)
+  pure result
+
+-- A stablecoin-for-Treasury intent: governance approves the execution on its participant and
+-- the operator executes it on its own, with the trader's holding disclosed by the trader.
+mpExecuteIntent : SecureMarket -> ContractId SecurePool -> ContractId SecureSwapIntent -> ContractId Holding -> Int -> Int -> Script SecureSwapResult
+mpExecuteIntent market poolCid intentCid inputCid inputAtoms expectedOut = do
+  let fixture = market.fixture
+  (pool, treasuryReserve, stableReserve) <- checkSecurePool market poolCid
+  totals <- totalsOf market
+  treasuryHeld <- holdingAtoms fixture.trader market.lineage.treasuryInstrument
+  stableHeld <- holdingAtoms fixture.trader market.lineage.stableInstrument
+  approvalCid <- submit fixture.governance $ createCmd ExecutionApproval with
+    operator = fixture.operator
+    governance = fixture.governance
+    intentCid
+    inputHoldingCid = inputCid
+  awaitActive [fixture.operator] approvalCid
+  inputDisclosed <- disclosureOf fixture.trader inputCid
+  result <- submit (actAs fixture.operator <> discloseMany [inputDisclosed]) $ exerciseCmd approvalCid ExecuteApproved
+  awaitActive (poolReaders market) result.poolCid
+  awaitActive [fixture.trader] result.outputHoldingCid
+  awaitArchived [fixture.trader, fixture.auditor] intentCid
+  result.amountOut === amountOf expectedOut
+  (next, nextTreasury, nextStable) <- checkSecurePool market result.poolCid
+  (atomsOf nextStable.amount, atomsOf nextTreasury.amount)
+    === (atomsOf stableReserve.amount + inputAtoms, atomsOf treasuryReserve.amount - expectedOut)
+  (atomsOf next.stableFeeAmount, next.treasuryFeeAmount)
+    === (atomsOf pool.stableFeeAmount + feeFor inputAtoms, pool.treasuryFeeAmount)
+  Some output <- queryContractId fixture.trader result.outputHoldingCid
+  (output.owner, output.instrument, atomsOf output.amount) === (fixture.trader, market.lineage.treasuryInstrument, expectedOut)
+  holdingAtoms fixture.trader market.lineage.stableInstrument >>= (=== stableHeld - inputAtoms)
+  holdingAtoms fixture.trader market.lineage.treasuryInstrument >>= (=== treasuryHeld + expectedOut)
+  holdingAtoms fixture.operator market.lineage.treasuryInstrument >>= (=== 0)
+  holdingAtoms fixture.governance market.lineage.treasuryInstrument >>= (=== 0)
+  totalsOf market >>= (=== totals)
+  pure result
+
+-- PHASE 1. Allocates each role's party on its own participant.
+mpAllocate : () -> Script MpParties
+mpAllocate () = do
+  let on hint participant = allocatePartyOn hint (ParticipantName participant)
+  custodian <- on "MpCustodian" "custodian"
+  operator <- on "MpOperator" "operator"
+  governance <- on "MpGovernance" "governance"
+  treasuryIssuer <- on "MpTreasuryIssuer" "treasury_issuer"
+  stableIssuer <- on "MpStableIssuer" "stable_issuer"
+  trader <- on "MpTrader" "trader"
+  provider <- on "MpProvider" "provider"
+  auditor <- on "MpAuditor" "auditor"
+  pure MpParties with custodian; operator; governance; treasuryIssuer; stableIssuer; trader; provider; auditor
+
+-- PHASE 2. Every participant knows all eight parties and hosts exactly its own role's party.
+mpVerifyHosting : MpParties -> Script ()
+mpVerifyHosting parties = do
+  let everyone = allParties parties
+  assertMsg "Every role is a distinct party" (unique everyone)
+  forA_ (hostingPlan parties) $ \(participant, party) -> do
+    poll ("parties known on " <> participant) 240 $ do
+      known <- listKnownPartiesOn (ParticipantName participant)
+      pure (all (`elem` map (\details -> details.party) known) everyone)
+    known <- listKnownPartiesOn (ParticipantName participant)
+    [details.party | details <- known, details.isLocal, details.party `elem` everyone] === [party]
+    debug ("HOSTING " <> participant <> " hosts " <> show party <> " and no other AMM role")
+
+-- PHASE 3. The core signers try to create a charter in one submission, as the IDE tests do.
+-- Expected to fail: no participant hosts all four.
+mpSingleSubmissionCharter : MpParties -> Script ()
+mpSingleSubmissionCharter parties = do
+  let lineage = SecureLineage with
+        custodian = parties.custodian
+        operator = parties.operator
+        governance = parties.governance
+        treasuryInstrument = InstrumentId with issuer = parties.treasuryIssuer; symbol = "UST"
+        stableInstrument = InstrumentId with issuer = parties.stableIssuer; symbol = "USD"
+        charterReference = "single-submission"
+  _ <- submit (actAs (coreSignatories lineage)) $ createCmd SecurePoolCharter with
+    lineage
+    initialProvider = parties.provider
+    auditors = []
+  abort "A charter needing four participants' parties was created in one submission"
+
+-- PHASE 4. Scenarios 1 to 10, each submitted from the participants of the roles involved.
+mpScenarios : MpParties -> Script MpState
+mpScenarios parties = do
+  let treasuryInstrument = InstrumentId with issuer = parties.treasuryIssuer; symbol = "UST"
+  let stableInstrument = InstrumentId with issuer = parties.stableIssuer; symbol = "USD"
+  treasuryInstrumentCid <- submit parties.treasuryIssuer $ createCmd TokenInstrument with
+    instrument = treasuryInstrument
+    displayName = "Tokenized U.S. Treasury"
+    auditors = [parties.auditor]
+  stableInstrumentCid <- submit parties.stableIssuer $ createCmd TokenInstrument with
+    instrument = stableInstrument
+    displayName = "USD Stablecoin"
+    auditors = [parties.auditor]
+  let lineage = SecureLineage with
+        custodian = parties.custodian
+        operator = parties.operator
+        governance = parties.governance
+        treasuryInstrument
+        stableInstrument
+        charterReference = "multi-participant-pool"
+
+  -- SCENARIO 1. Initialization: each core signer approves the charter on its own participant,
+  -- then the provider initializes it on the provider's participant.
+  let charter = SecurePoolCharter with lineage; initialProvider = parties.provider; auditors = [parties.auditor]
+  proposal0 <- submit parties.custodian $ createCmd CharterProposal with charter; approved = [parties.custodian]
+  awaitActive [parties.operator] proposal0
+  proposal1 <- submit parties.operator $ exerciseCmd proposal0 ApproveCharter with approver = parties.operator
+  awaitActive [parties.treasuryIssuer] proposal1
+  proposal2 <- submit parties.treasuryIssuer $ exerciseCmd proposal1 ApproveCharter with approver = parties.treasuryIssuer
+  awaitActive [parties.stableIssuer] proposal2
+  proposal3 <- submit parties.stableIssuer $ exerciseCmd proposal2 ApproveCharter with approver = parties.stableIssuer
+  awaitActive [parties.custodian] proposal3
+  charterCid <- submit parties.custodian $ exerciseCmd proposal3 FinalizeCharter with finalizer = parties.custodian
+  awaitActive [parties.provider, parties.governance, parties.auditor] charterCid
+  Some charterSeen <- queryContractId parties.provider charterCid
+  charterSeen === charter
+  initialTreasury <- issueFrom parties.treasuryIssuer treasuryInstrumentCid parties.auditor parties.provider 5000000
+  initialStable <- issueFrom parties.stableIssuer stableInstrumentCid parties.auditor parties.provider 10000000
+  initialized <- submit parties.provider $ exerciseCmd charterCid InitializePool with
+    treasuryHoldingCid = initialTreasury
+    stableHoldingCid = initialStable
+    treasuryAmount = amountOf 5000000
+    stableAmount = amountOf 10000000
+  let state0 = MpState with
+        parties; lineage; treasuryInstrumentCid; stableInstrumentCid; charterCid; initialized
+        poolCid = initialized.poolCid
+  let market = marketOf state0
+  awaitActive (poolReaders market) initialized.poolCid
+  awaitActive [parties.provider] initialized.positionCid
+  awaitArchived (poolReaders market) charterCid
+  (pool0, _, _) <- checkSecurePool market initialized.poolCid
+  (atomsOf pool0.totalShares, pool0.stateVersion) === (7071067, 0)
+  Some position0 <- queryContractId parties.provider initialized.positionCid
+  atomsOf position0.shares === 7071066
+  totalsOf market >>= (=== Totals with treasury = 5000000; stable = 10000000)
+  debug "SCENARIO 1 initialization: PASS"
+
+  -- SCENARIO 2. Swap on the trader's participant; the four core participants confirm.
+  swapInput <- issue market treasuryInstrument parties.trader 1000
+  swapped <- mpSwap market initialized.poolCid swapInput 1000 1993
+  debug "SCENARIO 2 swap: PASS"
+
+  -- SCENARIO 3. Deposit on the provider's participant.
+  depositTreasury <- issue market treasuryInstrument parties.provider 500000
+  depositStable <- issue market stableInstrument parties.provider 1000000
+  added <- mpAdd market swapped.poolCid depositTreasury depositStable 706965 500000 999601
+  debug "SCENARIO 3 deposit: PASS"
+
+  -- SCENARIO 4. Withdrawal of half the deposit's shares.
+  removed <- mpRemove market added.poolCid added.positionCid 353482 249999 499799
+  debug "SCENARIO 4 withdrawal: PASS"
+
+  -- SCENARIO 5. Swap intent: the operator and governance create the factory on their own
+  -- participants, the trader submits on its own, and the execution needs both controllers.
+  factoryProposal <- submit parties.operator $ createCmd FactoryProposal with
+    factory = SecureSwapIntentFactory with
+      lineage
+      genesisCid = charterCid
+      authorizedTraders = [parties.trader]
+      complianceObservers = [parties.auditor]
+  awaitActive [parties.governance] factoryProposal
+  factoryCid <- submit parties.governance $ exerciseCmd factoryProposal AcceptFactory
+  awaitActive [parties.trader, parties.operator, parties.auditor] factoryCid
+  deadline <- futureDeadline
+  Some poolBeforeIntent <- queryContractId parties.custodian removed.poolCid
+  intentCid <- submit parties.trader $ exerciseCmd factoryCid SubmitSwapIntent with
+    trader = parties.trader
+    poolCid = removed.poolCid
+    direction = StableForTreasury
+    inputAmount = amountOf 2000
+    minimumAmountOut = amountOf 997
+    deadline
+    expectedPoolVersion = poolBeforeIntent.stateVersion
+  awaitActive [parties.operator, parties.governance, parties.auditor] intentCid
+  intentInput <- issue market stableInstrument parties.trader 5000
+  rejectsWith market assertAuthorizationError $ do
+    inputDisclosed <- disclosureOf parties.trader intentInput
+    trySubmit (actAs parties.operator <> discloseMany [inputDisclosed]) $
+      exerciseCmd intentCid Execute with inputHoldingCid = intentInput
+  executed <- mpExecuteIntent market removed.poolCid intentCid intentInput 2000 997
+  Some changeCid <- pure executed.inputChangeHoldingCid
+  awaitActive [parties.trader] changeCid
+  Some change <- queryContractId parties.trader changeCid
+  (change.owner, atomsOf change.amount) === (parties.trader, 3000)
+  debug "SCENARIO 5 swap intent execution: PASS"
+
+  let current = executed.poolCid
+  (pool, _, _) <- checkSecurePool market current
+  disclosures <- secureDisclosures market current
+  victimInput <- issue market treasuryInstrument parties.trader 1000
+  victimDisclosed <- disclosureOf parties.trader victimInput
+  Some providerPositionCid <- pure removed.remainingPositionCid
+  positionDisclosed <- disclosureOf parties.provider providerPositionCid
+  attackDeadline <- futureDeadline
+
+  -- SCENARIO 6. Operator-only diversion on the operator's participant, with every contract it
+  -- does not already see disclosed.
+  let asOperator = actAs parties.operator <> discloseMany (victimDisclosed :: positionDisclosed :: disclosures)
+  forA_ [pool.treasuryReserveCid, pool.stableReserveCid] $ \reserveCid ->
+    rejectsWith market assertAuthorizationError $ trySubmit asOperator $ archiveCmd reserveCid
+  rejectsWith market assertAuthorizationError $ trySubmit asOperator $ archiveCmd current
+  rejectsWith market assertAuthorizationError $ trySubmit asOperator $
+    swapCommand current parties.trader TreasuryForStable victimInput 1000 0 attackDeadline pool.stateVersion
+  rejectsWith market assertAuthorizationError $ trySubmit asOperator $ exerciseCmd current RemoveLiquidity with
+    provider = parties.provider
+    positionCid = providerPositionCid
+    burnShares = amountOf 1000
+    minimumTreasuryOut = 0.0
+    minimumStableOut = 0.0
+    expectedVersion = pool.stateVersion
+  rejectsWith market assertAuthorizationError $ trySubmit parties.operator $ createCmd Holding with
+    instrument = treasuryInstrument
+    owner = parties.operator
+    amount = pool.treasuryReserveAmount
+    auditors = []
+  debug "SCENARIO 6 operator-only diversion rejected: PASS"
+
+  -- SCENARIO 7. Issuer-only archival, each issuer on its own participant.
+  forA_ [(parties.treasuryIssuer, pool.treasuryReserveCid), (parties.stableIssuer, pool.stableReserveCid)] $ \(issuer, reserveCid) -> do
+    let asIssuer = actAs issuer <> discloseMany (positionDisclosed :: disclosures)
+    rejectsWith market assertAuthorizationError $ trySubmit asIssuer $ archiveCmd reserveCid
+    rejectsWith market assertAuthorizationError $ trySubmit asIssuer $ archiveCmd current
+    rejectsWith market assertAuthorizationError $ trySubmit asIssuer $ archiveCmd providerPositionCid
+  debug "SCENARIO 7 issuer-only archival rejected: PASS"
+
+  -- SCENARIO 8. Operator and governance collusion across their two participants: governance
+  -- signs an unrestricted proxy that the operator exercises.
+  proxyCid <- submit parties.governance $ createCmd GovernanceProxy with
+    operator = parties.operator
+    governance = parties.governance
+  awaitActive [parties.operator] proxyCid
+  Some providerPosition <- queryContractId parties.provider providerPositionCid
+  let asColluder = actAs parties.operator <> discloseMany (victimDisclosed :: disclosures)
+  forA_ [pool.treasuryReserveCid, pool.stableReserveCid] $ \reserveCid ->
+    rejectsWith market assertAuthorizationError $ trySubmit asColluder $
+      exerciseCmd proxyCid ProxyArchiveReserve with reserveCid
+  rejectsWith market assertAuthorizationError $ trySubmit asColluder $
+    exerciseCmd proxyCid ProxyArchivePool with poolCid = current
+  rejectsWith market assertAuthorizationError $ trySubmit asColluder $
+    exerciseCmd proxyCid ProxyCreatePool with pool
+  rejectsWith market assertAuthorizationError $ trySubmit asColluder $
+    exerciseCmd proxyCid ProxyMintPosition with position = providerPosition with provider = parties.operator
+  rejectsWith market assertAuthorizationError $ trySubmit asColluder $
+    exerciseCmd proxyCid ProxySwapAsTrader with
+      poolCid = current
+      trader = parties.trader
+      inputHoldingCid = victimInput
+      inputAmount = amountOf 1000
+      deadline = attackDeadline
+      expectedVersion = pool.stateVersion
+  debug "SCENARIO 8 operator and governance collusion rejected: PASS"
+
+  -- SCENARIO 9. Disclosure and visibility, read on each role's own participant.
+  let poolContracts reader = do
+        pools <- query @SecurePool reader
+        reserves <- query @SecureReserveHolding reader
+        positions <- query @SecureLiquidityPosition reader
+        pure (length pools, length reserves, length positions)
+  forA_ (poolReaders market) (poolContracts >=> (=== (1, 2, 2)))
+  poolContracts parties.trader >>= (=== (0, 0, 0))
+  poolContracts parties.provider >>= (=== (0, 0, 2))
+  forA_ [parties.operator, parties.custodian, parties.governance, parties.provider] $ \reader -> do
+    seen <- queryContractId reader victimInput
+    assertMsg ("The trader's holding is visible to " <> show reader) (isNone seen)
+  auditorView <- queryContractId parties.auditor victimInput
+  assertMsg "The holding auditor does not see the trader's holding" (isSome auditorView)
+  rejectsWith market (assertInvisibleActive market [show current]) $ trySubmit parties.trader $
+    swapCommand current parties.trader TreasuryForStable victimInput 1000 0 attackDeadline pool.stateVersion
+  debug "SCENARIO 9 disclosure and visibility: PASS"
+
+  -- SCENARIO 10. Replay of consumed contracts.
+  rejectsWith market (Settlement.assertConsumedAmong [show swapInput]) $
+    trySubmit (actAs parties.trader <> discloseMany disclosures) $
+      swapCommand current parties.trader TreasuryForStable swapInput 1000 0 attackDeadline pool.stateVersion
+  replayApproval <- submit parties.governance $ createCmd ExecutionApproval with
+    operator = parties.operator
+    governance = parties.governance
+    intentCid
+    inputHoldingCid = victimInput
+  awaitActive [parties.operator] replayApproval
+  rejectsWith market (Settlement.assertConsumedAmong [show intentCid]) $
+    trySubmit (actAs parties.operator <> discloseMany [victimDisclosed]) $ exerciseCmd replayApproval ExecuteApproved
+  replayTreasury <- issue market treasuryInstrument parties.provider 5000000
+  replayStable <- issue market stableInstrument parties.provider 10000000
+  rejectsWith market (Settlement.assertConsumedAmong [show charterCid]) $
+    trySubmit parties.provider $ exerciseCmd charterCid InitializePool with
+      treasuryHoldingCid = replayTreasury
+      stableHoldingCid = replayStable
+      treasuryAmount = amountOf 5000000
+      stableAmount = amountOf 10000000
+  debug "SCENARIO 10 replay rejection: PASS"
+
+  pure state0 with poolCid = current
+
+-- PHASE 5. Run with a participant config that routes the core signers and the Treasury issuer
+-- to the trader's participant, which hosts none of them: it must refuse both submissions.
+mpImpersonation : MpState -> Script [Text]
+mpImpersonation state = do
+  forgedReserve <- trySubmit (actAs (coreSignatories state.lineage)) $ createCmd SecureReserveHolding with
+    lineage = state.lineage
+    genesisCid = state.charterCid
+    instrument = state.lineage.treasuryInstrument
+    amount = amountOf 1000000
+    auditors = []
+  forgedHolding <- trySubmit state.parties.treasuryIssuer $ createCmd Holding with
+    instrument = state.lineage.treasuryInstrument
+    owner = state.parties.trader
+    amount = amountOf 1000000
+    auditors = []
+  let outcome label result = case result of
+        Left err@UnknownError {unknownErrorMessage}
+          | "NO_SYNCHRONIZER_ON_WHICH_ALL_SUBMITTERS_CAN_SUBMIT" `isInfixOf` unknownErrorMessage ->
+            pure (label <> " rejected: " <> show err)
+        Left err -> abort (label <> " failed for another reason: " <> show err)
+        Right _ -> abort (label <> " was accepted by a participant that does not host its submitters")
+  reserveOutcome <- outcome "IMPERSONATION core-signed reserve from the trader participant" forgedReserve
+  holdingOutcome <- outcome "IMPERSONATION issuer-signed holding from the trader participant" forgedHolding
+  forA_ [reserveOutcome, holdingOutcome] debug
+  pure [reserveOutcome, holdingOutcome]
+
+-- PHASE 6. After PHASE 5: nothing was created, then a swap is attempted while the stablecoin
+-- issuer's participant is disconnected. It must not commit, and nothing may change.
+mpOfflineSwap : MpState -> Script MpLiveness
+mpOfflineSwap state = do
+  let market = marketOf state
+  let parties = state.parties
+  reserves <- query @SecureReserveHolding parties.custodian
+  length reserves === 2
+  forgedHoldings <- query @Holding parties.treasuryIssuer
+  [() | (_, holding) <- forgedHoldings, atomsOf holding.amount == 1000000, holding.owner == parties.trader] === []
+  (pool, treasuryReserve, stableReserve) <- checkSecurePool market state.poolCid
+  inputCid <- issue market state.lineage.treasuryInstrument parties.trader 1000
+  disclosures <- secureDisclosures market state.poolCid
+  deadline <- futureDeadline
+  result <- trySubmit (actAs parties.trader <> discloseMany disclosures) $
+    swapCommand state.poolCid parties.trader TreasuryForStable inputCid 1000 0 deadline pool.stateVersion
+  case result of
+    Left err@UnknownError {unknownErrorMessage}
+      | "MEDIATOR_SAYS_TX_TIMED_OUT" `isInfixOf` unknownErrorMessage ->
+        debug ("LIVENESS swap with the stablecoin issuer's participant disconnected rejected: " <> show err)
+    Left err -> abort ("The offline swap failed for another reason: " <> show err)
+    Right _ -> abort "A swap committed while the stablecoin issuer's participant was disconnected"
+  forA_ [parties.custodian, parties.operator, parties.governance, parties.treasuryIssuer, parties.auditor] $ \reader -> do
+    Some seen <- queryContractId reader state.poolCid
+    seen === pool
+  Some currentTreasury <- queryContractId parties.custodian pool.treasuryReserveCid
+  Some currentStable <- queryContractId parties.custodian pool.stableReserveCid
+  (currentTreasury, currentStable) === (treasuryReserve, stableReserve)
+  inputStill <- queryContractId parties.trader inputCid
+  assertMsg "The trader's input was consumed by a swap that did not commit" (isSome inputStill)
+  pure MpLiveness with state; inputCid
+
+-- PHASE 7. After reconnecting the stablecoin issuer's participant, the same swap settles.
+mpReconnectedSwap : MpLiveness -> Script ()
+mpReconnectedSwap liveness = do
+  let market = marketOf liveness.state
+  _ <- mpSwap market liveness.state.poolCid liveness.inputCid 1000 1993
+  debug "LIVENESS swap after reconnecting the stablecoin issuer's participant: PASS"

@@ -344,3 +344,73 @@ depositsWithForeignAuditorsAreRejectedLikeLegacy = do
         maximumStable = amountOf 1000000
         minimumShares = 0.0
         expectedVersion = 0
+
+-- Fee counters across swaps in both directions interleaved with a deposit, a full withdrawal and
+-- a second deposit, every step settled in full. Expected outputs, contributions and payouts are
+-- the integer formulas evaluated independently: 1,000 T -> 1,993 S; deposit mints 706,965 for
+-- 500,000 / 999,601; 2,500 S -> 1,246 T; burning 706,965 pays 499,886 / 999,827; 333 T -> 663 S;
+-- deposit mints 141,415 for 100,000 / 199,984; 10 S -> 4 T. Counters: Treasury 3 + 1 = 4 and
+-- stablecoin 8 + 1 = 9, unchanged by liquidity steps; final reserves 5,100,197 / 10,199,612 and
+-- supply 7,212,482.
+feeCountersStayExactAcrossMixedSwapsAndLiquidity : Script ()
+feeCountersStayExactAcrossMixedSwapsAndLiquidity = do
+  market <- standardSecureMarket "secure-mixed-fees"
+  let fixture = market.fixture
+  let trader = fixture.trader
+  let lp = market.secondProvider
+  let counters poolCid = do
+        Some pool <- queryContractId market.custodian poolCid
+        pure (atomsOf pool.treasuryFeeAmount, atomsOf pool.stableFeeAmount)
+  in1 <- issueTreasury fixture trader (amountOf 1000)
+  s1 <- settleSwap market trader market.initialized.poolCid TreasuryForStable in1 1000 1993
+  counters s1.poolCid >>= (=== (3, 0))
+  lpTreasury <- issueTreasury fixture lp (amountOf 500000)
+  lpStable <- issueStable fixture lp (amountOf 1000000)
+  a1 <- settleAdd market lp s1.poolCid lpTreasury lpStable 500000 1000000 706965 500000 999601
+  counters a1.poolCid >>= (=== (3, 0))
+  in2 <- issueStable fixture trader (amountOf 2500)
+  s2 <- settleSwap market trader a1.poolCid StableForTreasury in2 2500 1246
+  counters s2.poolCid >>= (=== (3, 8))
+  r1 <- settleRemove market lp s2.poolCid a1.positionCid 706965 499886 999827
+  counters r1.poolCid >>= (=== (3, 8))
+  in3 <- issueTreasury fixture trader (amountOf 333)
+  s3 <- settleSwap market trader r1.poolCid TreasuryForStable in3 333 663
+  counters s3.poolCid >>= (=== (4, 8))
+  providerTreasury <- issueTreasury fixture fixture.provider (amountOf 100000)
+  providerStable <- issueStable fixture fixture.provider (amountOf 200000)
+  a2 <- settleAdd market fixture.provider s3.poolCid providerTreasury providerStable 100000 200000 141415 100000 199984
+  counters a2.poolCid >>= (=== (4, 8))
+  in4 <- issueStable fixture trader (amountOf 10)
+  s4 <- settleSwap market trader a2.poolCid StableForTreasury in4 10 4
+  counters s4.poolCid >>= (=== (4, 9))
+  (final, _, _) <- checkSecurePool market s4.poolCid
+  (atomsOf final.treasuryReserveAmount, atomsOf final.stableReserveAmount, atomsOf final.totalShares, final.stateVersion)
+    === (5100197, 10199612, 7212482, 7)
+
+-- Coexistence on one ledger. Actors: the operator of a legacy pool over the same instruments,
+-- with the same issuers, governance and auditor as a Secure V1 pool. The operator alone moves the
+-- legacy reserves to itself, which the legacy model allows. Expected: the legacy diversion
+-- succeeds; the Secure V1 ledger snapshot is unchanged by it, and a swap on the Secure V1 pool
+-- still settles exactly (1,000 T -> 1,993 S).
+legacyOperatorDiversionCannotReachSecureReserves : Script ()
+legacyOperatorDiversionCannotReachSecureReserves = do
+  market <- standardSecureMarket "secure-coexistence"
+  let fixture = market.fixture
+  legacy <- initializePool fixture "legacy-coexistence" (amountOf 5000000) (amountOf 10000000)
+  Some legacyPool <- queryContractId fixture.operator legacy.poolCid
+  Some secureBefore <- queryContractId market.custodian market.initialized.poolCid
+  secureReservesBefore <- query @SecureReserveHolding market.custodian
+  forA_ [legacyPool.treasuryReserveHoldingCid, legacyPool.stableReserveHoldingCid] $ \reserveCid -> do
+    Some reserve <- queryContractId fixture.operator reserveCid
+    moved <- submit fixture.operator $ exerciseCmd reserveCid TransferExact with
+      newOwner = fixture.operator
+      transferAmount = reserve.amount
+    Some movedHolding <- queryContractId fixture.operator moved.movedHoldingCid
+    movedHolding.owner === fixture.operator
+  Some secureAfter <- queryContractId market.custodian market.initialized.poolCid
+  secureAfter === secureBefore
+  query @SecureReserveHolding market.custodian >>= (=== secureReservesBefore)
+  _ <- checkSecurePool market market.initialized.poolCid
+  inputCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  _ <- settleSwap market fixture.trader market.initialized.poolCid TreasuryForStable inputCid 1000 1993
+  pure ()

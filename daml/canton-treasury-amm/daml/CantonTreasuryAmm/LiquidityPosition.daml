@@ -1,6 +1,3 @@
--- LEGACY MVP LP position for `CantonTreasuryAmm.Pool`: the operator and governance can create
--- or burn positions outside pool accounting. Not a secure position model; see
--- `CantonTreasuryAmm.SecureV1` and `SECURE_V1.md`.
 module CantonTreasuryAmm.LiquidityPosition where
 
 import CantonTreasuryAmm.Errors

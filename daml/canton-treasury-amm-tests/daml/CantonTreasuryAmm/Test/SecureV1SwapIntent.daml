@@ -10,6 +10,7 @@ import DA.Time (hours)
 import Daml.Script
 
 import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.SecureV1.Errors
 import CantonTreasuryAmm.SecureV1.Pool
 import CantonTreasuryAmm.SecureV1.SwapIntent
 import CantonTreasuryAmm.Test.Fixtures
@@ -276,3 +277,44 @@ secureIntentControlsMatchTheLegacyRoles = do
   rejectsWith market (assertConsumedContract intentCid) $ executeAs market (controllersOf market) intentCid inputCid
   Some input <- queryContractId fixture.trader inputCid
   atomsOf input.amount === 1000
+
+-- Input selection. The intent names an amount, not a holding: the executors choose which of the
+-- trader's holdings to debit. Actors: the operator and governance, executing a 1,000 Treasury
+-- intent while the trader holds a 1,000 holding it meant to use, a larger 7,000 holding, a
+-- stablecoin holding, a Treasury holding with no auditors, and a 400 Treasury holding.
+-- Expected: the wrong instrument fails `amm/instrument-mismatch`, the unaudited holding
+-- `amm/incompatible-holdings` and the short holding `amm/insufficient-balance`, each leaving the
+-- intent active and nothing changed. The executors can still pick the larger holding instead
+-- of the intended one: exactly 1,000 is debited from it, 6,000 is returned to the trader as
+-- change, the output 1,993 goes to the trader, and the intended holding is untouched. Choosing
+-- among the trader's eligible holdings is the executors' residual discretion; it cannot change
+-- the amount, the output's recipient, the deadline or the minimum.
+executorsChooseOnlyAmongTheTradersEligibleHoldings : Script ()
+executorsChooseOnlyAmongTheTradersEligibleHoldings = do
+  market <- standardSecureMarket "intent-input-selection"
+  let fixture = market.fixture
+  factoryCid <- createSecureFactory market [fixture.trader]
+  deadline <- futureDeadline
+  intentCid <- submitIntent market factoryCid market.initialized.poolCid TreasuryForStable 1000 0 deadline
+  intendedCid <- issueTreasury fixture fixture.trader (amountOf 1000)
+  largerCid <- issueTreasury fixture fixture.trader (amountOf 7000)
+  stableCid <- issueStable fixture fixture.trader (amountOf 1000)
+  unauditedCid <- submit fixture.treasuryIssuer $ createCmd Holding with
+    instrument = fixture.treasuryInstrument
+    owner = fixture.trader
+    amount = amountOf 1000
+    auditors = []
+  shortCid <- issueTreasury fixture fixture.trader (amountOf 400)
+  forA_
+    [ (stableCid, instrumentMismatchError)
+    , (unauditedCid, incompatibleHoldingsError)
+    , (shortCid, insufficientBalanceError)
+    ] $ \(holdingCid, errorId) -> do
+      rejectsWith market (assertFailureId errorId) $ executeAs market (controllersOf market) intentCid holdingCid
+      assertIntentActive market intentCid
+  result <- settleIntent market intentCid market.initialized.poolCid TreasuryForStable largerCid 1000 1993
+  Some changeCid <- pure result.inputChangeHoldingCid
+  Some change <- queryContractId fixture.trader changeCid
+  (change.owner, change.instrument, atomsOf change.amount) === (fixture.trader, fixture.treasuryInstrument, 6000)
+  Some intended <- queryContractId fixture.trader intendedCid
+  (intended.owner, atomsOf intended.amount) === (fixture.trader, 1000)
