@@ -1,3 +1,4 @@
 packages:
   - ./daml/canton-treasury-amm
+  - ./daml/canton-treasury-amm-live-reserve-prototype
   - ./daml/canton-treasury-amm-tests

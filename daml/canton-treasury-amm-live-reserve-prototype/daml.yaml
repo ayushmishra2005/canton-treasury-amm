@@ -1,0 +1,11 @@
+sdk-version: 3.5.5
+name: canton-treasury-amm-live-reserve-prototype
+version: 0.1.0
+source: daml
+dependencies:
+  - daml-prim
+  - daml-stdlib
+data-dependencies:
+  - ../../lib/splice-api-token-metadata-v1-1.0.0.dar
+  - ../../lib/splice-api-token-holding-v1-1.0.0.dar
+  - ../canton-treasury-amm/.daml/dist/canton-treasury-amm-0.1.0.dar

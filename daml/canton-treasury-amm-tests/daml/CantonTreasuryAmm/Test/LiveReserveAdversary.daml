@@ -1,0 +1,51 @@
+-- Test-only adversary templates for the live-reserve prototype. Any coalition can write, upload
+-- and sign contracts like these; their choices carry only the signers' and controller's
+-- authority, so they show what that authority alone can reach.
+module CantonTreasuryAmm.Test.LiveReserveAdversary where
+
+import CantonTreasuryAmm.LiveReservePrototype
+
+-- A pool-like state with the genuine lineage, genesis and reserve references, signed by forgers.
+template CounterfeitLivePool
+  with
+    forgers : [Party]
+    lineage : LiveLineage
+    genesisCid : ContractId LiveCharter
+    treasuryReserveCid : ContractId ReserveHolding
+    stableReserveCid : ContractId ReserveHolding
+  where
+    signatory forgers
+
+    choice CounterfeitPayout : DisburseResult
+      with
+        recipient : Party
+        payoutAtoms : Int
+      controller forgers
+      do
+        exercise treasuryReserveCid Disburse with recipient; payoutAtoms
+
+-- A generic standing authorization: the grantors pre-authorize the holder to move or retire
+-- any reserve, the way a custodian mandate pre-authorizes releases.
+template ReserveMandate
+  with
+    grantors : [Party]
+    holder : Party
+  where
+    signatory grantors
+    observer holder
+
+    nonconsuming choice DrawReserve : DisburseResult
+      with
+        reserveCid : ContractId ReserveHolding
+        recipient : Party
+        payoutAtoms : Int
+      controller holder
+      do
+        exercise reserveCid Disburse with recipient; payoutAtoms
+
+    nonconsuming choice RetireReserve : ()
+      with
+        reserveCid : ContractId ReserveHolding
+      controller holder
+      do
+        archive reserveCid

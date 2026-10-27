@@ -113,7 +113,7 @@ Deployment-dependent ([Privacy](https://archived.docs.digitalasset.com/overview/
 - A stakeholder who withholds disclosure denies trading to non-stakeholders. Disclosure delivery
   is off-ledger and not modelled.
 - Explicit disclosure must be enabled on participants (default on).
-- Stale disclosed contracts: on the Canton 3.5.19 sandbox, a swap on a consumed pool supplied
+- Stale disclosed contracts: on the Canton 3.5.12 sandbox (SDK 3.5.5), a swap on a consumed pool supplied
   via stale explicit disclosure passed submitter interpretation and was rejected at confirmation
   as `LOCAL_VERDICT_INACTIVE_CONTRACTS`; the IDE ledger rejects it as `ContractNotFound`. Both
   reject without state change. Multi-participant topologies were not tested.

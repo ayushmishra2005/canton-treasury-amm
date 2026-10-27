@@ -1,0 +1,431 @@
+-- PROTOTYPE ONLY. Isolated model of an AMM whose reserves are live, protected holding contracts.
+-- It is not the production AMM and is not deployed; `SECURITY_AND_INTEGRATION.md` in this
+-- package records the trust model and the integration assessment.
+--
+-- Asset model: reserves are `ReserveHolding`s, a protected holding template the instrument
+-- issuers must adopt. An ordinary production `Holding` cannot serve as a protected reserve: its
+-- issuer alone can archive it and its owner alone can move it, whoever holds its contract ID.
+-- Deposits convert ordinary holdings into the reserve and payouts convert reserve value back:
+-- the depositor's holding moves to the custodian under the depositor's own authority and is
+-- retired, and the reserve successor grows by exactly that amount; a payout is a new ordinary
+-- holding and a reserve successor smaller by exactly that amount. Each conversion is issuer-
+-- authorized ledger accounting; nothing here evidences off-ledger backing.
+--
+-- Authorization: every charter, pool state, reserve and position needs the custodian, the
+-- operator and both issuers as signatories (positions also their provider), and those parties
+-- must be distinct. Reserves move only through `AbsorbDeposit` and `Disburse`, controlled by all
+-- four, so only a contract carrying all four signatures can move them: the genuine pool state,
+-- or something that full coalition signs. No strict subset can move, archive or create a
+-- reserve, and no single-party mandate supplies enough authority.
+--
+-- Identity: a signatory set is not an identifier. Pool states, reserves and positions carry
+-- `genesisCid`, the consumed charter's contract ID; the pool accepts only reserves of its own
+-- genesis and redeems only positions of its own genesis. The full coalition can still create
+-- any state, reserve or position, including copies of a genesis ID; it is trusted.
+module CantonTreasuryAmm.LiveReservePrototype where
+
+import DA.List (unique)
+import DA.TextMap qualified as TextMap
+
+import Splice.Api.Token.HoldingV1 qualified as TokenStandard
+import Splice.Api.Token.MetadataV1 (Metadata (..))
+
+import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.Math
+import CantonTreasuryAmm.Pool (validateSwap)
+import CantonTreasuryAmm.Token
+import CantonTreasuryAmm.Types
+
+data LiveLineage = LiveLineage with
+  custodian : Party
+  operator : Party
+  governance : Party
+  treasuryInstrument : InstrumentId
+  stableInstrument : InstrumentId
+  charterReference : Text
+    deriving (Eq, Show)
+
+liveSignatories : LiveLineage -> [Party]
+liveSignatories lineage =
+  [lineage.custodian, lineage.operator, lineage.treasuryInstrument.issuer, lineage.stableInstrument.issuer]
+
+lineageIsIndependent : LiveLineage -> Bool
+lineageIsIndependent lineage =
+  lineage.treasuryInstrument /= lineage.stableInstrument
+    && unique (lineage.governance :: liveSignatories lineage)
+
+data AbsorbResult = AbsorbResult with
+  reserveCid : ContractId ReserveHolding
+  changeCid : Optional (ContractId Holding)
+    deriving (Eq, Show)
+
+data DisburseResult = DisburseResult with
+  reserveCid : ContractId ReserveHolding
+  payoutCid : ContractId Holding
+    deriving (Eq, Show)
+
+data LiveInitializeResult = LiveInitializeResult with
+  poolCid : ContractId LivePool
+  positionCid : ContractId LivePosition
+  treasuryChangeCid : Optional (ContractId Holding)
+  stableChangeCid : Optional (ContractId Holding)
+    deriving (Eq, Show)
+
+data LiveSwapResult = LiveSwapResult with
+  poolCid : ContractId LivePool
+  outputHoldingCid : ContractId Holding
+  inputChangeCid : Optional (ContractId Holding)
+  amountOut : Decimal
+    deriving (Eq, Show)
+
+data LiveAddResult = LiveAddResult with
+  poolCid : ContractId LivePool
+  positionCid : ContractId LivePosition
+  treasuryChangeCid : Optional (ContractId Holding)
+  stableChangeCid : Optional (ContractId Holding)
+  mintedShares : Decimal
+  usedTreasury : Decimal
+  usedStable : Decimal
+    deriving (Eq, Show)
+
+data LiveRemoveResult = LiveRemoveResult with
+  poolCid : ContractId LivePool
+  remainingPositionCid : Optional (ContractId LivePosition)
+  treasuryPayoutCid : Optional (ContractId Holding)
+  stablePayoutCid : Optional (ContractId Holding)
+  treasuryOut : Decimal
+  stableOut : Decimal
+    deriving (Eq, Show)
+
+-- Moves `atoms` of the depositor's holding to the custodian and retires the moved part. The
+-- move is the owner-controlled `TransferExact`, so it needs the depositor's own authority; the
+-- retirement needs the issuer's. The owner check reports a foreign holding as a domain error
+-- before the authorization failure the transfer would otherwise raise.
+retireHolding : InstrumentId -> Party -> Party -> ContractId Holding -> Int -> Update (Optional (ContractId Holding))
+retireHolding instrument custodian depositor holdingCid atoms = do
+  holding <- fetch holdingCid
+  requireDomain (holding.instrument == instrument) instrumentMismatchError "Deposit uses the wrong instrument"
+  requireDomain (holding.owner == depositor) ownerMismatchError "Depositor does not own the holding"
+  requireDomain (atoms > 0) invalidAmountError "Deposit must be positive"
+  requireState (atoms <= atomsOf holding.amount) insufficientBalanceError "Deposit exceeds the holding balance"
+  transfer <- exercise holdingCid TransferExact with
+    newOwner = custodian
+    transferAmount = amountOf atoms
+  archive transfer.movedHoldingCid
+  pure transfer.changeHoldingCid
+
+-- A live, protected pool reserve. Its own choices conserve value: `AbsorbDeposit` grows it by
+-- exactly the retired deposit, `Disburse` shrinks it by exactly the new payout holding, and
+-- neither can empty it.
+template ReserveHolding
+  with
+    lineage : LiveLineage
+    genesisCid : ContractId LiveCharter
+    instrument : InstrumentId
+    amount : Decimal
+  where
+    signatory liveSignatories lineage
+    observer lineage.governance
+    ensure
+      isPositiveCapped amount
+        && (instrument == lineage.treasuryInstrument || instrument == lineage.stableInstrument)
+        && lineageIsIndependent lineage
+
+    choice AbsorbDeposit : AbsorbResult
+      with
+        depositor : Party
+        holdingCid : ContractId Holding
+        depositAtoms : Int
+      controller depositor :: liveSignatories lineage
+      do
+        let reserveAtoms = atomsOf amount
+        requireDomain (reserveAtoms + depositAtoms <= maxReserveAtoms) reserveCapError "Reserve would exceed the atom cap"
+        changeCid <- retireHolding instrument lineage.custodian depositor holdingCid depositAtoms
+        reserveCid <- create this with amount = amountOf (reserveAtoms + depositAtoms)
+        pure AbsorbResult with reserveCid; changeCid
+
+    choice Disburse : DisburseResult
+      with
+        recipient : Party
+        payoutAtoms : Int
+      controller liveSignatories lineage
+      do
+        let reserveAtoms = atomsOf amount
+        requireState (payoutAtoms > 0 && payoutAtoms < reserveAtoms) insufficientLiquidityError
+          "Payout is empty or exhausts the reserve"
+        payoutCid <- create Holding with
+          instrument
+          owner = recipient
+          amount = amountOf payoutAtoms
+          auditors = []
+        reserveCid <- create this with amount = amountOf (reserveAtoms - payoutAtoms)
+        pure DisburseResult with reserveCid; payoutCid
+
+    -- The view adds no movement path: the standard interface declares no choices. The custodian
+    -- is reported as owner and every party whose authority a movement needs as a lock holder.
+    interface instance TokenStandard.Holding for ReserveHolding where
+      view = TokenStandard.HoldingView with
+        owner = lineage.custodian
+        instrumentId = standardInstrumentId instrument
+        amount
+        lock = Some TokenStandard.Lock with
+          holders = liveSignatories lineage
+          expiresAt = None
+          expiresAfter = None
+          context = Some "AMM pool reserve; moves only through pool settlement"
+        meta = Metadata with
+          values = TextMap.fromList [("canton-treasury-amm.prototype/charter-reference", lineage.charterReference)]
+
+template LiveCharter
+  with
+    lineage : LiveLineage
+    initialProvider : Party
+  where
+    signatory liveSignatories lineage
+    observer initialProvider, lineage.governance
+    ensure lineageIsIndependent lineage
+
+    choice InitializePool : LiveInitializeResult
+      with
+        treasuryHoldingCid : ContractId Holding
+        stableHoldingCid : ContractId Holding
+        treasuryAmount : Decimal
+        stableAmount : Decimal
+      controller initialProvider
+      do
+        requireDomain (treasuryAmount > 0.0 && stableAmount > 0.0) invalidAmountError "Initial deposits must be positive"
+        requireDomain (treasuryAmount <= maxReserveAmount && stableAmount <= maxReserveAmount) reserveCapError
+          "Initial reserve exceeds the atom cap"
+        let treasuryAtoms = atomsOf treasuryAmount
+        let stableAtoms = atomsOf stableAmount
+        let grossShares = floorSqrtWide (wide treasuryAtoms * wide stableAtoms)
+        requireDomain (grossShares >= minimumInitialSharesAtoms) initialLiquidityError
+          "Initial liquidity is below the minimum share threshold"
+        treasuryChangeCid <- retireHolding lineage.treasuryInstrument lineage.custodian initialProvider treasuryHoldingCid treasuryAtoms
+        stableChangeCid <- retireHolding lineage.stableInstrument lineage.custodian initialProvider stableHoldingCid stableAtoms
+        treasuryReserveCid <- create ReserveHolding with
+          lineage
+          genesisCid = self
+          instrument = lineage.treasuryInstrument
+          amount = amountOf treasuryAtoms
+        stableReserveCid <- create ReserveHolding with
+          lineage
+          genesisCid = self
+          instrument = lineage.stableInstrument
+          amount = amountOf stableAtoms
+        poolCid <- create LivePool with
+          lineage
+          genesisCid = self
+          treasuryReserveCid
+          stableReserveCid
+          totalShares = amountOf grossShares
+          lockedShares = amountOf lockedSharesAtoms
+          stateVersion = 0
+        positionCid <- create LivePosition with
+          lineage
+          genesisCid = self
+          provider = initialProvider
+          shares = amountOf (grossShares - lockedSharesAtoms)
+        pure LiveInitializeResult with poolCid; positionCid; treasuryChangeCid; stableChangeCid
+
+-- The authenticated pool state. Reserve amounts are read from the live reserves it references,
+-- so there is no separate balance to reconcile.
+template LivePool
+  with
+    lineage : LiveLineage
+    genesisCid : ContractId LiveCharter
+    treasuryReserveCid : ContractId ReserveHolding
+    stableReserveCid : ContractId ReserveHolding
+    totalShares : Decimal
+    lockedShares : Decimal
+    stateVersion : Int
+  where
+    signatory liveSignatories lineage
+    observer lineage.governance
+    ensure
+      totalShares >= lockedShares
+        && totalShares <= maxReserveAmount
+        && lockedShares == amountOf lockedSharesAtoms
+        && lineageIsIndependent lineage
+
+    choice SwapExactInput : LiveSwapResult
+      with
+        trader : Party
+        direction : SwapDirection
+        inputHoldingCid : ContractId Holding
+        inputAmount : Decimal
+        minimumAmountOut : Decimal
+        deadline : Time
+        expectedVersion : Int
+      controller trader
+      do
+        requireState (stateVersion == expectedVersion) staleStateError "Pool state version is stale"
+        now <- getTime
+        requireState (now < deadline) deadlineError "Swap deadline has expired"
+        requireDomain (inputAmount > 0.0 && minimumAmountOut >= 0.0) invalidAmountError
+          "Swap amounts must be positive or zero as required"
+        requireDomain (inputAmount <= maxReserveAmount && minimumAmountOut <= maxReserveAmount) reserveCapError
+          "Swap amount exceeds the atom cap"
+        (treasuryReserve, stableReserve) <- fetchReserves this
+        let inputAtoms = atomsOf inputAmount
+        let (inputReserveCid, outputReserveCid, reserveInAtoms, reserveOutAtoms) = case direction of
+              TreasuryForStable -> (treasuryReserveCid, stableReserveCid, atomsOf treasuryReserve.amount, atomsOf stableReserve.amount)
+              StableForTreasury -> (stableReserveCid, treasuryReserveCid, atomsOf stableReserve.amount, atomsOf treasuryReserve.amount)
+        requireDomain (reserveInAtoms + inputAtoms <= maxReserveAtoms) reserveCapError "Input reserve would exceed the atom cap"
+        let outputAtoms = swapOutputAtoms reserveInAtoms reserveOutAtoms inputAtoms
+        validateSwap reserveInAtoms reserveOutAtoms inputAtoms outputAtoms (atomsOf minimumAmountOut)
+        absorbed <- exercise inputReserveCid AbsorbDeposit with
+          depositor = trader
+          holdingCid = inputHoldingCid
+          depositAtoms = inputAtoms
+        paid <- exercise outputReserveCid Disburse with
+          recipient = trader
+          payoutAtoms = outputAtoms
+        poolCid <- create this with
+          treasuryReserveCid = if direction == TreasuryForStable then absorbed.reserveCid else paid.reserveCid
+          stableReserveCid = if direction == TreasuryForStable then paid.reserveCid else absorbed.reserveCid
+          stateVersion = stateVersion + 1
+        pure LiveSwapResult with
+          poolCid
+          outputHoldingCid = paid.payoutCid
+          inputChangeCid = absorbed.changeCid
+          amountOut = amountOf outputAtoms
+
+    choice AddLiquidity : LiveAddResult
+      with
+        provider : Party
+        treasuryHoldingCid : ContractId Holding
+        stableHoldingCid : ContractId Holding
+        maximumTreasury : Decimal
+        maximumStable : Decimal
+        minimumShares : Decimal
+        expectedVersion : Int
+      controller provider
+      do
+        requireState (stateVersion == expectedVersion) staleStateError "Pool state version is stale"
+        requireDomain (maximumTreasury > 0.0 && maximumStable > 0.0 && minimumShares >= 0.0) invalidAmountError
+          "Liquidity amounts must be positive or zero as required"
+        requireDomain (maximumTreasury <= maxReserveAmount && maximumStable <= maxReserveAmount && minimumShares <= maxReserveAmount)
+          reserveCapError "Liquidity amount exceeds the atom cap"
+        (treasuryReserve, stableReserve) <- fetchReserves this
+        let treasuryReserveAtoms = atomsOf treasuryReserve.amount
+        let stableReserveAtoms = atomsOf stableReserve.amount
+        let totalShareAtoms = atomsOf totalShares
+        treasuryLimitedShares <- narrowAtoms (wideMulFloor (atomsOf maximumTreasury) totalShareAtoms treasuryReserveAtoms)
+        stableLimitedShares <- narrowAtoms (wideMulFloor (atomsOf maximumStable) totalShareAtoms stableReserveAtoms)
+        let mintedShareAtoms = min treasuryLimitedShares stableLimitedShares
+        requireState (mintedShareAtoms > 0) insufficientLiquidityError "Contribution mints no shares"
+        requireDomain (mintedShareAtoms >= atomsOf minimumShares) slippageError "Minted shares are below the provider minimum"
+        usedTreasuryAtoms <- narrowAtoms (wideMulCeil mintedShareAtoms treasuryReserveAtoms totalShareAtoms)
+        usedStableAtoms <- narrowAtoms (wideMulCeil mintedShareAtoms stableReserveAtoms totalShareAtoms)
+        requireDomain (totalShareAtoms + mintedShareAtoms <= maxReserveAtoms) reserveCapError "LP supply would exceed the atom cap"
+        treasuryAbsorbed <- exercise treasuryReserveCid AbsorbDeposit with
+          depositor = provider
+          holdingCid = treasuryHoldingCid
+          depositAtoms = usedTreasuryAtoms
+        stableAbsorbed <- exercise stableReserveCid AbsorbDeposit with
+          depositor = provider
+          holdingCid = stableHoldingCid
+          depositAtoms = usedStableAtoms
+        poolCid <- create this with
+          treasuryReserveCid = treasuryAbsorbed.reserveCid
+          stableReserveCid = stableAbsorbed.reserveCid
+          totalShares = amountOf (totalShareAtoms + mintedShareAtoms)
+          stateVersion = stateVersion + 1
+        positionCid <- create LivePosition with
+          lineage
+          genesisCid
+          provider
+          shares = amountOf mintedShareAtoms
+        pure LiveAddResult with
+          poolCid
+          positionCid
+          treasuryChangeCid = treasuryAbsorbed.changeCid
+          stableChangeCid = stableAbsorbed.changeCid
+          mintedShares = amountOf mintedShareAtoms
+          usedTreasury = amountOf usedTreasuryAtoms
+          usedStable = amountOf usedStableAtoms
+
+    choice RemoveLiquidity : LiveRemoveResult
+      with
+        provider : Party
+        positionCid : ContractId LivePosition
+        burnShares : Decimal
+        minimumTreasuryOut : Decimal
+        minimumStableOut : Decimal
+        expectedVersion : Int
+      controller provider
+      do
+        requireState (stateVersion == expectedVersion) staleStateError "Pool state version is stale"
+        position <- fetch positionCid
+        requireDomain (position.lineage == lineage) positionError "Position belongs to another pool lineage"
+        requireDomain (position.genesisCid == genesisCid) positionError "Position belongs to another pool instance"
+        requireDomain (position.provider == provider) ownerMismatchError "Provider does not own the position"
+        requireDomain (burnShares > 0.0 && minimumTreasuryOut >= 0.0 && minimumStableOut >= 0.0) invalidAmountError
+          "Removal amounts must be positive or zero as required"
+        (treasuryReserve, stableReserve) <- fetchReserves this
+        let burnShareAtoms = atomsOf burnShares
+        let positionShareAtoms = atomsOf position.shares
+        let totalShareAtoms = atomsOf totalShares
+        requireState (burnShareAtoms <= positionShareAtoms) positionError "Burn exceeds the position"
+        requireState (burnShareAtoms <= totalShareAtoms - atomsOf lockedShares) positionError "Burn would consume locked shares"
+        treasuryOutAtoms <- narrowAtoms (wideMulFloor burnShareAtoms (atomsOf treasuryReserve.amount) totalShareAtoms)
+        stableOutAtoms <- narrowAtoms (wideMulFloor burnShareAtoms (atomsOf stableReserve.amount) totalShareAtoms)
+        requireState (treasuryOutAtoms > 0 || stableOutAtoms > 0) insufficientLiquidityError "Burn produces no output"
+        requireDomain (treasuryOutAtoms >= atomsOf minimumTreasuryOut && stableOutAtoms >= atomsOf minimumStableOut)
+          slippageError "Liquidity output is below its minimum"
+        archive positionCid
+        remainingPositionCid <-
+          if burnShareAtoms == positionShareAtoms
+            then pure None
+            else Some <$> create position with shares = amountOf (positionShareAtoms - burnShareAtoms)
+        (treasuryPayoutCid, nextTreasuryReserveCid) <- disburseIfPositive treasuryReserveCid provider treasuryOutAtoms
+        (stablePayoutCid, nextStableReserveCid) <- disburseIfPositive stableReserveCid provider stableOutAtoms
+        poolCid <- create this with
+          treasuryReserveCid = nextTreasuryReserveCid
+          stableReserveCid = nextStableReserveCid
+          totalShares = amountOf (totalShareAtoms - burnShareAtoms)
+          stateVersion = stateVersion + 1
+        pure LiveRemoveResult with
+          poolCid
+          remainingPositionCid
+          treasuryPayoutCid
+          stablePayoutCid
+          treasuryOut = amountOf treasuryOutAtoms
+          stableOut = amountOf stableOutAtoms
+
+-- An LP entitlement with no choices. It changes only inside `RemoveLiquidity`, and its implicit
+-- `Archive` needs every lineage signatory and the provider.
+template LivePosition
+  with
+    lineage : LiveLineage
+    genesisCid : ContractId LiveCharter
+    provider : Party
+    shares : Decimal
+  where
+    signatory provider :: liveSignatories lineage
+    ensure isPositiveCapped shares && lineageIsIndependent lineage
+
+-- Both referenced reserves must be live, of this pool's lineage and genesis, and of the right
+-- instrument; a reference to any other reserve fails before value moves.
+fetchReserves : LivePool -> Update (ReserveHolding, ReserveHolding)
+fetchReserves pool = do
+  treasuryReserve <- fetch pool.treasuryReserveCid
+  stableReserve <- fetch pool.stableReserveCid
+  requireState (reserveBelongsTo pool pool.lineage.treasuryInstrument treasuryReserve) reserveMismatchError
+    "Treasury reserve does not belong to this pool"
+  requireState (reserveBelongsTo pool pool.lineage.stableInstrument stableReserve) reserveMismatchError
+    "Stablecoin reserve does not belong to this pool"
+  pure (treasuryReserve, stableReserve)
+
+reserveBelongsTo : LivePool -> InstrumentId -> ReserveHolding -> Bool
+reserveBelongsTo pool instrument reserve =
+  reserve.lineage == pool.lineage && reserve.genesisCid == pool.genesisCid && reserve.instrument == instrument
+
+disburseIfPositive : ContractId ReserveHolding -> Party -> Int -> Update (Optional (ContractId Holding), ContractId ReserveHolding)
+disburseIfPositive reserveCid recipient payoutAtoms =
+  if payoutAtoms == 0
+    then pure (None, reserveCid)
+    else do
+      paid <- exercise reserveCid Disburse with recipient; payoutAtoms
+      pure (Some paid.payoutCid, paid.reserveCid)
