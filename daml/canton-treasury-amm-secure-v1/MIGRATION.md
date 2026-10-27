@@ -1,9 +1,11 @@
 # Legacy-to-Secure V1 migration design
 
 This is a design for moving liquidity from legacy pools into Secure V1. It is not authorized and
-must not be executed as written. It contains no live commands, archives no legacy position, moves
-no legacy reserve and promises no in-place upgrade. Every step needs its own approval, its own
-tooling review and a rehearsal on a non-production network.
+must not be executed against real assets. It contains no live commands, archives no legacy
+position, moves no legacy reserve and promises no in-place upgrade. It has been rehearsed with
+synthetic assets only (see [Rehearsal](#rehearsal)). A real migration still needs its own
+approval for every step, reviewed tooling, and the approvals listed in
+[`RELEASE_READINESS.md`](RELEASE_READINESS.md#remaining-blockers).
 
 **Default: parallel deployment.** The legacy package (`canton-treasury-amm` 0.1.0,
 `d8cadd3c…`) stays deployed and unchanged. Secure V1 (`canton-treasury-amm-secure-v1` 0.2.0,
@@ -138,15 +140,123 @@ stay bound to the legacy package; nothing converts them.
     - If a legacy pool freezes mid-migration, apply step 8.
     - Keep every snapshot and reconciliation as evidence.
 
-## Implementation gaps
+## Atomicity and coordination
 
-The following are not implemented:
-- inventory, snapshot and reconciliation tooling;
-- an onboarding procedure agreed with the custodian and issuers (the workflow itself is in
-  [`ONBOARDING.md`](ONBOARDING.md));
-- a legacy withdrawal-window procedure;
-- an operational procedure for using the Secure V1 pause (the mechanism is in
-  [`PAUSE.md`](PAUSE.md)) and for permanent signer loss (decisions listed in
-  [`PAUSE.md`](PAUSE.md#permanent-signer-loss));
-- a decision on legacy dust;
-- a rehearsal on a non-production network.
+No transaction spans the migration. Each of the following is atomic on its own, so a failure
+leaves the state before it:
+
+| Step | Atomic unit | Who submits |
+| --- | --- | --- |
+| Legacy exit (step 7) | One `RemoveLiquidity`: the position burns, both payouts go to the provider, the pool state moves by exactly the payout | The provider |
+| Charter onboarding (step 9) | Each proposal, approval and finalization separately; finalization creates the charter only with all four approvals before expiry | The operator, then each core signer, then the operator |
+| Secure V1 initialization (step 9) | One `InitializePool`: both deposits, both reserves, the pool, the provider's position and the change | The initial provider |
+| Each later deposit, swap or withdrawal | One Secure V1 choice | The LP or trader |
+
+Everything between these steps is off-ledger coordination:
+- the inventory, snapshots and reconciliation (steps 1–5, 10 and 12);
+- the order in which LPs exit, since each exit consumes the legacy pool state;
+- the time an LP holds its legacy proceeds before depositing them, during which they are
+  ordinary holdings in its own name;
+- the initial provider's choice of ratio, and when the charter is initialized;
+- the decision that the migration of a pool is complete.
+
+Between a provider's legacy exit and its Secure V1 deposit, no one else can move its proceeds.
+Between initialization and a later LP's deposit, swaps can move the Secure V1 price, and that
+LP sets its own maxima and minimum shares.
+
+## Stop conditions
+
+Stop the migration of a pool, record the evidence, and leave the decision to the people
+named:
+
+| Condition | Detected by | Who decides |
+| --- | --- | --- |
+| No active legacy `Pool` for the `PoolId`, or more than one | `LegacyPoolMissing`, `LegacyPoolDuplicated` | Operator, governance, both issuers |
+| A referenced legacy reserve is inactive (step 8) | `LegacyReserveInactive` | Both issuers and every affected LP |
+| A referenced reserve has another instrument, owner or amount than the pool records | `LegacyReserveMismatch` | Both issuers and every affected LP |
+| Positions plus the locked share differ from `totalShares` (step 5) | `LegacySupplyMismatch` | Every affected LP |
+| A provider does not recognize its position, or a position no provider claims | Step 4 | That provider and governance |
+| An exit pays anything other than the computed claim, or another LP's claim falls | `checkLegacyExit` | Every affected LP |
+| A Secure V1 approval or finalization fails for any reason other than an honest retry | Onboarding errors | The four core signers |
+| The Secure V1 pool, its reserves, its positions or the instrument totals differ from the expectation | `secureMismatches` | The four core signers, both issuers |
+| A core participant is unreachable for longer than an agreed window | Timed-out submissions | The four core signers; see [Pause and signer loss](#pause-and-signer-loss) |
+
+In none of these cases does anyone create, archive, move or re-issue a contract to make the
+numbers agree. A state that reconciles is not thereby genuine: a legacy pool archived and
+re-created unchanged by the operator and governance passes every check of the procedure, and
+only the ledger history shows it (scenario C of the rehearsal). Steps 1 and 8 therefore require
+the transaction history of each pool state, not just the active contracts.
+
+## Pause and signer loss
+
+The Secure V1 pause ([`PAUSE.md`](PAUSE.md)) stops trading and deposits in the new pool while
+LPs exit. It needs all four core signers, and so do paused exits: an offline core participant
+blocks both. Pausing is therefore an option during migration only while every core signer is
+available. It is not a remedy for an unavailable or compromised signer.
+
+There is no recovery from permanent loss of a core signer. Every pool that signer signs, paused
+or not, can no longer move, and the rest of the core cannot release its reserves. The decisions
+this needs are listed in [`PAUSE.md`](PAUSE.md#permanent-signer-loss) and are unmade. Archiving
+a pool state or reserve with all signatories destroys its record of value; it is not recovery.
+Legacy pools have no pause.
+
+## Rehearsal
+
+The runbook was rehearsed with synthetic assets, on the production templates of both packages,
+and with no live participant. Two harnesses use the same reconciliation procedure
+(`CantonTreasuryAmm.Test.MigrationRehearsal`). It reads every state as the pool auditor and the
+issuers see it, never as the operator reports it, and finds the legacy pool by its `PoolId`.
+
+**Setup shortcuts.** Both harnesses issue the synthetic balances and create the legacy
+`PoolSetup` directly. Legacy has no onboarding workflow. On the IDE ledger, the operator and
+governance create it in one submission. On Canton, the operator proposes it through the test-only
+`LegacyPoolSetupProposal` and governance accepts it on its own participant. Everything after the
+setup uses production choices only.
+
+**Sequence (scenario A).**
+1. The legacy pool starts at 5,000,000 / 10,000,000, so the initial provider holds 7,071,066
+   shares.
+2. A second LP adds 500,000 / 1,000,000 for 707,106 shares.
+3. A trader swaps 10,000 Treasury for 19,903 (fee 30) and 5,000 stablecoin for 2,500 (fee 15).
+4. The snapshot reconciles 5,507,500 / 10,985,097 and a supply of 7,778,173. The first LP's
+   claim is 5,006,817 / 9,986,451 and the second's 500,681 / 998,644.
+5. Each LP exits from its own submission and receives exactly its claim. The second claim rises
+   to 500,682 / 998,644 after the first exit, and the legacy pool keeps 1 / 2 atoms of dust
+   backing the locked share.
+6. The Secure V1 charter is proposed, approved by both issuers and the custodian, and finalized.
+7. The first LP initializes it from its proceeds (supply 7,071,091). The second deposits its
+   proceeds for 707,108 shares, with 1 Treasury atom returned as change.
+8. A swap of 1,000 pays 1,988, and the second LP withdraws 353,554 shares for 250,385 / 499,231.
+9. The completion check finds no blocker. The pool holds 5,258,113 / 10,483,876 with a supply
+   of 7,424,645, and the instrument totals equal the synthetic issuance throughout.
+
+**Failure scenarios** (`Test/Migration.daml`, IDE ledger):
+
+| Scenario | Test | Outcome |
+| --- | --- | --- |
+| A, success | `migrationMovesBothProvidersIntoSecureV1` | As above |
+| B, partial | `partialMigrationKeepsTheRemainingLegacyClaim` | After one exit, completion reports `LegacyPositionsOutstanding`. The remaining LP's claim is intact and later settles. Legacy and Secure V1 positions are rejected by the other pool (`WronglyTypedContract`) |
+| C, diversion | `divertedLegacyReserveBlocksMigration` | An operator `TransferExact` of a reserve yields `LegacyReserveInactive`. Every exit then fails (`ContractNotFound`), and the diverted value sits with the recipient. No recovery is attempted |
+| C, tampered state | `tamperedLegacyStateBlocksMigration` | A duplicate pool state, a forged position, an overstated reserve, a reserve that is another party's holding, and a direct position burn are each reported. A faithful re-creation is not |
+| D, missing approval | `missingCoreApprovalCreatesNoCharter` | Without any one core approval, finalization fails `amm/onboarding-incomplete`, a direct create fails authorization, and no charter exists |
+| E, interrupted onboarding | `interruptedOnboardingIsRetriedWithFreshApprovals` | A replayed approval fails, an expired proposal can be neither approved (`amm/deadline`) nor finalized, and it is cancelled. A fresh proposal succeeds |
+| F, failed initialization | `failedSecureInitializationLosesNothing` | Another LP's proceeds fail (`ContractNotFound` unless disclosed, then `amm/owner-mismatch`), as do a deposit above the holding (`amm/insufficient-balance`) and swapped instruments (`amm/instrument-mismatch`). An LP that is not the charter's provider cannot reach it. Nothing moves; the retry succeeds |
+| G, duplicate submission | `duplicatedMigrationStepsSettleOnce` | A resubmitted legacy exit (with the old disclosures, or against the new state), finalization, initialization or deposit fails on consumed contracts. Each step settles once |
+| H, reconciliation mismatch | `reconciliationMismatchBlocksCompletion` | Wrong expected reserves, supply, positions or totals are each reported. A paused pool is reported as not active; after resume the check passes |
+
+**Local multi-participant Canton.** `scripts/run-multi-participant.sh` runs scenario A end to
+end as `mpMigrationAllocate` and `mpMigrationRehearsal`, after the earlier phases. The second LP
+is allocated on a ninth participant, `second_provider`, and each role submits from its own
+participant. The phases also check that a replayed legacy exit fails on the consumed state, and
+that a wrong completion expectation is reported. This is a local, in-memory network, not
+evidence about a production topology.
+
+**Not rehearsed.**
+- A real inventory across participants with ledger offsets and signed snapshots.
+- Transaction-history checks.
+- Communication with real LPs and issuers.
+- A decision on legacy dust.
+- An LP withdrawal window under load.
+- Any non-local network.
+
+The custodian and issuers have not agreed an onboarding or pause procedure.

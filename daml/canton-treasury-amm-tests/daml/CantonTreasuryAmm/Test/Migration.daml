@@ -1,0 +1,605 @@
+-- Rehearsal of the voluntary legacy-to-Secure V1 migration (`MIGRATION.md`) on the IDE ledger,
+-- with synthetic assets and the production templates: a legacy pool with two independent LPs
+-- and fee-bearing swaps, each LP's own legacy exit, production Secure V1 onboarding with every
+-- core signer approving in its own submission, initialization and deposit from the LPs' own
+-- proceeds, and reconciliation through `MigrationRehearsal`. Setup shortcuts, outside every
+-- claim about production onboarding: the issuers issue the synthetic balances, and the operator
+-- and governance create the legacy `PoolSetup` in one submission (legacy has no onboarding
+-- workflow; the Canton rehearsal uses a proposal instead).
+--
+-- Atomicity: each legacy exit, each approval, finalization, initialization, deposit, swap and
+-- withdrawal is one atomic transaction. Nothing spans them: the sequence of exits and the Secure
+-- V1 onboarding are coordinated off-ledger, and every step re-reads the ledger first.
+module CantonTreasuryAmm.Test.Migration where
+
+import DA.Assert ((===))
+import DA.Foldable (forA_, mapA_)
+import DA.List (sortOn)
+import DA.NonEmpty qualified as NonEmpty
+import DA.Text (isPrefixOf)
+import DA.Optional (fromSome)
+import DA.Time (hours)
+import Daml.Script
+
+import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.Math
+import CantonTreasuryAmm.LiquidityPosition qualified as Legacy
+import CantonTreasuryAmm.Pool qualified as Legacy
+import CantonTreasuryAmm.SecureV1.Errors
+import CantonTreasuryAmm.SecureV1.Onboarding
+import CantonTreasuryAmm.SecureV1.Pool
+import CantonTreasuryAmm.Test.Fixtures
+import CantonTreasuryAmm.Test.MigrationRehearsal
+import CantonTreasuryAmm.Test.ProtectedPoolPrototypeTests qualified as Prototype
+import CantonTreasuryAmm.Test.ProtectedPoolSettlementTests qualified as Settlement
+import CantonTreasuryAmm.Test.SecureV1Onboarding (Ledger, Onboarding (..), approveAll, approveAs, approveCmd, finalize, finalizeCmd, ledgerOf, propose, refused)
+import CantonTreasuryAmm.Test.SecureV1Support
+import CantonTreasuryAmm.Token
+import CantonTreasuryAmm.Types
+
+data LegacyMarket = LegacyMarket with
+  fixture : Fixture
+  custodian : Party
+  secondProvider : Party
+  poolId : PoolId
+  reference : Text
+  readers : MigrationReaders
+  secureSwapInput : ContractId Holding
+  totals : Totals
+
+-- Every synthetic balance is issued first, so instrument totals must hold for the rest of the
+-- rehearsal. The provider initializes 5,000,000 / 10,000,000 (7,071,066 shares and the locked
+-- share), the second provider deposits 500,000 / 1,000,000 (707,106 shares), and the trader swaps
+-- 10,000 Treasury for 19,903 stablecoin (fee 30) and 5,000 stablecoin for 2,500 Treasury (fee
+-- 15): reserves 5,507,500 / 10,985,097, supply 7,778,173, version 3.
+-- The same reference names both the legacy pool and its Secure V1 successor: names authenticate
+-- nothing.
+openLegacyMarket : Text -> Script LegacyMarket
+openLegacyMarket reference = do
+  fixture <- setup
+  custodian <- allocateParty "SecureCustodian"
+  secondProvider <- allocateParty "SecondProvider"
+  providerTreasury <- issueTreasury fixture fixture.provider (amountOf 5000000)
+  providerStable <- issueStable fixture fixture.provider (amountOf 10000000)
+  secondTreasury <- issueTreasury fixture secondProvider (amountOf 500000)
+  secondStable <- issueStable fixture secondProvider (amountOf 1000000)
+  legacyTreasuryInput <- issueTreasury fixture fixture.trader (amountOf 10000)
+  legacyStableInput <- issueStable fixture fixture.trader (amountOf 5000)
+  secureSwapInput <- issueTreasury fixture fixture.trader (amountOf 1000)
+  totals <- totalsFor fixture
+  totals === Totals with treasury = 5511000; stable = 11005000
+
+  setupCid <- createPoolSetup fixture reference
+  initialized <- submit fixture.provider $ exerciseCmd setupCid Legacy.Initialize with
+    treasuryHoldingCid = providerTreasury
+    stableHoldingCid = providerStable
+    treasuryAmount = amountOf 5000000
+    stableAmount = amountOf 10000000
+  added <- submitAddLiquidity fixture initialized.poolCid secondProvider secondTreasury secondStable
+    (amountOf 500000) (amountOf 1000000) 0.0
+  atomsOf added.mintedShares === 707106
+  first <- submitDirectSwap fixture added.poolCid fixture.trader TreasuryForStable legacyTreasuryInput (amountOf 10000) 0.0
+  atomsOf first.amountOut === 19903
+  second <- submitDirectSwap fixture first.poolCid fixture.trader StableForTreasury legacyStableInput (amountOf 5000) 0.0
+  atomsOf second.amountOut === 2500
+  let readers = MigrationReaders with
+        auditor = fixture.auditor
+        treasuryIssuer = fixture.treasuryIssuer
+        stableIssuer = fixture.stableIssuer
+  pure LegacyMarket with
+    fixture; custodian; secondProvider; poolId = poolIdOf fixture reference; reference; readers; secureSwapInput; totals
+
+-- Steps 1 to 5 on the market above: one pool state with both reserves live, supply reconciled,
+-- and the two claims at that state.
+checkOpeningSnapshot : LegacyMarket -> Script LegacySnapshot
+checkOpeningSnapshot market = do
+  snapshot <- requireLegacySnapshot market.readers market.poolId
+  legacyAccounting snapshot.pool === PoolAccounting with
+    treasuryReserveAtoms = 5507500
+    stableReserveAtoms = 10985097
+    totalShareAtoms = 7778173
+    lockedShareAtoms = 1
+    treasuryFeeAtoms = 30
+    stableFeeAtoms = 15
+    stateVersion = 3
+  let claim provider = (\c -> (c.shares, c.treasuryClaim, c.stableClaim)) (claimOf snapshot provider)
+  claim market.fixture.provider === (7071066, 5006817, 9986451)
+  claim market.secondProvider === (707106, 500681, 998644)
+  pure snapshot
+
+-- One LP's whole legacy exit at the current state, checked against its claim.
+exitLegacy : LegacyMarket -> LegacySnapshot -> Party -> Script (Legacy.RemoveLiquidityResult, LegacySnapshot)
+exitLegacy market snapshot provider = do
+  let claim = claimOf snapshot provider
+  totals <- totalsFor market.fixture
+  result <- submitLegacyExit market.fixture.operator snapshot claim
+  next <- checkLegacyExit market.readers snapshot claim result
+  totalsFor market.fixture >>= (=== totals)
+  pure (result, next)
+
+onboardingOf : LegacyMarket -> Time -> Onboarding
+onboardingOf market expiresAt = Onboarding with
+  fixture = market.fixture
+  custodian = market.custodian
+  secondProvider = market.secondProvider
+  terms = SecurePoolTerms with
+    lineage = secureLineageFor market.fixture market.custodian market.reference
+    initialProvider = market.fixture.provider
+    auditors = [market.fixture.auditor]
+    expiresAt
+
+-- Step 9: production onboarding; the operator proposes and the Treasury issuer, the custodian
+-- and the stablecoin issuer each approve in their own submission before the operator finalizes.
+onboardSecure : LegacyMarket -> Script (Onboarding, ContractId SecurePoolCharter)
+onboardSecure market = do
+  expiresAt <- futureDeadline
+  let onboarding = onboardingOf market expiresAt
+  let terms = onboarding.terms
+  charterCid <- propose terms
+    >>= approveAll [market.fixture.treasuryIssuer, market.custodian, market.fixture.stableIssuer] terms
+    >>= finalize terms
+  pure (onboarding, charterCid)
+
+initializeCommand : ContractId SecurePoolCharter -> Legacy.RemoveLiquidityResult -> Commands SecureInitializeResult
+initializeCommand charterCid proceeds = exerciseCmd charterCid InitializePool with
+  treasuryHoldingCid = fromSome proceeds.treasuryOutputHoldingCid
+  stableHoldingCid = fromSome proceeds.stableOutputHoldingCid
+  treasuryAmount = proceeds.treasuryOut
+  stableAmount = proceeds.stableOut
+
+-- Steps 10 and 12: the initial provider funds the pool with exactly its legacy proceeds,
+-- 5,006,817 / 9,986,451, minting floor(sqrt) = 7,071,091 shares with the locked share.
+initializeSecure : LegacyMarket -> Onboarding -> ContractId SecurePoolCharter -> Legacy.RemoveLiquidityResult -> Script SecureMarket
+initializeSecure market onboarding charterCid proceeds = do
+  totals <- totalsFor market.fixture
+  initialized <- submit market.fixture.provider (initializeCommand charterCid proceeds)
+  let secure = SecureMarket with
+        fixture = market.fixture
+        custodian = market.custodian
+        secondProvider = market.secondProvider
+        lineage = onboarding.terms.lineage
+        charterCid
+        initialized
+  (pool, treasuryReserve, stableReserve) <- checkSecurePool secure initialized.poolCid
+  (atomsOf treasuryReserve.amount, atomsOf stableReserve.amount, atomsOf pool.totalShares, pool.stateVersion)
+    === (5006817, 9986451, 7071091, 0)
+  (pool.treasuryFeeAmount, pool.stableFeeAmount) === (0.0, 0.0)
+  (initialized.treasuryChangeHoldingCid, initialized.stableChangeHoldingCid) === (None, None)
+  Some position <- queryContractId market.fixture.provider initialized.positionCid
+  (position.provider, atomsOf position.shares, position.genesisCid) === (market.fixture.provider, 7071090, charterCid)
+  assertArchived market.custodian charterCid
+  mapA_ (assertArchived market.fixture.provider)
+    [fromSome proceeds.treasuryOutputHoldingCid, fromSome proceeds.stableOutputHoldingCid]
+  totalsFor market.fixture >>= (=== totals)
+  pure secure
+
+data Migrated = Migrated with
+  market : LegacyMarket
+  secure : SecureMarket
+  poolCid : ContractId SecurePool
+  expected : SecureExpectation
+
+-- SCENARIO A, as a sequence the other scenarios reuse. Both LPs exit the legacy pool
+-- themselves (5,006,817 / 9,986,451 and then 500,682 / 998,644: the second claim grew by one
+-- Treasury atom because the first exit rounded down); the legacy pool keeps only the locked
+-- share and its 1 / 2 atoms of dust. The Secure V1 pool is onboarded and initialized from the
+-- first LP's proceeds; the second LP deposits its own proceeds (707,108 shares for 500,681 /
+-- 998,644, 1 Treasury atom returned); a 1,000-atom swap pays 1,988 (fee 3); the second LP
+-- withdraws half its shares for 250,385 / 499,231.
+fullMigration : Text -> Script Migrated
+fullMigration reference = do
+  market <- openLegacyMarket reference
+  opening <- checkOpeningSnapshot market
+  (firstProceeds, afterFirst) <- exitLegacy market opening market.fixture.provider
+  (secondProceeds, afterSecond) <- exitLegacy market afterFirst market.secondProvider
+  ((atomsOf firstProceeds.treasuryOut, atomsOf firstProceeds.stableOut), (atomsOf secondProceeds.treasuryOut, atomsOf secondProceeds.stableOut))
+    === ((5006817, 9986451), (500682, 998644))
+  afterSecond.claims === []
+  (atomsOf afterSecond.pool.totalShares, atomsOf afterSecond.pool.treasuryReserveAmount, atomsOf afterSecond.pool.stableReserveAmount)
+    === (1, 1, 2)
+  legacyExitBlockers market.readers market.poolId >>= (=== [])
+
+  (onboarding, charterCid) <- onboardSecure market
+  secure <- initializeSecure market onboarding charterCid firstProceeds
+  let fixture = market.fixture
+  added <- settleAdd secure market.secondProvider secure.initialized.poolCid
+    (fromSome secondProceeds.treasuryOutputHoldingCid) (fromSome secondProceeds.stableOutputHoldingCid)
+    500682 998644 707108 500681 998644
+  holdingAtoms market.secondProvider fixture.treasuryInstrument >>= (=== 1)
+
+  -- Neither new entitlement is a legacy share count carried over: each is a fresh position of
+  -- the new genesis, redeemable for at most what that LP deposited (each is 1 atom short per
+  -- instrument, the rounding that stays with the pool).
+  (pool, _, _) <- checkSecurePool secure added.poolCid
+  let redeemable shares =
+        ( narrow (wideMulFloor shares (atomsOf pool.treasuryReserveAmount) (atomsOf pool.totalShares))
+        , narrow (wideMulFloor shares (atomsOf pool.stableReserveAmount) (atomsOf pool.totalShares)) )
+  redeemable 7071090 === (5006816, 9986450)
+  redeemable 707108 === (500680, 998643)
+
+  swapped <- settleSwap secure fixture.trader added.poolCid TreasuryForStable market.secureSwapInput 1000 1988
+  removed <- settleRemove secure market.secondProvider swapped.poolCid added.positionCid 353554 250385 499231
+  pure Migrated with
+    market
+    secure
+    poolCid = removed.poolCid
+    expected = SecureExpectation with
+      treasuryReserve = 5258113
+      stableReserve = 10483876
+      totalShares = 7424645
+      positions = [(fixture.provider, 7071090), (market.secondProvider, 353554)]
+      totals = market.totals
+
+-- Every onboarding, pool, reserve, position and holding contract (`SecureV1Onboarding.ledgerOf`)
+-- plus every legacy pool state and position, so a refusal is shown to change nothing anywhere.
+data MigrationLedger = MigrationLedger with
+  secure : Ledger
+  legacyPools : [(ContractId Legacy.Pool, Legacy.Pool)]
+  legacyPositions : [(ContractId Legacy.LiquidityPosition, Legacy.LiquidityPosition)]
+  totals : Totals
+    deriving (Eq, Show)
+
+migrationLedgerOf : LegacyMarket -> Script MigrationLedger
+migrationLedgerOf market = do
+  expiresAt <- futureDeadline
+  secure <- ledgerOf (onboardingOf market expiresAt)
+  legacyPools <- sortOn (show . fst) <$> query @Legacy.Pool market.readers.auditor
+  legacyPositions <- sortOn (show . fst) <$> query @Legacy.LiquidityPosition market.readers.auditor
+  totals <- totalsFor market.fixture
+  pure MigrationLedger with secure; legacyPools; legacyPositions; totals
+
+refusedMigration : LegacyMarket -> (Either SubmitError a -> Script ()) -> Script (Either SubmitError a) -> Script ()
+refusedMigration market check submission = do
+  before <- migrationLedgerOf market
+  submission >>= check
+  migrationLedgerOf market >>= (=== before)
+
+assertNotFound : [Text] -> Either SubmitError a -> Script ()
+assertNotFound cids result = case result of
+  Left ContractNotFound {unknownContractIds}
+    | all (`elem` cids) (NonEmpty.toList unknownContractIds) -> pure ()
+  Left otherError -> abort ("Expected ContractNotFound, got " <> show otherError)
+  Right _ -> abort "Expected the submission to fail on a contract it cannot use"
+
+completionBlockersOf : Migrated -> SecureExpectation -> Script [Text]
+completionBlockersOf migrated expected =
+  migrationCompletionBlockers migrated.market.readers migrated.market.poolId
+    migrated.secure.lineage migrated.secure.charterCid expected
+
+-- SCENARIO A. Successful migration (`fullMigration`). Expected: the procedure reports no
+-- blocker on either side; the legacy pool is left with only the locked share, backed by 1 / 2
+-- atoms in reserves that are still live and operator-owned; the Secure V1 pool, its two
+-- reserves and both positions belong to the new genesis only, although both pools carry the
+-- same reference text; instrument totals equal the synthetic issuance throughout.
+migrationMovesBothProvidersIntoSecureV1 : Script ()
+migrationMovesBothProvidersIntoSecureV1 = do
+  migrated <- fullMigration "migration-complete"
+  let market = migrated.market
+  completionBlockersOf migrated migrated.expected >>= (=== [])
+  dust <- requireLegacySnapshot market.readers market.poolId
+  (dust.claims, atomsOf dust.pool.totalShares) === ([], 1)
+  Some treasuryDust <- queryContractId market.fixture.treasuryIssuer dust.pool.treasuryReserveHoldingCid
+  Some stableDust <- queryContractId market.fixture.stableIssuer dust.pool.stableReserveHoldingCid
+  ((treasuryDust.owner, atomsOf treasuryDust.amount), (stableDust.owner, atomsOf stableDust.amount))
+    === ((market.fixture.operator, 1), (market.fixture.operator, 2))
+  dust.pool.poolId.setupReference === migrated.secure.lineage.charterReference
+  reserves <- query @SecureReserveHolding market.readers.auditor
+  [(reserve.genesisCid, reserve.lineage) | (_, reserve) <- reserves] === replicate 2 (migrated.secure.charterCid, migrated.secure.lineage)
+  positions <- query @SecureLiquidityPosition market.readers.auditor
+  [position.genesisCid | (_, position) <- positions] === replicate 2 migrated.secure.charterCid
+  totalsFor market.fixture >>= (=== market.totals)
+
+-- SCENARIO B. Partial participation: only the first LP exits and funds Secure V1. Expected: the
+-- second LP's legacy position is untouched and its claim is now 500,682 / 998,644 against live
+-- legacy reserves of 500,683 / 998,646; the Secure V1 pool reconciles on its own, but the
+-- migration is not complete while the legacy position is outstanding. A legacy position cannot
+-- redeem from the Secure V1 pool, nor a Secure V1 position from the legacy pool
+-- (`WronglyTypedContract`). The second LP can still exit later, on its own terms.
+partialMigrationKeepsTheRemainingLegacyClaim : Script ()
+partialMigrationKeepsTheRemainingLegacyClaim = do
+  market <- openLegacyMarket "migration-partial"
+  let fixture = market.fixture
+  opening <- checkOpeningSnapshot market
+  (proceeds, afterFirst) <- exitLegacy market opening fixture.provider
+  let remaining = claimOf afterFirst market.secondProvider
+  (remaining.shares, remaining.treasuryClaim, remaining.stableClaim) === (707106, 500682, 998644)
+  (atomsOf afterFirst.pool.treasuryReserveAmount, atomsOf afterFirst.pool.stableReserveAmount) === (500683, 998646)
+  (onboarding, charterCid) <- onboardSecure market
+  secure <- initializeSecure market onboarding charterCid proceeds
+  let expected = SecureExpectation with
+        treasuryReserve = 5006817
+        stableReserve = 9986451
+        totalShares = 7071091
+        positions = [(fixture.provider, 7071090)]
+        totals = market.totals
+  secureMismatches market.readers secure.lineage charterCid expected >>= (=== [])
+  migrationCompletionBlockers market.readers market.poolId secure.lineage charterCid expected
+    >>= (=== [show (LegacyPositionsOutstanding [remaining.positionCid])])
+
+  secureDisclosed <- secureDisclosures secure secure.initialized.poolCid
+  refusedMigration market Prototype.assertWronglyTyped $
+    trySubmit (actAs market.secondProvider <> discloseMany secureDisclosed) $
+      exerciseCmd secure.initialized.poolCid RemoveLiquidity with
+        provider = market.secondProvider
+        positionCid = coerceContractId @Legacy.LiquidityPosition @SecureLiquidityPosition remaining.positionCid
+        burnShares = amountOf remaining.shares
+        minimumTreasuryOut = 0.0
+        minimumStableOut = 0.0
+        expectedVersion = 0
+  legacyDisclosed <- legacyDisclosures fixture.operator afterFirst
+  let securePosition = LegacyClaim with
+        positionCid = coerceContractId @SecureLiquidityPosition @Legacy.LiquidityPosition secure.initialized.positionCid
+        provider = fixture.provider
+        shares = 7071090
+        treasuryClaim = 0
+        stableClaim = 0
+  refusedMigration market Prototype.assertWronglyTyped $
+    trySubmit (actAs fixture.provider <> discloseMany legacyDisclosed) (legacyExitCommand afterFirst securePosition)
+
+  (_, afterSecond) <- exitLegacy market afterFirst market.secondProvider
+  afterSecond.claims === []
+  legacyExitBlockers market.readers market.poolId >>= (=== [])
+
+-- SCENARIO C. Legacy reserve diversion during the cutover. After a clean snapshot, the operator
+-- moves the whole Treasury reserve to another party with its owner-controlled `TransferExact`.
+-- Expected: the procedure reports the reserve inactive and refuses to continue; each LP's exit,
+-- prepared from the earlier snapshot, fails on the consumed reserve and changes nothing; no LP is
+-- paid, both legacy positions remain, the diverted 5,507,500 Treasury atoms sit with the other
+-- party and the totals are unchanged: nothing is minted to replace them. Recovery is the manual
+-- incident procedure of `MIGRATION.md` step 8; nothing here attempts it.
+divertedLegacyReserveBlocksMigration : Script ()
+divertedLegacyReserveBlocksMigration = do
+  market <- openLegacyMarket "migration-diverted"
+  let fixture = market.fixture
+  opening <- checkOpeningSnapshot market
+  let reserveCid = opening.pool.treasuryReserveHoldingCid
+  _ <- submit fixture.operator $ exerciseCmd reserveCid TransferExact with
+    newOwner = fixture.other
+    transferAmount = opening.pool.treasuryReserveAmount
+  legacySnapshot market.readers market.poolId >>= (=== Left [LegacyReserveInactive reserveCid])
+  legacyExitBlockers market.readers market.poolId >>= (=== [LegacyReserveInactive reserveCid])
+  poolDisclosed <- disclosed fixture.operator opening.poolCid
+  stableDisclosed <- disclosed fixture.operator opening.pool.stableReserveHoldingCid
+  forA_ [fixture.provider, market.secondProvider] $ \provider ->
+    refusedMigration market (assertConsumedContract reserveCid) $
+      trySubmit (actAs provider <> discloseMany [poolDisclosed, stableDisclosed])
+        (legacyExitCommand opening (claimOf opening provider))
+  forA_ [fixture.provider, market.secondProvider] $ \provider -> do
+    holdingAtoms provider fixture.treasuryInstrument >>= (=== 0)
+    holdingAtoms provider fixture.stableInstrument >>= (=== 0)
+  positions <- query @Legacy.LiquidityPosition market.readers.auditor
+  map fst positions === map (\claim -> claim.positionCid) opening.claims
+  holdingAtoms fixture.other fixture.treasuryInstrument >>= (=== 5507500)
+  totalsFor fixture >>= (=== market.totals)
+
+-- SCENARIO C, tampered state. The operator and governance can create legacy pool states and
+-- positions, and providers can burn positions outside the pool. Expected: a duplicate pool state
+-- (`LegacyPoolDuplicated`), a forged position (`LegacySupplyMismatch`, 1,000 shares too many), a
+-- replacement state overstating its Treasury reserve (`LegacyReserveMismatch`), one whose
+-- Treasury reserve is another party's holding of the recorded amount (`LegacyReserveMismatch`;
+-- the decoy is issued for this step, so the Treasury total grows by it) and a direct burn
+-- (`LegacySupplyMismatch`, 1,000 too few) each block the migration. A faithful re-creation of the
+-- original state is not detected by the reconciliation: only the ledger history shows that the
+-- pool was archived outside a pool choice, which is why `MIGRATION.md` step 8 requires the
+-- issuers and every affected LP to agree before any restored state is used.
+tamperedLegacyStateBlocksMigration : Script ()
+tamperedLegacyStateBlocksMigration = do
+  market <- openLegacyMarket "migration-tampered"
+  let fixture = market.fixture
+  let operatorAndGovernance = actAs [fixture.operator, fixture.governance]
+  let snapshot = legacySnapshot market.readers market.poolId
+  opening <- checkOpeningSnapshot market
+
+  duplicateCid <- submit operatorAndGovernance $ createCmd opening.pool
+  snapshot >>= (=== Left [LegacyPoolDuplicated (sortOn show [opening.poolCid, duplicateCid])])
+  submit operatorAndGovernance $ archiveCmd duplicateCid
+
+  forgedCid <- submit operatorAndGovernance $ createCmd Legacy.LiquidityPosition with
+    poolId = market.poolId
+    provider = fixture.other
+    shares = amountOf 1000
+    auditors = [fixture.auditor]
+  snapshot >>= (=== Left [LegacySupplyMismatch with recordedShares = 7778173; reconciledShares = 7779173])
+  submit operatorAndGovernance $ archiveCmd forgedCid
+
+  submit operatorAndGovernance $ archiveCmd opening.poolCid
+  inflatedCid <- submit operatorAndGovernance $ createCmd opening.pool with treasuryReserveAmount = amountOf 5507501
+  snapshot >>= (=== Left [LegacyReserveMismatch opening.pool.treasuryReserveHoldingCid])
+  submit operatorAndGovernance $ archiveCmd inflatedCid
+  decoyCid <- issueTreasury fixture fixture.other (amountOf 5507500)
+  decoyedCid <- submit operatorAndGovernance $ createCmd opening.pool with treasuryReserveHoldingCid = decoyCid
+  snapshot >>= (=== Left [LegacyReserveMismatch decoyCid])
+  submit operatorAndGovernance $ archiveCmd decoyedCid
+  restoredCid <- submit operatorAndGovernance $ createCmd opening.pool
+  restored <- requireLegacySnapshot market.readers market.poolId
+  (restored.poolCid, restored.pool, restored.claims) === (restoredCid, opening.pool, opening.claims)
+
+  let second = claimOf restored market.secondProvider
+  _ <- submit market.secondProvider $ exerciseCmd second.positionCid Legacy.BurnPosition with
+    expectedPoolId = market.poolId
+    burnAmount = amountOf 1000
+  snapshot >>= (=== Left [LegacySupplyMismatch with recordedShares = 7778173; reconciledShares = 7777173])
+  totalsFor fixture >>= (=== market.totals with treasury = market.totals.treasury + 5507500)
+
+-- SCENARIO D. Missing independent approval. After the first LP's legacy exit, the operator
+-- proposes the Secure V1 charter and every core signer but one approves, for each of the
+-- Treasury issuer, the custodian and the stablecoin issuer in turn. Expected: finalization fails
+-- `amm/onboarding-incomplete`, a direct charter create by the other core signers fails
+-- `AuthorizationError`, nothing else changes, and no charter ever exists; the LP keeps its legacy
+-- proceeds in its own holdings.
+missingCoreApprovalCreatesNoCharter : Script ()
+missingCoreApprovalCreatesNoCharter = do
+  market <- openLegacyMarket "migration-missing-approval"
+  let fixture = market.fixture
+  opening <- checkOpeningSnapshot market
+  (proceeds, _) <- exitLegacy market opening fixture.provider
+  expiresAt <- futureDeadline
+  let onboarding = onboardingOf market expiresAt
+  let terms = onboarding.terms
+  let approvers = [fixture.treasuryIssuer, market.custodian, fixture.stableIssuer]
+  forA_ approvers $ \missing -> do
+    proposalCid <- propose terms >>= approveAll (filter (/= missing) approvers) terms
+    refused onboarding (assertFailureId onboardingIncompleteError) $
+      trySubmit fixture.operator $ finalizeCmd terms proposalCid
+    refused onboarding assertAuthorizationError $
+      trySubmit (actAs (filter (/= missing) (coreSignatories terms.lineage))) $ createCmd SecurePoolCharter with
+        lineage = terms.lineage
+        initialProvider = terms.initialProvider
+        auditors = terms.auditors
+    submit fixture.operator $ exerciseCmd proposalCid CancelPoolProposal with canceller = fixture.operator
+  query @SecurePoolCharter fixture.auditor >>= (=== [])
+  query @SecurePool fixture.auditor >>= (=== [])
+  forA_ [(proceeds.treasuryOutputHoldingCid, 5006817), (proceeds.stableOutputHoldingCid, 9986451)] $ \(holdingCid, atoms) -> do
+    Some holding <- queryContractId fixture.provider (fromSome holdingCid)
+    (holding.owner, atomsOf holding.amount) === (fixture.provider, atoms)
+
+-- SCENARIO E. Interrupted onboarding. The Treasury issuer approves; a replay of the proposal it
+-- consumed fails `ContractNotFound`; after the proposal expires, the custodian's approval fails
+-- `amm/deadline`, and finalizing it fails on its missing approvals (`amm/onboarding-incomplete`,
+-- checked before expiry). The custodian cancels it, after which it cannot be approved. Expected:
+-- the procedure is retried only through a fresh proposal with a fresh expiry and four fresh
+-- approvals, which then initializes exactly as in scenario A.
+interruptedOnboardingIsRetriedWithFreshApprovals : Script ()
+interruptedOnboardingIsRetriedWithFreshApprovals = do
+  market <- openLegacyMarket "migration-interrupted"
+  let fixture = market.fixture
+  opening <- checkOpeningSnapshot market
+  (proceeds, _) <- exitLegacy market opening fixture.provider
+  expiresAt <- futureDeadline
+  let onboarding = onboardingOf market expiresAt
+  let terms = onboarding.terms
+  proposed <- propose terms
+  partial <- approveAs fixture.treasuryIssuer terms proposed
+  refused onboarding (Settlement.assertConsumedAmong [show proposed]) $
+    trySubmit market.custodian $ approveCmd market.custodian terms proposed
+  passTime (hours 2)
+  refused onboarding (assertFailureId deadlineError) $
+    trySubmit market.custodian $ approveCmd market.custodian terms partial
+  refused onboarding (assertFailureId onboardingIncompleteError) $
+    trySubmit fixture.operator $ finalizeCmd terms partial
+  submit market.custodian $ exerciseCmd partial CancelPoolProposal with canceller = market.custodian
+  refused onboarding (Settlement.assertConsumedAmong [show partial]) $
+    trySubmit fixture.stableIssuer $ approveCmd fixture.stableIssuer terms partial
+
+  freshExpiry <- futureDeadline
+  let retried = onboardingOf market freshExpiry
+  charterCid <- propose retried.terms
+    >>= approveAll [fixture.treasuryIssuer, market.custodian, fixture.stableIssuer] retried.terms
+    >>= finalize retried.terms
+  _ <- initializeSecure market retried charterCid proceeds
+  pure ()
+
+-- SCENARIO F. Failed Secure V1 initialization. Both LPs have exited; the charter names the first
+-- as initial provider. Expected, each changing nothing: the second LP's Treasury proceeds fail
+-- `ContractNotFound` when the first LP cannot see them, and `amm/owner-mismatch` when their owner
+-- discloses them; a deposit above the holding fails `amm/insufficient-balance`; swapped
+-- instruments fail `amm/instrument-mismatch`; the second LP cannot initialize a charter it does
+-- not observe. The first LP then initializes with its own proceeds, exactly as in scenario A.
+failedSecureInitializationLosesNothing : Script ()
+failedSecureInitializationLosesNothing = do
+  market <- openLegacyMarket "migration-failed-init"
+  let fixture = market.fixture
+  opening <- checkOpeningSnapshot market
+  (first, afterFirst) <- exitLegacy market opening fixture.provider
+  (second, _) <- exitLegacy market afterFirst market.secondProvider
+  (onboarding, charterCid) <- onboardSecure market
+  let firstTreasury = fromSome first.treasuryOutputHoldingCid
+  let firstStable = fromSome first.stableOutputHoldingCid
+  let secondTreasury = fromSome second.treasuryOutputHoldingCid
+  let initialize submitter disclosures treasuryCid stableCid treasuryAtoms stableAtoms =
+        trySubmit (actAs submitter <> discloseMany disclosures) $ exerciseCmd charterCid InitializePool with
+          treasuryHoldingCid = treasuryCid
+          stableHoldingCid = stableCid
+          treasuryAmount = amountOf treasuryAtoms
+          stableAmount = amountOf stableAtoms
+  refusedMigration market (assertNotFound [show secondTreasury]) $
+    initialize fixture.provider [] secondTreasury firstStable 500682 9986451
+  foreignDisclosed <- disclosed market.secondProvider secondTreasury
+  refusedMigration market (assertFailureId ownerMismatchError) $
+    initialize fixture.provider [foreignDisclosed] secondTreasury firstStable 500682 9986451
+  refusedMigration market (assertFailureId insufficientBalanceError) $
+    initialize fixture.provider [] firstTreasury firstStable 5006818 9986451
+  refusedMigration market (assertFailureId instrumentMismatchError) $
+    initialize fixture.provider [] firstStable firstTreasury 9986451 5006817
+  refusedMigration market (assertNotFound [show charterCid]) $
+    initialize market.secondProvider [] secondTreasury (fromSome second.stableOutputHoldingCid) 500682 998644
+  _ <- initializeSecure market onboarding charterCid first
+  pure ()
+
+-- SCENARIO G. Duplicate invocation of every settling step. Expected, each changing nothing:
+-- resubmitting the first LP's legacy exit with the same disclosures fails on the consumed pool
+-- state, position and reserves; the same exit against the new state fails on the consumed
+-- position; a second finalization fails on the consumed proposal; a second initialization on the
+-- consumed charter and deposits; the second LP's deposit, resubmitted against the new state,
+-- on its consumed holdings. Every step settled exactly once.
+duplicatedMigrationStepsSettleOnce : Script ()
+duplicatedMigrationStepsSettleOnce = do
+  market <- openLegacyMarket "migration-duplicates"
+  let fixture = market.fixture
+  opening <- checkOpeningSnapshot market
+  let firstClaim = claimOf opening fixture.provider
+  openingDisclosed <- legacyDisclosures fixture.operator opening
+  let exitWith disclosures snapshot = trySubmit (actAs fixture.provider <> discloseMany disclosures) (legacyExitCommand snapshot firstClaim)
+  Right first <- exitWith openingDisclosed opening
+  afterFirst <- checkLegacyExit market.readers opening firstClaim first
+  refusedMigration market (Settlement.assertConsumedAmong
+      (map show [opening.pool.treasuryReserveHoldingCid, opening.pool.stableReserveHoldingCid] ++ [show opening.poolCid, show firstClaim.positionCid])) $
+    exitWith openingDisclosed opening
+  currentDisclosed <- legacyDisclosures fixture.operator afterFirst
+  refusedMigration market (Settlement.assertConsumedAmong [show firstClaim.positionCid]) $
+    exitWith currentDisclosed afterFirst
+
+  expiresAt <- futureDeadline
+  let onboarding = onboardingOf market expiresAt
+  let terms = onboarding.terms
+  ready <- propose terms >>= approveAll [fixture.treasuryIssuer, market.custodian, fixture.stableIssuer] terms
+  charterCid <- finalize terms ready
+  refusedMigration market (Settlement.assertConsumedAmong [show ready]) $
+    trySubmit fixture.operator $ finalizeCmd terms ready
+  secure <- initializeSecure market onboarding charterCid first
+  refusedMigration market (Settlement.assertConsumedAmong
+      [show charterCid, show (fromSome first.treasuryOutputHoldingCid), show (fromSome first.stableOutputHoldingCid)]) $
+    trySubmit fixture.provider (initializeCommand charterCid first)
+
+  (second, _) <- exitLegacy market afterFirst market.secondProvider
+  let secondTreasury = fromSome second.treasuryOutputHoldingCid
+  let secondStable = fromSome second.stableOutputHoldingCid
+  added <- settleAdd secure market.secondProvider secure.initialized.poolCid secondTreasury secondStable
+    500682 998644 707108 500681 998644
+  disclosures <- secureDisclosures secure added.poolCid
+  refusedMigration market (Settlement.assertConsumedAmong [show secondTreasury, show secondStable]) $
+    trySubmit (actAs market.secondProvider <> discloseMany disclosures) $ exerciseCmd added.poolCid AddLiquidity with
+      provider = market.secondProvider
+      treasuryHoldingCid = secondTreasury
+      stableHoldingCid = secondStable
+      maximumTreasury = amountOf 500682
+      maximumStable = amountOf 998644
+      minimumShares = 0.0
+      expectedVersion = 1
+  positions <- query @SecureLiquidityPosition fixture.auditor
+  sortOn show [(position.provider, atomsOf position.shares) | (_, position) <- positions]
+    === sortOn show [(fixture.provider, 7071090), (market.secondProvider, 707108)]
+
+-- SCENARIO H. Reconciliation mismatch. After scenario A, the completion check passes only with
+-- the exact expectation. One atom too many in the expected supply, a wrong Treasury reserve, a
+-- wrong position set or a wrong instrument total each produces exactly one named mismatch, and
+-- the migration is not declared complete. While a discrepancy is investigated the core may pause
+-- the new pool; the check then refuses the paused state, and passes again after resume.
+reconciliationMismatchBlocksCompletion : Script ()
+reconciliationMismatchBlocksCompletion = do
+  migrated <- fullMigration "migration-mismatch"
+  let expected = migrated.expected
+  let check = completionBlockersOf migrated
+  check expected >>= (=== [])
+  check (expected with totalShares = 7424646) >>= (=== ["secure LP supply: expected 7424646, found 7424645"])
+  check (expected with treasuryReserve = 5258114) >>= (=== ["secure treasury reserve: expected 5258114, found 5258113"])
+  wrongPositions <- check (expected with positions = [(migrated.market.fixture.provider, 7071090), (migrated.market.secondProvider, 707108)])
+  map (\mismatch -> "secure positions: expected " `isPrefixOf` mismatch) wrongPositions === [True]
+  let totals = expected.totals
+  check (expected with totals = totals with treasury = totals.treasury + 1)
+    >>= (=== ["instrument totals: expected " <> show (totals with treasury = totals.treasury + 1) <> ", found " <> show totals])
+  pausedCid <- settlePause migrated.secure migrated.poolCid
+  check expected >>= (=== ["expected exactly one active Secure V1 state, found 0 active and 1 paused"])
+  resumedCid <- settleResume migrated.secure pausedCid
+  _ <- checkSecurePool migrated.secure resumedCid
+  check expected >>= (=== [])

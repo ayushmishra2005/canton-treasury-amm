@@ -1,5 +1,6 @@
-# Build, lint and test every package on the pinned SDK, check the reviewed template and choice
-# surfaces and package IDs, and run the local multi-participant Canton validation. Read-only:
+# Install the pinned SDK from a size- and SHA-256-verified archive, build, lint and test every
+# package, check the reviewed template and choice surfaces and package IDs, and run the local
+# multi-participant Canton validation, including the migration rehearsal. Read-only:
 # no secrets, no deployment, no upload to any ledger outside the job's own in-memory nodes.
 name: Secure V1 validation
 
@@ -24,8 +25,6 @@ jobs:
     timeout-minutes: 60
     env:
       DPM_SDK_VERSION: 3.5.5
-      # SHA-256 of https://get.digitalasset.com/install/install.sh as reviewed for this pin.
-      DPM_INSTALLER_SHA256: e5f20449dffefcf3b90f9b4941ce42d37832b300c6a6142b9a92b1cd5db9b139
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -36,11 +35,14 @@ jobs:
           distribution: temurin
           java-version: "21"
 
+      - name: Installer refuses unverified SDK archives
+        run: bash daml/canton-treasury-amm-tests/scripts/check-dpm-installer.sh
+
+      # Downloads the SDK archive and installs it only if its size and SHA-256 match the pins
+      # in the script.
       - name: Install dpm with SDK ${{ env.DPM_SDK_VERSION }}
         run: |
-          curl -fsSL https://get.digitalasset.com/install/install.sh -o "$RUNNER_TEMP/dpm-install.sh"
-          echo "$DPM_INSTALLER_SHA256  $RUNNER_TEMP/dpm-install.sh" | sha256sum --check --strict
-          sh "$RUNNER_TEMP/dpm-install.sh" "$DPM_SDK_VERSION"
+          bash daml/canton-treasury-amm-tests/scripts/install-dpm-verified.sh "$DPM_SDK_VERSION"
           echo "$HOME/.dpm/bin" >> "$GITHUB_PATH"
 
       - name: Toolchain versions
@@ -65,11 +67,27 @@ jobs:
       - name: Full test suite, no skipped or missing tests
         run: bash daml/canton-treasury-amm-tests/scripts/run-tests-strict.sh "$RUNNER_TEMP/dpm-test.log"
 
+      - name: Migration rehearsal tests
+        run: |
+          bash daml/canton-treasury-amm-tests/scripts/run-tests-strict.sh "$RUNNER_TEMP/dpm-migration-test.log" \
+            daml/CantonTreasuryAmm/Test/Migration.daml
+
       - name: Template inventory and choice surfaces
         run: bash daml/canton-treasury-amm-tests/scripts/check-prototype-choice-surface.sh
 
       - name: Package IDs, dependencies and upgrade check
         run: bash daml/canton-treasury-amm-tests/scripts/check-packages.sh
+
+      - name: Record built DAR digests
+        run: |
+          sha256sum \
+            daml/canton-treasury-amm/.daml/dist/canton-treasury-amm-0.1.0.dar \
+            daml/canton-treasury-amm-secure-v1/.daml/dist/canton-treasury-amm-secure-v1-0.2.0.dar \
+            daml/canton-treasury-amm-live-reserve-prototype/.daml/dist/canton-treasury-amm-live-reserve-prototype-0.1.0.dar \
+            daml/canton-treasury-amm-tests/.daml/dist/canton-treasury-amm-tests-0.1.0.dar \
+            lib/splice-api-token-holding-v1-1.0.0.dar lib/splice-api-token-metadata-v1-1.0.0.dar \
+            > "$RUNNER_TEMP/dar-sha256.txt"
+          cat "$RUNNER_TEMP/dar-sha256.txt"
 
       - name: Multi-participant Canton validation
         env:
@@ -83,6 +101,8 @@ jobs:
           name: secure-v1-validation-logs
           path: |
             ${{ runner.temp }}/dpm-test.log
+            ${{ runner.temp }}/dpm-migration-test.log
+            ${{ runner.temp }}/dar-sha256.txt
             ${{ runner.temp }}/multi-participant
           if-no-files-found: warn
           retention-days: 14

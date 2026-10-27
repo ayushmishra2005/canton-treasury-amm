@@ -13,18 +13,20 @@ import DA.Action ((>=>), unless)
 import DA.Assert ((===))
 import DA.Foldable (forA_)
 import DA.List (sortOn, unique)
-import DA.Optional (isNone, isSome)
+import DA.Optional (fromSome, isNone, isSome)
 import DA.Text (isInfixOf)
 import DA.Time (milliseconds)
 import Daml.Script
 
 import CantonTreasuryAmm.Errors
+import CantonTreasuryAmm.Pool qualified as Legacy
 import CantonTreasuryAmm.SecureV1.Errors
 import CantonTreasuryAmm.SecureV1.Onboarding
 import CantonTreasuryAmm.SecureV1.Pause
 import CantonTreasuryAmm.SecureV1.Pool
 import CantonTreasuryAmm.SecureV1.SwapIntent
 import CantonTreasuryAmm.Test.Fixtures
+import CantonTreasuryAmm.Test.MigrationRehearsal
 import CantonTreasuryAmm.Test.ProtectedPoolPrototypeTests qualified as Prototype
 import CantonTreasuryAmm.Test.ProtectedPoolSettlementTests qualified as Settlement
 import CantonTreasuryAmm.Test.SecureV1Attacks (assertInvisibleActive)
@@ -1185,3 +1187,238 @@ mpResumeAfterOutage pausedState = do
     trySubmit (actAs parties.trader <> discloseMany staleDisclosures) $
       swapCommand traded.poolCid parties.trader TreasuryForStable staleInput 1000 0 deadline paused.stateVersion
   debug "PAUSE swap after resume settles and the pre-resume version is rejected: PASS"
+
+-- Legacy has no onboarding workflow and `PoolSetup` needs the operator and governance, which no
+-- single participant hosts here. In the migration rehearsal the operator proposes the setup and
+-- governance accepts on its own participant: a test-only setup step, not a production workflow.
+template LegacyPoolSetupProposal
+  with
+    poolId : PoolId
+    initialProvider : Party
+    auditors : [Party]
+  where
+    signatory poolId.operator
+    observer poolId.governance
+
+    choice AcceptLegacyPoolSetup : ContractId Legacy.PoolSetup
+      controller poolId.governance
+      do create Legacy.PoolSetup with poolId; initialProvider; auditors
+
+data MpMigration = MpMigration with
+  state : MpState
+  secondProvider : Party
+    deriving (Eq, Show)
+
+-- PHASE 12. Allocates an independent second LP on its own ninth participant, `second_provider`,
+-- and checks from every participant that it is known everywhere and hosted only there.
+mpMigrationAllocate : MpState -> Script MpMigration
+mpMigrationAllocate state = do
+  secondProvider <- allocatePartyOn "MpSecondProvider" (ParticipantName "second_provider")
+  let everyone = secondProvider :: allParties state.parties
+  let participants = "second_provider" :: map fst (hostingPlan state.parties)
+  forA_ participants $ \participant ->
+    poll ("parties known on " <> participant) 240 $ do
+      known <- listKnownPartiesOn (ParticipantName participant)
+      pure (all (`elem` map (\details -> details.party) known) everyone)
+  forA_ participants $ \participant -> do
+    known <- listKnownPartiesOn (ParticipantName participant)
+    let local = [details.party | details <- known, details.isLocal, details.party `elem` everyone]
+    if participant == "second_provider"
+      then local === [secondProvider]
+      else assertMsg ("Second provider hosted on " <> participant) (secondProvider `notElem` local)
+  debug ("MIGRATION second_provider hosts " <> show secondProvider <> " and no other AMM role")
+  pure MpMigration with state; secondProvider
+
+-- Waits until the operator, governance and the auditor see the legacy state and each issuer sees
+-- its reserve, then takes the rehearsal procedure's snapshot.
+mpLegacySnapshot : MpParties -> MigrationReaders -> PoolId -> ContractId Legacy.Pool -> Script LegacySnapshot
+mpLegacySnapshot parties readers poolId poolCid = do
+  awaitActive [parties.operator, parties.governance, parties.auditor] poolCid
+  Some pool <- queryContractId parties.operator poolCid
+  awaitActive [parties.treasuryIssuer, parties.auditor] pool.treasuryReserveHoldingCid
+  awaitActive [parties.stableIssuer, parties.auditor] pool.stableReserveHoldingCid
+  snapshot <- requireLegacySnapshot readers poolId
+  snapshot.poolCid === poolCid
+  pure snapshot
+
+-- One LP's whole legacy exit from its own participant, with the operator's participant
+-- disclosing the state, checked by the rehearsal procedure once every reader has applied it.
+mpLegacyExit : MpParties -> MigrationReaders -> LegacySnapshot -> Party -> Script (Legacy.RemoveLiquidityResult, LegacySnapshot)
+mpLegacyExit parties readers snapshot provider = do
+  let claim = claimOf snapshot provider
+  result <- submitLegacyExit parties.operator snapshot claim
+  _ <- mpLegacySnapshot parties readers snapshot.pool.poolId result.poolCid
+  forA_ [result.treasuryOutputHoldingCid, result.stableOutputHoldingCid] $ \payoutCid ->
+    awaitActive [provider, parties.auditor] (fromSome payoutCid)
+  awaitArchived [provider, parties.auditor] claim.positionCid
+  next <- checkLegacyExit readers snapshot claim result
+  pure (result, next)
+
+-- A legacy swap from the trader's participant, disclosed by the operator's.
+mpLegacySwap : MpParties -> MigrationReaders -> LegacySnapshot -> SwapDirection -> ContractId Holding -> Int -> Int -> Script LegacySnapshot
+mpLegacySwap parties readers snapshot direction inputCid inputAtoms expectedOut = do
+  disclosures <- legacyDisclosures parties.operator snapshot
+  deadline <- futureDeadline
+  result <- submit (actAs parties.trader <> discloseMany disclosures) $ exerciseCmd snapshot.poolCid Legacy.SwapExactInput with
+    trader = parties.trader
+    direction
+    inputHoldingCid = inputCid
+    inputAmount = amountOf inputAtoms
+    minimumAmountOut = amountOf expectedOut
+    deadline
+    expectedVersion = snapshot.pool.stateVersion
+  atomsOf result.amountOut === expectedOut
+  awaitActive [parties.trader] result.outputHoldingCid
+  mpLegacySnapshot parties readers snapshot.pool.poolId result.poolCid
+
+migrationTotals : SecureLineage -> Script Totals
+migrationTotals lineage = do
+  treasury <- instrumentUnits lineage.treasuryInstrument
+  stable <- instrumentUnits lineage.stableInstrument
+  pure Totals with treasury; stable
+
+-- PHASE 13. The voluntary migration of `Migration:fullMigration` on the nine participants, with
+-- the same amounts. Synthetic balances are issued first, from the issuers' participants, and the
+-- instrument totals must not change after that. The legacy pool is set up through
+-- `LegacyPoolSetupProposal`; the provider initializes it, the second LP deposits and the trader
+-- swaps in both directions, each from its own participant. The rehearsal procedure then reads the
+-- legacy pool as the auditor and the issuers see it, and each LP exits from its own participant;
+-- a replay of the first exit fails on the consumed state. The Secure V1 pool is onboarded through
+-- `SecurePoolProposal`, initialized from the first LP's proceeds and joined with the second LP's;
+-- one swap and one withdrawal settle; the completion check reports no blocker.
+mpMigrationRehearsal : MpMigration -> Script ()
+mpMigrationRehearsal migration = do
+  let state = migration.state
+  let parties = state.parties
+  let second = migration.secondProvider
+  let treasury = state.lineage.treasuryInstrument
+  let stable = state.lineage.stableInstrument
+  let readers = MigrationReaders with
+        auditor = parties.auditor
+        treasuryIssuer = parties.treasuryIssuer
+        stableIssuer = parties.stableIssuer
+  let issueTreasuryTo = issueFrom parties.treasuryIssuer state.treasuryInstrumentCid parties.auditor
+  let issueStableTo = issueFrom parties.stableIssuer state.stableInstrumentCid parties.auditor
+  providerTreasury <- issueTreasuryTo parties.provider 5000000
+  providerStable <- issueStableTo parties.provider 10000000
+  secondTreasury <- issueTreasuryTo second 500000
+  secondStable <- issueStableTo second 1000000
+  legacyTreasuryInput <- issueTreasuryTo parties.trader 10000
+  legacyStableInput <- issueStableTo parties.trader 5000
+  secureInput <- issueTreasuryTo parties.trader 1000
+  totals <- migrationTotals state.lineage
+
+  let poolId = PoolId with
+        operator = parties.operator
+        governance = parties.governance
+        treasuryInstrument = treasury
+        stableInstrument = stable
+        setupReference = "mp-migration"
+  setupProposalCid <- submit parties.operator $ createCmd LegacyPoolSetupProposal with
+    poolId
+    initialProvider = parties.provider
+    auditors = [parties.auditor]
+  awaitActive [parties.governance] setupProposalCid
+  setupCid <- submit parties.governance $ exerciseCmd setupProposalCid AcceptLegacyPoolSetup
+  awaitActive [parties.provider] setupCid
+  initialized <- submit parties.provider $ exerciseCmd setupCid Legacy.Initialize with
+    treasuryHoldingCid = providerTreasury
+    stableHoldingCid = providerStable
+    treasuryAmount = amountOf 5000000
+    stableAmount = amountOf 10000000
+  initial <- mpLegacySnapshot parties readers poolId initialized.poolCid
+  initialDisclosed <- legacyDisclosures parties.operator initial
+  added <- submit (actAs second <> discloseMany initialDisclosed) $ exerciseCmd initial.poolCid Legacy.AddLiquidity with
+    provider = second
+    treasuryHoldingCid = secondTreasury
+    stableHoldingCid = secondStable
+    maximumTreasury = amountOf 500000
+    maximumStable = amountOf 1000000
+    minimumShares = amountOf 707106
+    expectedVersion = initial.pool.stateVersion
+  atomsOf added.mintedShares === 707106
+  deposited <- mpLegacySnapshot parties readers poolId added.poolCid
+  swappedOnce <- mpLegacySwap parties readers deposited TreasuryForStable legacyTreasuryInput 10000 19903
+  opening <- mpLegacySwap parties readers swappedOnce StableForTreasury legacyStableInput 5000 2500
+  ( atomsOf opening.pool.treasuryReserveAmount, atomsOf opening.pool.stableReserveAmount, atomsOf opening.pool.totalShares
+    , atomsOf opening.pool.treasuryFeeAmount, atomsOf opening.pool.stableFeeAmount )
+    === (5507500, 10985097, 7778173, 30, 15)
+  sortOn show (map (\claim -> (claim.provider, claim.shares, claim.treasuryClaim, claim.stableClaim)) opening.claims)
+    === sortOn show [(parties.provider, 7071066, 5006817, 9986451), (second, 707106, 500681, 998644)]
+  migrationTotals state.lineage >>= (=== totals)
+  debug "MIGRATION legacy pool with two LPs and swaps, snapshot reconciled by the auditor and issuers: PASS"
+
+  openingDisclosed <- legacyDisclosures parties.operator opening
+  (first, afterFirst) <- mpLegacyExit parties readers opening parties.provider
+  let firstClaim = claimOf opening parties.provider
+  Settlement.assertConsumedAmong
+      [show opening.poolCid, show firstClaim.positionCid, show opening.pool.treasuryReserveHoldingCid, show opening.pool.stableReserveHoldingCid]
+    =<< trySubmit (actAs parties.provider <> discloseMany openingDisclosed) (legacyExitCommand opening firstClaim)
+  requireLegacySnapshot readers poolId >>= (=== afterFirst)
+  (secondExit, afterSecond) <- mpLegacyExit parties readers afterFirst second
+  ((atomsOf first.treasuryOut, atomsOf first.stableOut), (atomsOf secondExit.treasuryOut, atomsOf secondExit.stableOut))
+    === ((5006817, 9986451), (500682, 998644))
+  (afterSecond.claims, atomsOf afterSecond.pool.totalShares) === ([], 1)
+  legacyExitBlockers readers poolId >>= (=== [])
+  migrationTotals state.lineage >>= (=== totals)
+  debug "MIGRATION both LPs exited the legacy pool from their own participants; replayed exit rejected: PASS"
+
+  let lineage = state.lineage with charterReference = "mp-migration"
+  terms <- termsFor parties lineage "mp-migration"
+  charterCid <- mpPropose parties terms
+    >>= mpApprove parties parties.treasuryIssuer terms
+    >>= mpApprove parties parties.custodian terms
+    >>= mpApprove parties parties.stableIssuer terms
+    >>= mpFinalize parties terms
+  secureInitialized <- submit parties.provider $ exerciseCmd charterCid InitializePool with
+    treasuryHoldingCid = fromSome first.treasuryOutputHoldingCid
+    stableHoldingCid = fromSome first.stableOutputHoldingCid
+    treasuryAmount = first.treasuryOut
+    stableAmount = first.stableOut
+  let market = (marketOf state) with
+        secondProvider = second
+        lineage
+        charterCid
+        initialized = secureInitialized
+  awaitActive (poolReaders market) secureInitialized.poolCid
+  awaitActive [parties.provider] secureInitialized.positionCid
+  (pool0, _, _) <- checkSecurePool market secureInitialized.poolCid
+  (atomsOf pool0.treasuryReserveAmount, atomsOf pool0.stableReserveAmount, atomsOf pool0.totalShares) === (5006817, 9986451, 7071091)
+
+  disclosed0 <- secureDisclosures market secureInitialized.poolCid
+  secondAdded <- submit (actAs second <> discloseMany disclosed0) $ exerciseCmd secureInitialized.poolCid AddLiquidity with
+    provider = second
+    treasuryHoldingCid = fromSome secondExit.treasuryOutputHoldingCid
+    stableHoldingCid = fromSome secondExit.stableOutputHoldingCid
+    maximumTreasury = secondExit.treasuryOut
+    maximumStable = secondExit.stableOut
+    minimumShares = amountOf 707108
+    expectedVersion = 0
+  (atomsOf secondAdded.mintedShares, atomsOf secondAdded.usedTreasury, atomsOf secondAdded.usedStable) === (707108, 500681, 998644)
+  awaitActive (poolReaders market) secondAdded.poolCid
+  awaitActive [second] secondAdded.positionCid
+  _ <- checkSecurePool market secondAdded.poolCid
+  debug "MIGRATION Secure V1 onboarded on four participants and funded from both LPs' legacy proceeds: PASS"
+
+  swapped <- mpSwap market secondAdded.poolCid secureInput 1000 1988
+  disclosed1 <- secureDisclosures market swapped.poolCid
+  removed <- submit (actAs second <> discloseMany disclosed1) $ exerciseCmd swapped.poolCid RemoveLiquidity with
+    provider = second
+    positionCid = secondAdded.positionCid
+    burnShares = amountOf 353554
+    minimumTreasuryOut = amountOf 250385
+    minimumStableOut = amountOf 499231
+    expectedVersion = 2
+  (atomsOf removed.treasuryOut, atomsOf removed.stableOut) === (250385, 499231)
+  awaitActive (poolReaders market) removed.poolCid
+  awaitActive [second] (fromSome removed.remainingPositionCid)
+  let expected = SecureExpectation with
+        treasuryReserve = 5258113
+        stableReserve = 10483876
+        totalShares = 7424645
+        positions = [(parties.provider, 7071090), (second, 353554)]
+        totals
+  migrationCompletionBlockers readers poolId lineage charterCid expected >>= (=== [])
+  migrationCompletionBlockers readers poolId lineage charterCid (expected with totalShares = 7424646)
+    >>= (=== ["secure LP supply: expected 7424646, found 7424645"])
+  debug "MIGRATION swap and withdrawal on the new pool; completion reconciled, a wrong expectation refused: PASS"

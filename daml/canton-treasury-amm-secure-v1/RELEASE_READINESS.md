@@ -82,6 +82,12 @@ What this does not show:
   multi-participant run below uploads the test DAR, which includes 0.2.0, and runs both
   packages side by side.
 
+**Stage 3.3.** No deployable source changed. The legacy package is still `d8cadd3c…` (DAR
+SHA-256 `42d50138…`), Secure V1 0.2.0 is still `4abe2905…`, and the live-reserve prototype's source is
+unchanged (ID `aa060cbc…`, first recorded here). Only the tests package (`canton-treasury-amm-tests` 0.1.0, now `6b4e1ab1…`)
+changed; it is never deployed. `check-packages.sh` now also pins the two vendored Token
+Standard DARs by package ID.
+
 **External coordination still required.**
 - Every participant hosting a core party, governance, an auditor, a trader or a provider must
   upload and vet the Secure V1 DAR. The legacy package stays vetted.
@@ -94,44 +100,84 @@ What this does not show:
 `ubuntu-24.04`. It has `contents: read` permission only, no secrets, persisted credentials
 disabled and actions pinned by commit SHA. Its steps:
 
-1. Install `dpm` from `get.digitalasset.com`. The installer script's SHA-256 is checked
-   before it runs, and it is invoked with the pinned SDK version 3.5.5.
-2. Print the toolchain versions, and fail if any `daml.yaml` is not pinned to 3.5.5.
-3. `dpm build --all --no-cache`.
-4. `dpm damlc lint` in all four packages. Lint exits non-zero on any hint.
-5. `scripts/run-tests-strict.sh`. This runs `dpm test` and fails on any failure. It also fails
+1. `scripts/check-dpm-installer.sh`: negative tests of the SDK installer (below).
+2. `scripts/install-dpm-verified.sh 3.5.5`: download the SDK archive for the runner's platform
+   and install it only if its size and SHA-256 match the pins.
+3. Print the toolchain versions, and fail if any `daml.yaml` is not pinned to 3.5.5.
+4. `dpm build --all --no-cache`.
+5. `dpm damlc lint` in all four packages. Lint exits non-zero on any hint.
+6. `scripts/run-tests-strict.sh`. This runs `dpm test` and fails on any failure. It also fails
    if the set of passing tests differs from the `Script` values declared in the sources, so a
    skipped, renamed-away or missing test fails.
-6. `scripts/check-prototype-choice-surface.sh`, the template inventories and choice surfaces.
-7. `scripts/check-packages.sh`.
-8. `scripts/run-multi-participant.sh`.
-9. Upload the test and Canton logs as an artifact, also on failure.
+7. `scripts/run-tests-strict.sh` on `Test/Migration.daml` alone, the migration rehearsal.
+8. `scripts/check-prototype-choice-surface.sh`, the template inventories and choice surfaces.
+9. `scripts/check-packages.sh`: package IDs, dependencies, the vendored Token Standard DAR IDs
+   and the upgrade check.
+10. Record the SHA-256 of every built and vendored DAR in the logs artifact.
+11. `scripts/run-multi-participant.sh`, including the migration rehearsal.
+12. Upload the test and Canton logs and the DAR digests as an artifact, also on failure.
 
 No step uses `|| true`, `continue-on-error` or skipped tests.
 
+**SDK supply chain (Stage 3.3).** Until Stage 3.2, CI pinned the SHA-256 of
+`get.digitalasset.com/install/install.sh`. That script downloads
+`dpm-VERSION-OS-ARCH.tar.gz` from Digital Asset's Artifact Registry
+(`projects/da-images/locations/europe/repositories/public-generic`, package `dpm-sdk`), extracts
+it and runs `dpm bootstrap` without verifying the archive. `install-dpm-verified.sh` performs
+the same steps, with these differences:
+- Only SDK 3.5.5 is accepted. There is no "latest" lookup.
+- The platform is detected explicitly. Only `linux-amd64`, `linux-arm64`, `darwin-amd64` and
+  `darwin-arm64` have pins; any other operating system or architecture is refused.
+- The archive's byte size and SHA-256 must equal the pins before anything is extracted or run.
+  A missing checksum tool, a failed download or a missing archive also stop the install.
+
+The pinned digests are the SHA256 values that the registry's files API records for each
+3.5.5 file (created 2026-08-12). The linux-amd64 archive used by CI and the darwin-arm64
+archive were downloaded in full, and both match their recorded size and digest. The digests
+come from the publisher's own registry, the same origin as the download. They are not an
+independent signature, and none was found. The installer script itself is no longer used.
+
+`check-dpm-installer.sh` runs these negative tests, each of which must fail with its specific
+reason and run nothing:
+- a wrong, `latest`, empty or missing version;
+- an architecture with no pin (through a fake `uname`);
+- a platform override outside verify-only mode;
+- a missing archive;
+- a truncated archive;
+- a same-size archive whose `bin/dpm` would leave a marker if run.
+
+A control step first shows that this fake archive does run when nothing verifies it. With the
+real archive as an argument, the script also checks that the archive verifies, that another
+platform's pin rejects it, and that a copy with one flipped byte is refused. On macOS, a full
+verified install from the darwin-arm64 archive into an empty home installed SDK 3.5.5 with
+Canton 3.5.12.
+
+`dpm bootstrap` installs the components bundled in the verified archive. Components `dpm`
+might fetch later from its OCI registry are addressed by digest in that registry but are not
+pinned here. The bootstrap was not run with networking disabled.
+
 **Local validation.**
-- The workflow parses as YAML with the expected permissions, shell and steps, and `shellcheck`
-  passes on every script.
+- The workflow parses as YAML (Ruby's standard YAML library) with `contents: read`, one job
+  and the steps above. Each `run:` block, extracted from the parsed YAML, passes `shellcheck`,
+  as does every script.
 - Each script was run locally and also made to fail on purpose (see
   [Mutation testing](#mutation-testing)).
-- The install step's exact mechanism was run on macOS into an isolated home directory: the
-  checksum-verified installer with `3.5.5` installed `dpm` 1.0.21, `damlc` 3.5.2 and Canton
-  3.5.12, the versions used throughout.
+- No step contains `|| true` or a `latest` version.
 
 **CI blockers and gaps.**
 - **Not run on GitHub.** The workflow has never executed remotely, so there is no remote CI
-  result. The Linux install path, the runner's memory for eight participants, and the run time
+  result. The Linux install path, the runner's memory for nine participants, and the run time
   are unverified until it does.
-- **SDK tarball not checksum-pinned.** The installer script is pinned by SHA-256, but it
-  downloads the SDK tarball over HTTPS without verifying a checksum. Pinning the tarball needs
-  its published digest, which could not be obtained in this stage.
-- **`actionlint` unavailable.** It was not installed locally, so the workflow has not been
-  linted beyond a YAML parse.
+- **`actionlint` unavailable.** It is not installed locally, and installing it would add an
+  unreviewed tool, so the workflow's static validation is incomplete.
+- **Digest provenance.** The SDK digests are the publisher registry's own records, not a
+  signature.
 
 ## Multi-participant Canton
 
-**Result: PASS on a local network with eight independently hosted participants.** This
-covers the scenarios below on one synchronizer. It is not evidence about production topology,
+**Result: PASS on a local network with eight independently hosted role participants**, plus
+a ninth participant for the migration rehearsal's second LP. This covers the scenarios below on
+one synchronizer. It is not evidence about production topology,
 networking, key management or other outage modes.
 
 - **Toolchain.** Canton open source 3.5.12 (protocol versions 34 and 35), run from the SDK 3.5.5
@@ -141,8 +187,9 @@ networking, key management or other outage modes.
 - **Topology** (`daml/canton-treasury-amm-tests/multi-participant/canton.conf`):
   - one sequencer and one mediator on the `amm` synchronizer;
   - eight participants named `custodian`, `operator`, `governance`, `treasury_issuer`,
-    `stable_issuer`, `trader`, `provider` and `auditor`;
-  - in-memory storage throughout, with local ports 15001–15083 only.
+    `stable_issuer`, `trader`, `provider` and `auditor`, and `second_provider` for the
+    migration rehearsal;
+  - in-memory storage throughout, with local ports 15001–15093 only.
 
   `bootstrap.canton` connects every participant and uploads the test DAR. Each party is
   allocated on its own participant.
@@ -166,6 +213,8 @@ The script runs these phases in order, from `CantonTreasuryAmm.Test.MultiPartici
 | `mpPauseLifecycle` | Pause through `SecurePauseProposal` (see [`PAUSE.md`](PAUSE.md)). Rejected, each from the attacker's own participant: the operator approving as the Treasury issuer and a governance-created proposal claiming all four signatures (`DAML_AUTHORIZATION_ERROR`); governance approving and a repeated approval (`amm/lifecycle-approver`); an approval naming a wrong version (`amm/lifecycle-terms`); finalization with three approvals (`amm/lifecycle-incomplete`); a replayed approval (`CONTRACT_NOT_FOUND`). The four core signers then approve on their own participants and the pool pauses with every field carried over and the version plus one, as seen from every reading participant. While paused, a swap and a deposit fail on the consumed state (`CONTRACT_NOT_FOUND`) and on a coerced paused reference (`WronglyTypedContract`). The provider's partial exit settles exactly (1,000,000 shares → 707,248 / 1,413,932). |
 | `mpOfflinePausedExit` | With the stablecoin issuer's participant disconnected, the provider's full exit from the paused pool and the finalization of a fully approved resume both fail with `MEDIATOR_SAYS_TX_TIMED_OUT`; the paused state, reserves, position and proposal are unchanged. Pause does not keep LP exits available when a core signer is offline. |
 | `mpResumeAfterOutage` | After reconnection, the same exit settles (353,483 shares → 250,000 / 499,801). The resume approved for the replaced paused state fails with `CONTRACT_NOT_FOUND`; a fresh four-participant resume restores the pool exactly (4,293,756 / 8,584,083, supply 6,071,067). Governance and repeated approvals and a replayed finalization are rejected. A swap settles (1,000 → 1,992) and the pre-resume version is rejected (`amm/stale-state`). |
+| `mpMigrationAllocate` | A second LP is allocated on `second_provider`, which every participant then knows. It is hosted there and nowhere else, read from each participant's own party list. |
+| `mpMigrationRehearsal` | Scenario A of [`MIGRATION.md`](MIGRATION.md#rehearsal), with the same amounts, each role submitting from its own participant. The legacy pool is set up through the test-only `LegacyPoolSetupProposal` (proposed by the operator, accepted by governance), initialized by the provider and joined by the second LP, and the trader swaps both ways. The auditor and the issuers reconcile the snapshot. Each LP exits and receives exactly its claim, and a replayed exit fails on the consumed state with the snapshot unchanged. The Secure V1 charter is onboarded on the four core participants, initialized from the first LP's proceeds (supply 7,071,091) and joined with the second's (707,108 shares). A swap (1,000 → 1,988) and a withdrawal (353,554 → 250,385 / 499,231) settle. The completion check reports no blocker, and an expectation one share off is reported. Instrument totals are unchanged throughout. |
 
 The disconnection is done through the issuer participant's admin API, on the script's own local
 network only. It demonstrates one outage of one confirming participant and its recovery. It
@@ -174,14 +223,17 @@ does not establish censorship resistance or any other outage behavior.
 **Onboarding (Stage 3.1).** Stage 2.3 found that there was no production onboarding workflow and
 used test-only templates in the tests package. Those templates are removed. Every
 multi-signatory step in the harness now uses the production templates in
-`CantonTreasuryAmm.SecureV1.Onboarding`; see [`ONBOARDING.md`](ONBOARDING.md). The only test-only
-template left in `MultiParticipant` is `GovernanceProxy`, an attack fixture for scenario 8.
+`CantonTreasuryAmm.SecureV1.Onboarding`; see [`ONBOARDING.md`](ONBOARDING.md). The test-only
+templates in `MultiParticipant` are `GovernanceProxy`, an attack fixture for scenario 8, and
+`LegacyPoolSetupProposal`, which sets up the legacy pool for the migration rehearsal because
+legacy has no onboarding workflow.
 
 **Warnings in a passing run.** `canton.log` contains no ERROR lines and exactly four WARN
 lines, all from the stablecoin issuer's `TransactionProcessor`: "Response message for request …
 timed out". Two come from the first outage (the swap and the charter finalization) and two from
-the paused-pool outage (the exit and the resume finalization). In the Stage 3.2 run, which took
-about 4 minutes, every phase passed. After
+the paused-pool outage (the exit and the resume finalization). In the final Stage 3.3 run,
+which took about 4 minutes 15 seconds, every phase passed, including both migration phases, with
+the same four WARN lines and no ERROR line. After
 reconnection, the sequencer refuses the issuer's late confirmations with
 `MAX_SEQUENCING_TIME_EXCEEDED`, which is logged at INFO. The expected
 rejections in the other phases are logged at INFO. The daemon exits with status 143 when the
@@ -253,6 +305,43 @@ structural mutations, all detected by the choice-surface script, that makes 18 m
 | A no-op `AdminWithdraw` choice on `SecurePausedPool` | Secure V1 pause choice surface |
 | A `CustodianOnlyWithdraw` template | Template inventory and the pause choice surface |
 
+**Stage 3.3.** These were applied one at a time: the rehearsal mutations to
+`MigrationRehearsal.daml`, run with `dpm test` on `Migration.daml`; the installer mutations to
+`install-dpm-verified.sh`, run with `check-dpm-installer.sh`. Each was reverted, and both files'
+SHA-256 matched the originals afterwards. Every mutant compiled, so each kill is a failing test.
+
+| Mutation | Caught by |
+| --- | --- |
+| An inactive legacy reserve is accepted | `divertedLegacyReserveBlocksMigration` |
+| The legacy supply reconciliation always passes | `tamperedLegacyStateBlocksMigration` |
+| The first of several legacy pool states is used | `tamperedLegacyStateBlocksMigration` |
+| The legacy reserve amount is not compared | `tamperedLegacyStateBlocksMigration` |
+| The legacy reserve owner is not compared | Survived at first; killed by `tamperedLegacyStateBlocksMigration` after adding a pool state whose Treasury reserve is another party's holding of the recorded amount |
+| An exit may reduce another LP's claim | **Survived.** The legacy pool rounds every payout down, so no reachable state reduces another claim; the check is defensive |
+| An active Secure V1 state is accepted next to a paused one | **Survived, equivalent.** Pause consumes the active state, so the two never coexist, and a paused state alone is still reported |
+| Instrument totals are not compared | `reconciliationMismatchBlocksCompletion` |
+| Outstanding legacy positions do not block completion | `partialMigrationKeepsTheRemainingLegacyClaim` |
+| Secure V1 positions are not compared | `reconciliationMismatchBlocksCompletion` |
+| The installer skips the SHA-256 comparison | "modified archive installs nothing" (the fake `bin/dpm` ran) and "real archive with one flipped byte" |
+| The installer accepts any version | "wrong version", "latest version", "empty version" |
+| The archive is extracted and bootstrapped before verification | "truncated archive" and "modified archive installs nothing" (content ran) |
+| The platform override works outside verify-only mode | "platform override outside verification" |
+| The darwin-arm64 pin is off by one hex digit | "real archive verifies" (locally, with the real archive). On CI, the same error in the linux-amd64 pin fails the install step |
+
+## Stage 3.3 security review
+
+This was a focused, read-only review of the Secure V1 sources for what the migration relies on:
+charter initialization from redeemed proceeds, later deposits, onboarding expiry, pause during
+migration, and the reconciliation procedure. It is not an audit. It found no new critical, high
+or medium issue in Secure V1. Findings:
+
+| Severity | Finding |
+| --- | --- |
+| Medium (legacy, known) | The operator and governance can archive and re-create a legacy pool state unchanged, and the reconciliation cannot tell. Migration must check each state's transaction history ([`MIGRATION.md`](MIGRATION.md#stop-conditions)); this is the legacy forgery power in [`SECURITY.md`](SECURITY.md#legacy-amm). |
+| Low | A finalized `SecurePoolCharter` has no expiry. Its initial provider can initialize it at any later time, at a ratio of its choosing. Withdrawing an unused charter needs all four core signers to archive it; it holds no value. Onboarding and initialization should be scheduled together. |
+| Info | Reserve auditors come from the initial deposit's holdings, not the charter's `auditors`. Every later deposit must carry the same auditor set (`amm/incompatible-holdings`). Payouts from one legacy pool share that pool's reserve auditors, so its LPs' proceeds are compatible with each other. Proceeds from pools with different holding auditors are not. |
+| Info | No transaction spans the migration; the atomic units and the off-ledger coordination are listed in [`MIGRATION.md`](MIGRATION.md#atomicity-and-coordination). |
+
 ## Deployment readiness
 
 - **Verified tests.** The full Daml Script suite passes on the IDE ledger. Legacy
@@ -264,12 +353,16 @@ structural mutations, all detected by the choice-surface script, that makes 18 m
     run.
   - Stage 3.1: the multi-participant run above, with production onboarding.
   - Stage 3.2: the same run, extended with pause, paused exits during an outage, and resume.
+  - Stage 3.3: the same run, extended with the migration rehearsal on a ninth participant.
   - Every other test ran on the IDE ledger only.
 - **Multi-participant verification.** PASS, locally, for the scenarios above. Not run on any
   production-like topology.
 - **Packaging and coexistence.** Resolved by a separate package; verified locally.
-- **Migration readiness.** A design only ([`MIGRATION.md`](MIGRATION.md)), with no tooling and
-  no rehearsal.
+- **Migration readiness.** The design ([`MIGRATION.md`](MIGRATION.md)) has been rehearsed with
+  synthetic assets on the IDE ledger (scenarios A–H) and end to end on the local
+  multi-participant network (scenario A). Its reconciliation procedure exists as test code,
+  not as reviewed production tooling. No real inventory has been taken, and no LP or issuer has
+  been consulted.
 - **Privacy requirements.** The custodian and both issuers see every pool state and position,
   including LP identities and share amounts. This needs sign-off from every LP and the
   issuers.
@@ -293,7 +386,7 @@ structural mutations, all detected by the choice-surface script, that makes 18 m
 | High | The pause workflow has not been reviewed or accepted by any custodian or issuer, has been run only on a local test network, and is not audited. |
 | High | No independent security audit has been done. |
 | Medium | Any one core participant can halt every pool operation, including LP exits from a paused pool, and pause and resume themselves. |
-| Medium | CI has never run remotely, and the SDK tarball is not checksum-pinned. |
-| Medium | Migration tooling, a rehearsal, and LP and issuer communication do not exist. |
+| Medium | CI has never run remotely, and `actionlint` has not been run. The SDK archive digests come from the publisher's registry, not from a signature. |
+| Medium | Migration has been rehearsed only with synthetic assets on local networks. There is no reviewed inventory and transaction-history tooling, no withdrawal-window procedure, no decision on legacy dust, and no LP or issuer communication. A legacy pool re-created unchanged by the operator and governance passes reconciliation. |
 | Medium | Privacy sign-off for the issuers' and custodian's visibility is missing. |
 | Low | Intent executors choose among the trader's eligible holdings and the execution timing (see [`SECURITY.md`](SECURITY.md#secure-swapintent-scope)). |

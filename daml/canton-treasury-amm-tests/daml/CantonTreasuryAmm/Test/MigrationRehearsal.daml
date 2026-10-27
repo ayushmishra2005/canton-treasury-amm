@@ -1,0 +1,244 @@
+-- The reconciliation procedure of the legacy-to-Secure V1 migration rehearsal
+-- (`MIGRATION.md`): discovering a legacy pool by its `PoolId`, checking its reserves and LP supply,
+-- computing every outstanding claim, settling one provider's own exit, and reconciling the new
+-- Secure V1 pool and the instrument totals. Every read uses the view of a party that does not
+-- depend on the operator: the pool auditor observes every legacy and Secure V1 pool state and
+-- position, and each issuer signs every holding and reserve of its instrument. The procedure
+-- never moves a reserve, never submits for an LP and never repairs a mismatch; it reports
+-- blockers for a human to resolve. `Migration.daml` runs it on the IDE ledger and
+-- `MultiParticipant.daml` on the local Canton network.
+module CantonTreasuryAmm.Test.MigrationRehearsal where
+
+import DA.Assert ((===))
+import DA.List (sort, sortOn)
+import Daml.Script
+
+import CantonTreasuryAmm.LiquidityPosition qualified as Legacy
+import CantonTreasuryAmm.Math
+import CantonTreasuryAmm.Pool qualified as Legacy
+import CantonTreasuryAmm.SecureV1.Pause
+import CantonTreasuryAmm.SecureV1.Pool
+import CantonTreasuryAmm.Test.SecureV1Support (Totals (..), instrumentUnits)
+import CantonTreasuryAmm.Token
+import CantonTreasuryAmm.Types
+
+data MigrationReaders = MigrationReaders with
+  auditor : Party
+  treasuryIssuer : Party
+  stableIssuer : Party
+    deriving (Eq, Show)
+
+-- One outstanding legacy position and what it redeems for at the snapshot.
+data LegacyClaim = LegacyClaim with
+  positionCid : ContractId Legacy.LiquidityPosition
+  provider : Party
+  shares : Int
+  treasuryClaim : Int
+  stableClaim : Int
+    deriving (Eq, Show)
+
+data LegacySnapshot = LegacySnapshot with
+  poolCid : ContractId Legacy.Pool
+  pool : Legacy.Pool
+  claims : [LegacyClaim]
+    deriving (Eq, Show)
+
+-- Each blocker stops the migration of that pool until a human resolves it (`MIGRATION.md`).
+data MigrationBlocker
+  = LegacyPoolMissing
+  | LegacyPoolDuplicated [ContractId Legacy.Pool]
+  | LegacyReserveInactive (ContractId Holding)
+  | LegacyReserveMismatch (ContractId Holding)
+  | LegacySupplyMismatch with recordedShares : Int; reconciledShares : Int
+  | LegacyPositionsOutstanding [ContractId Legacy.LiquidityPosition]
+    deriving (Eq, Show)
+
+-- The legacy `RemoveLiquidity` payout for `shares`, rounded down as the pool rounds it.
+legacyClaimOf : Legacy.Pool -> (ContractId Legacy.LiquidityPosition, Legacy.LiquidityPosition) -> LegacyClaim
+legacyClaimOf pool (positionCid, position) =
+  let
+    shares = atomsOf position.shares
+    supply = atomsOf pool.totalShares
+  in LegacyClaim with
+    positionCid
+    provider = position.provider
+    shares
+    treasuryClaim = narrow (wideMulFloor shares (atomsOf pool.treasuryReserveAmount) supply)
+    stableClaim = narrow (wideMulFloor shares (atomsOf pool.stableReserveAmount) supply)
+
+-- Runbook steps 1 to 5: exactly one active state for the `PoolId`, both referenced reserves
+-- active as the issuers see them, owned by the operator, of the pool's instruments and with the
+-- recorded amounts, and LP supply equal to the active positions plus the locked share.
+legacySnapshot : MigrationReaders -> PoolId -> Script (Either [MigrationBlocker] LegacySnapshot)
+legacySnapshot readers poolId = do
+  pools <- query @Legacy.Pool readers.auditor
+  case sortOn (show . fst) [entry | entry@(_, pool) <- pools, pool.poolId == poolId] of
+    [] -> pure (Left [LegacyPoolMissing])
+    [(poolCid, pool)] -> do
+      treasury <- reserveBlockers readers.treasuryIssuer poolId.treasuryInstrument poolId.operator
+        pool.treasuryReserveHoldingCid pool.treasuryReserveAmount
+      stable <- reserveBlockers readers.stableIssuer poolId.stableInstrument poolId.operator
+        pool.stableReserveHoldingCid pool.stableReserveAmount
+      positions <- query @Legacy.LiquidityPosition readers.auditor
+      let outstanding = sortOn (show . fst) [entry | entry@(_, position) <- positions, position.poolId == poolId]
+      let reconciledShares = sum [atomsOf position.shares | (_, position) <- outstanding] + atomsOf pool.lockedShares
+      let recordedShares = atomsOf pool.totalShares
+      let supply = [LegacySupplyMismatch with recordedShares; reconciledShares | reconciledShares /= recordedShares]
+      pure $ case treasury ++ stable ++ supply of
+        [] -> Right LegacySnapshot with poolCid; pool; claims = map (legacyClaimOf pool) outstanding
+        blockers -> Left blockers
+    duplicates -> pure (Left [LegacyPoolDuplicated (map fst duplicates)])
+
+reserveBlockers : Party -> InstrumentId -> Party -> ContractId Holding -> Decimal -> Script [MigrationBlocker]
+reserveBlockers issuer instrument operator reserveCid recordedAmount = do
+  reserve <- queryContractId issuer reserveCid
+  pure $ case reserve of
+    None -> [LegacyReserveInactive reserveCid]
+    Some holding
+      | holding.instrument == instrument && holding.owner == operator && holding.amount == recordedAmount -> []
+      | otherwise -> [LegacyReserveMismatch reserveCid]
+
+-- A snapshot the procedure may act on; anything else stops it.
+requireLegacySnapshot : MigrationReaders -> PoolId -> Script LegacySnapshot
+requireLegacySnapshot readers poolId = do
+  result <- legacySnapshot readers poolId
+  case result of
+    Right snapshot -> pure snapshot
+    Left blockers -> abort ("Legacy pool is not safe to migrate: " <> show blockers)
+
+-- Step 7 is complete only when no legacy position is outstanding and the supply is exactly the
+-- locked share; the reserves then hold only the dust that backs it.
+legacyExitBlockers : MigrationReaders -> PoolId -> Script [MigrationBlocker]
+legacyExitBlockers readers poolId = do
+  result <- legacySnapshot readers poolId
+  pure $ case result of
+    Left blockers -> blockers
+    Right snapshot -> [LegacyPositionsOutstanding (map (\claim -> claim.positionCid) snapshot.claims) | not (null snapshot.claims)]
+
+claimOf : LegacySnapshot -> Party -> LegacyClaim
+claimOf snapshot provider = case [claim | claim <- snapshot.claims, claim.provider == provider] of
+  [claim] -> claim
+  _ -> error ("Expected exactly one legacy claim for " <> show provider)
+
+-- The operator's participant discloses the current pool state and both reserves to the LP.
+legacyDisclosures : Party -> LegacySnapshot -> Script [Disclosure]
+legacyDisclosures operator snapshot = do
+  pool <- disclosed operator snapshot.poolCid
+  treasury <- disclosed operator snapshot.pool.treasuryReserveHoldingCid
+  stable <- disclosed operator snapshot.pool.stableReserveHoldingCid
+  pure [pool, treasury, stable]
+
+disclosed : Template t => Party -> ContractId t -> Script Disclosure
+disclosed reader cid = do
+  result <- queryDisclosure reader cid
+  case result of
+    Some disclosure -> pure disclosure
+    None -> abort ("No disclosure available for " <> show cid)
+
+-- Step 7: the provider burns its whole position from its own submission, at the current
+-- version, with its claim as the minimum outputs.
+legacyExitCommand : LegacySnapshot -> LegacyClaim -> Commands Legacy.RemoveLiquidityResult
+legacyExitCommand snapshot claim = exerciseCmd snapshot.poolCid Legacy.RemoveLiquidity with
+  provider = claim.provider
+  positionCid = claim.positionCid
+  burnShares = amountOf claim.shares
+  minimumTreasuryOut = amountOf claim.treasuryClaim
+  minimumStableOut = amountOf claim.stableClaim
+  expectedVersion = snapshot.pool.stateVersion
+
+submitLegacyExit : Party -> LegacySnapshot -> LegacyClaim -> Script Legacy.RemoveLiquidityResult
+submitLegacyExit operator snapshot claim = do
+  disclosures <- legacyDisclosures operator snapshot
+  submit (actAs claim.provider <> discloseMany disclosures) (legacyExitCommand snapshot claim)
+
+-- After an exit: the provider was paid exactly its claim in its own holdings, its position is
+-- gone, the pool moved by exactly the payout and the burn with unchanged fee counters, and no
+-- other LP's claim fell. Returns the new snapshot.
+checkLegacyExit : MigrationReaders -> LegacySnapshot -> LegacyClaim -> Legacy.RemoveLiquidityResult -> Script LegacySnapshot
+checkLegacyExit readers before claim result = do
+  (atomsOf result.treasuryOut, atomsOf result.stableOut, result.remainingPositionCid)
+    === (claim.treasuryClaim, claim.stableClaim, None)
+  let poolId = before.pool.poolId
+  let checkPayout payoutCid instrument atoms = case payoutCid of
+        Some cid -> do
+          Some payout <- queryContractId claim.provider cid
+          (payout.owner, payout.instrument, atomsOf payout.amount) === (claim.provider, instrument, atoms)
+        None -> atoms === 0
+  checkPayout result.treasuryOutputHoldingCid poolId.treasuryInstrument claim.treasuryClaim
+  checkPayout result.stableOutputHoldingCid poolId.stableInstrument claim.stableClaim
+  queryContractId claim.provider claim.positionCid >>= (=== None)
+  after <- requireLegacySnapshot readers poolId
+  after.poolCid === result.poolCid
+  let pool = before.pool
+  ( atomsOf after.pool.treasuryReserveAmount, atomsOf after.pool.stableReserveAmount
+    , atomsOf after.pool.totalShares, after.pool.stateVersion )
+    === ( atomsOf pool.treasuryReserveAmount - claim.treasuryClaim, atomsOf pool.stableReserveAmount - claim.stableClaim
+        , atomsOf pool.totalShares - claim.shares, pool.stateVersion + 1 )
+  (after.pool.treasuryFeeAmount, after.pool.stableFeeAmount) === (pool.treasuryFeeAmount, pool.stableFeeAmount)
+  map (\remaining -> remaining.positionCid) after.claims === [other.positionCid | other <- before.claims, other.positionCid /= claim.positionCid]
+  let earlier = [(other.positionCid, other) | other <- before.claims]
+  assertMsg "An exit must not reduce another LP's claim" $ and
+    [ remaining.treasuryClaim >= previous.treasuryClaim && remaining.stableClaim >= previous.stableClaim
+    | remaining <- after.claims, Some previous <- [lookup remaining.positionCid earlier] ]
+  pure after
+
+-- What the Secure V1 pool must hold once the migration is declared complete (steps 10 and 12).
+data SecureExpectation = SecureExpectation with
+  treasuryReserve : Int
+  stableReserve : Int
+  totalShares : Int
+  positions : [(Party, Int)]
+  totals : Totals
+    deriving (Eq, Show)
+
+-- Every difference between the Secure V1 pool of `genesisCid`, as the auditor and the issuers
+-- see it, and the expectation; empty when they agree.
+secureMismatches : MigrationReaders -> SecureLineage -> ContractId SecurePoolCharter -> SecureExpectation -> Script [Text]
+secureMismatches readers lineage genesisCid expected = do
+  pools <- query @SecurePool readers.auditor
+  paused <- query @SecurePausedPool readers.auditor
+  let states = [pool | (_, pool) <- pools, pool.genesisCid == genesisCid]
+  let pausedStates = [pool | (_, pool) <- paused, pool.genesisCid == genesisCid]
+  stateMismatches <- case (states, pausedStates) of
+    ([pool], []) -> do
+      let field name expectedAtoms actualAtoms =
+            [name <> ": expected " <> show expectedAtoms <> ", found " <> show actualAtoms | expectedAtoms /= actualAtoms]
+      treasury <- reserveMismatches readers.treasuryIssuer lineage genesisCid "treasury" pool.treasuryReserveCid pool.treasuryReserveAmount
+      stable <- reserveMismatches readers.stableIssuer lineage genesisCid "stable" pool.stableReserveCid pool.stableReserveAmount
+      positions <- query @SecureLiquidityPosition readers.auditor
+      let mine = [position | (_, position) <- positions, position.genesisCid == genesisCid]
+      let held = sort [(position.provider, atomsOf position.shares) | position <- mine]
+      pure $ concat
+        [ [ "pool lineage differs" | pool.lineage /= lineage ]
+        , field "secure treasury reserve" expected.treasuryReserve (atomsOf pool.treasuryReserveAmount)
+        , field "secure stablecoin reserve" expected.stableReserve (atomsOf pool.stableReserveAmount)
+        , field "secure LP supply" expected.totalShares (atomsOf pool.totalShares)
+        , field "secure supply reconciliation" (atomsOf pool.totalShares)
+            (sum (map snd held) + atomsOf pool.lockedShares)
+        , [ "secure positions: expected " <> show (sort expected.positions) <> ", found " <> show held
+          | held /= sort expected.positions ]
+        , treasury
+        , stable ]
+    _ -> pure ["expected exactly one active Secure V1 state, found " <> show (length states) <> " active and "
+      <> show (length pausedStates) <> " paused"]
+  treasuryTotal <- instrumentUnits lineage.treasuryInstrument
+  stableTotal <- instrumentUnits lineage.stableInstrument
+  let totals = Totals with treasury = treasuryTotal; stable = stableTotal
+  pure (stateMismatches ++ ["instrument totals: expected " <> show expected.totals <> ", found " <> show totals | totals /= expected.totals])
+
+reserveMismatches : Party -> SecureLineage -> ContractId SecurePoolCharter -> Text -> ContractId SecureReserveHolding -> Decimal -> Script [Text]
+reserveMismatches issuer lineage genesisCid name reserveCid recordedAmount = do
+  reserve <- queryContractId issuer reserveCid
+  pure $ case reserve of
+    None -> ["secure " <> name <> " reserve is not active"]
+    Some holding ->
+      [ "secure " <> name <> " reserve differs from the pool's record"
+      | holding.lineage /= lineage || holding.genesisCid /= genesisCid || holding.amount /= recordedAmount ]
+
+-- Completion needs both sides: the legacy pool fully exited and the Secure V1 pool exactly as
+-- expected. Anything listed here keeps the migration open.
+migrationCompletionBlockers : MigrationReaders -> PoolId -> SecureLineage -> ContractId SecurePoolCharter -> SecureExpectation -> Script [Text]
+migrationCompletionBlockers readers poolId lineage genesisCid expected = do
+  legacy <- legacyExitBlockers readers poolId
+  secure <- secureMismatches readers lineage genesisCid expected
+  pure (map show legacy ++ secure)

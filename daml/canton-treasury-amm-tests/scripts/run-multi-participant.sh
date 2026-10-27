@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs the Secure V1 multi-participant validation (`CantonTreasuryAmm.Test.MultiParticipant`) on
 # a local, in-memory Canton topology with one participant per role, and leaves every log in the
-# output directory. Local only: it starts its own nodes on ports 15001-15083 and connects to
+# output directory. Local only: it starts its own nodes on ports 15001-15093 and connects to
 # nothing else. Run after `dpm build --all`. Exits non-zero on any failed phase.
 set -euo pipefail
 # The SDK every daml.yaml pins; outside a package directory dpm would resolve its own default.
@@ -56,7 +56,8 @@ python3 - "$out" <<'EOF'
 import json, sys
 out = sys.argv[1]
 ports = {"custodian": 15011, "operator": 15021, "governance": 15031, "treasury_issuer": 15041,
-         "stable_issuer": 15051, "trader": 15061, "provider": 15071, "auditor": 15081}
+         "stable_issuer": 15051, "trader": 15061, "provider": 15071, "auditor": 15081,
+         "second_provider": 15091}
 participants = {name: {"host": "localhost", "port": port} for name, port in ports.items()}
 base = {"default_participant": participants["custodian"], "participants": participants, "party_participants": {}}
 json.dump(base, open(f"{out}/participants-allocation.json", "w"), indent=2)
@@ -125,5 +126,16 @@ run_script mpOfflinePausedExit participants-hosted.json "$out/paused.json" pause
 set_stable_issuer_connection reconnect
 run_script mpResumeAfterOutage participants-hosted.json "$out/paused-outage.json" resumed.json
 
-grep -h "HOSTING\|SCENARIO\|IMPERSONATION\|ONBOARDING\|LIVENESS\|PAUSE" "$out"/mp*.log
+run_script mpMigrationAllocate participants-hosted.json "$out/state.json" migration-parties.json
+python3 - "$out" <<'EOF'
+import json, sys
+out = sys.argv[1]
+hosted = json.load(open(f"{out}/participants-hosted.json"))
+second_provider = json.load(open(f"{out}/migration-parties.json"))["secondProvider"]
+routing = dict(hosted["party_participants"], **{second_provider: "second_provider"})
+json.dump(dict(hosted, party_participants=routing), open(f"{out}/participants-migration.json", "w"), indent=2)
+EOF
+run_script mpMigrationRehearsal participants-migration.json "$out/migration-parties.json" migration.json
+
+grep -h "HOSTING\|SCENARIO\|IMPERSONATION\|ONBOARDING\|LIVENESS\|PAUSE\|MIGRATION" "$out"/mp*.log
 echo "Multi-participant validation passed."

@@ -211,9 +211,13 @@ On the local multi-participant Canton network, the same cases surface as Canton 
   swap after it; rejected trading, deposits and intents; every partial coalition; replay,
   cross-pool and expired approvals; forged positions; custody paths; foreign reserves; fee
   counters; late-failure rollback; full-core trust; visibility by role.
-- `MultiParticipant`: the multi-participant Canton scenarios. Its scripts take arguments, so
-  `dpm test` does not run them; `scripts/run-multi-participant.sh` runs them on a local
-  eight-participant network (see [`RELEASE_READINESS.md`](RELEASE_READINESS.md)).
+- `Migration`: the legacy-to-Secure V1 migration rehearsal with synthetic assets, scenarios A–H
+  of [`MIGRATION.md`](MIGRATION.md#rehearsal), through the reconciliation procedure in
+  `MigrationRehearsal`.
+- `MultiParticipant`: the multi-participant Canton scenarios, including the migration
+  rehearsal. Its scripts take arguments, so `dpm test` does not run them;
+  `scripts/run-multi-participant.sh` runs them on a local network of eight role participants
+  plus a second provider's (see [`RELEASE_READINESS.md`](RELEASE_READINESS.md)).
 
 Shared invariant and settlement checks live in `SecureV1Support`; test-only adversary
 templates are in `SecureV1Adversary`. After every transition, the checks cover:
@@ -245,8 +249,9 @@ pinned package ID are updated.
 
 ## Migration and deployment
 
-No migration is implemented or authorized, and Secure V1 is not deployment-ready.
+No migration of a live pool is authorized, and Secure V1 is not deployment-ready.
 [`MIGRATION.md`](MIGRATION.md) describes the cutover design: a parallel deployment in which each
 LP redeems through the legacy `RemoveLiquidity` and deposits into Secure V1, with no conversion
-of legacy contracts. [`RELEASE_READINESS.md`](RELEASE_READINESS.md) lists what is verified and
+of legacy contracts. It has been rehearsed with synthetic assets on the IDE ledger and on the
+local multi-participant network only. [`RELEASE_READINESS.md`](RELEASE_READINESS.md) lists what is verified and
 what still blocks a deployment.

@@ -101,7 +101,8 @@ twoProviderMarket charterReference = do
 -- exit pays 500,908 / 998,189, exactly as `RemoveLiquidity` would; supply, reserves and
 -- positions reconcile after each step; fee counters stay 30 / 0 throughout; the first LP's
 -- remaining claim does not fall; burning into the locked share is rejected; resume carries every
--- field over; the resumed pool settles a 1,000-atom swap for 1,986.
+-- field over; the resumed pool settles a 1,000-atom swap for 1,986, whose own fee is 3 atoms
+-- (30 bps, rounded up), taking the cumulative Treasury fee counter from 30 to 33.
 pausedPoolSettlesTwoProviderExitsExactly : Script ()
 pausedPoolSettlesTwoProviderExitsExactly = do
   (market, poolCid, secondPositionCid) <- twoProviderMarket "pause-01"

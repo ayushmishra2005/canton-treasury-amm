@@ -7,7 +7,8 @@
 #   needs review). 0.2.0 is the upgrade successor of 0.1.0
 #   (e4546c3f60ef59f07edb4ad1c61676ed46fe66eb8c998a1277aa29bc43b958c8, the Stage 3.1 commit);
 #   that check needs the 0.1.0 DAR rebuilt from history and is recorded in RELEASE_READINESS.md;
-# - neither deployable DAR depends on daml-script, and the type-level upgrade check passes.
+# - neither deployable DAR depends on daml-script, and the type-level upgrade check passes;
+# - the vendored Token Standard DARs in lib/ have the package IDs listed in README.md.
 set -euo pipefail
 # The SDK every daml.yaml pins; outside a package directory dpm would resolve its own default.
 export DPM_SDK_VERSION=3.5.5
@@ -46,6 +47,15 @@ print(f"{dar}: {name} {version} {actual_id}, legacy dependency {legacy_id}")
 ' "$dar" "$name" "$version" "$main_id" "$legacy_id"
 }
 
+check_vendored_dar() {
+  local dar=$1 main_id=$2 actual_id
+  actual_id=$(dpm damlc inspect-dar "$dar" --json | python3 -c 'import json, sys; print(json.load(sys.stdin)["main_package_id"])')
+  [ "$actual_id" = "$main_id" ] || { echo "$dar: main package ID $actual_id is not the reviewed $main_id" >&2; exit 1; }
+  echo "$dar: $actual_id"
+}
+
+check_vendored_dar ../lib/splice-api-token-metadata-v1-1.0.0.dar 4ded6b668cb3b64f7a88a30874cd41c75829f5e064b3fbbadf41ec7e8363354f
+check_vendored_dar ../lib/splice-api-token-holding-v1-1.0.0.dar 718a0f77e505a8de22f188bd4c87fe74101274e9d4cb1bfac7d09aec7158d35b
 check_dar "$legacy_dar" canton-treasury-amm 0.1.0 "$legacy_id"
 check_dar "$secure_dar" canton-treasury-amm-secure-v1 0.2.0 "$secure_id"
 check_dar "$prototype_dar" canton-treasury-amm-live-reserve-prototype 0.1.0 -
