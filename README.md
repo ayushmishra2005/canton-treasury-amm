@@ -1,6 +1,61 @@
 # canton-treasury-amm
 
+[![Secure V1 validation](https://github.com/ayushmishra2005/canton-treasury-amm/actions/workflows/secure-v1-validation.yml/badge.svg?branch=main)](https://github.com/ayushmishra2005/canton-treasury-amm/actions/workflows/secure-v1-validation.yml)
+
 `canton-treasury-amm` is a Daml/Canton constant-product automated market maker for swapping a tokenized U.S. Treasury asset against a USD stablecoin. It provides single-use pool initialization, exact-input swaps in both directions, liquidity positions, proportional withdrawal, slippage and deadline protection, deterministic rounding, and atomic settlement.
+
+**Status:** not deployed and not independently audited. The release decision for Secure V1 is **NO-GO** for deployment ([`RELEASE_READINESS.md`](daml/canton-treasury-amm-secure-v1/RELEASE_READINESS.md)). The CI badge shows that the committed source builds and passes its checks; it is not evidence of production readiness. For a guided tour, see the [7-minute walkthrough](docs/WALKTHROUGH.md); for what is still trusted, see the [trust-boundary and residual-risk summary](daml/canton-treasury-amm-secure-v1/SECURITY.md#trust-boundaries-and-residual-risk-summary).
+
+## Architecture
+
+Secure V1, its onboarding and pause workflows, and the pre-migration check of a legacy pool. Every core signer, governance, LP, trader and auditor submits from its own participant; the arrows marked "4 of 4" need an approval from each core signer's participant.
+
+```mermaid
+flowchart TB
+  subgraph Hosts["Independently hosted Canton participants, one synchronizer"]
+    direction LR
+    Core["Core signers, one participant each:<br/>custodian, operator,<br/>Treasury issuer, stablecoin issuer"]
+    Gov["Governance"]
+    LP["Liquidity provider"]
+    Trader["Trader"]
+    Auditor["Auditor"]
+  end
+
+  subgraph Onboarding["Onboarding"]
+    Proposal["SecurePoolProposal<br/>each core signer approves the exact terms"]
+    Charter["SecurePoolCharter"]
+    Proposal -- "FinalizePoolProposal<br/>4 of 4" --> Charter
+  end
+
+  subgraph SecureV1["Secure V1 pool, bound to one lineage and genesis"]
+    Pool["SecurePool<br/>SwapExactInput, AddLiquidity, RemoveLiquidity"]
+    Reserves[("Protected reserves<br/>2 x SecureReserveHolding<br/>core-signed, no choices")]
+    Positions["SecureLiquidityPosition<br/>signed by provider and core"]
+    Paused["SecurePausedPool<br/>RemovePausedLiquidity only"]
+    Pool -- "changes only<br/>inside pool choices" --> Reserves
+    Pool -- "creates and<br/>redeems" --> Positions
+    Pool -- "FinalizePause<br/>4 of 4" --> Paused
+    Paused -- "FinalizeResume<br/>4 of 4" --> Pool
+  end
+
+  subgraph Migration["Legacy migration: rehearsed, not authorized"]
+    Legacy["Legacy Pool 0.1.0<br/>operator-owned reserves"]
+    Verifier["verify-legacy-lineage.py<br/>read-only, independent anchor"]
+    Verdict{"VERIFIED and<br/>human decision?"}
+    Legacy --> Verifier --> Verdict
+  end
+
+  Core -- "approve" --> Proposal
+  Charter -- "InitializePool<br/>by the initial provider" --> Pool
+  LP -- "add, remove" --> Pool
+  LP -- "exit while paused" --> Paused
+  Trader -- "swap, or intent executed<br/>by operator and governance" --> Pool
+  Gov -. "observes, no<br/>reserve authority" .-> Pool
+  Auditor -. "observes" .-> Pool
+  Auditor -. "pool history on<br/>its own participant" .-> Verifier
+  Core -. "issuers'<br/>reserve history" .-> Verifier
+  Verdict -- "LP's own legacy exit,<br/>then a Secure V1 deposit" --> Pool
+```
 
 ## Model
 
@@ -60,12 +115,12 @@ This MVP therefore trusts the operator as reserve custodian. It also trusts the 
 
 `CantonTreasuryAmm.SecureV1.Pool` and `CantonTreasuryAmm.SecureV1.SwapIntent` are a parallel implementation with protected reserves. Every pool state, reserve and LP position is signed by an independent custodian, the operator and both issuers. Reserves have no choices and change only inside the pool's own swap and liquidity choices, which bind them to the pool's lineage and genesis. Governance observes but holds no reserve authority, and no coalition smaller than those four signers can move reserves, forge positions or settle in another party's name. That full coalition remains trusted. When the signers are hosted on separate participants, `CantonTreasuryAmm.SecureV1.Onboarding` lets each of them approve the exact pool terms from its own participant before the operator finalizes the charter, and lets governance accept the intent factory and approve each intent execution. `CantonTreasuryAmm.SecureV1.Pause` lets all four core signers jointly pause a pool, which stops trading and deposits while LPs can still exit on the same terms, and jointly resume it. Pause needs every core signer and does not help when one is unavailable. Pricing, rounding, both fee counters, auditor visibility and the swap-intent roles match the legacy pool, which the tests check step by step. Arbitrary Token Standard holdings are not supported as reserves or deposits.
 
-Secure V1 is a separate package, `canton-treasury-amm-secure-v1` 0.2.0, in [`daml/canton-treasury-amm-secure-v1`](daml/canton-treasury-amm-secure-v1). It data-depends on the unchanged legacy `canton-treasury-amm` 0.1.0 DAR, so the legacy package keeps its package ID and both can be vetted on one participant. Secure V1 is not deployed, has not been audited and is not ready for deployment. No migration from legacy pools is implemented or authorized. See:
+Secure V1 is a separate package, `canton-treasury-amm-secure-v1` 0.2.0, in [`daml/canton-treasury-amm-secure-v1`](daml/canton-treasury-amm-secure-v1). It data-depends on the unchanged legacy `canton-treasury-amm` 0.1.0 DAR, so the legacy package keeps its package ID and both can be vetted on one participant. Secure V1 is not deployed, has not been independently audited, and its release decision is NO-GO. No migration of legacy pools is authorized: the cutover design has been rehearsed with synthetic assets only, and a read-only lineage verifier checks a legacy pool's history against an independently recorded anchor before any migration decision. See:
 
 - [`SECURE_V1.md`](daml/canton-treasury-amm-secure-v1/SECURE_V1.md) for the design, fee accounting, privacy and tests;
 - [`SECURITY.md`](daml/canton-treasury-amm-secure-v1/SECURITY.md) for the legacy and Secure V1 security model, residual trust, emergency operations and compatibility;
 - [`RELEASE_READINESS.md`](daml/canton-treasury-amm-secure-v1/RELEASE_READINESS.md) for packaging, CI, multi-participant Canton evidence and the remaining deployment blockers;
-- [`MIGRATION.md`](daml/canton-treasury-amm-secure-v1/MIGRATION.md) for the legacy cutover design;
+- [`MIGRATION.md`](daml/canton-treasury-amm-secure-v1/MIGRATION.md) for the legacy cutover design and lineage verification;
 - [`ONBOARDING.md`](daml/canton-treasury-amm-secure-v1/ONBOARDING.md) for the multi-party onboarding and approval procedure;
 - [`PAUSE.md`](daml/canton-treasury-amm-secure-v1/PAUSE.md) for pause, resume, LP exits while paused, liveness limits and permanent signer loss.
 
@@ -92,12 +147,13 @@ The release checks used by CI live in `daml/canton-treasury-amm-tests/scripts` a
 
 | Script | Fails when |
 | --- | --- |
+| `check-dpm-installer.sh` | `install-dpm-verified.sh` accepts, or runs anything from, a wrong SDK version, an unpinned platform, or a missing, truncated or modified archive |
 | `run-tests-strict.sh` | any test fails, or the set of passing tests differs from the `Script` values declared in the test sources (so a skipped or missing test fails) |
 | `check-prototype-choice-surface.sh` | a production or prototype package gains, loses or renames a template, or a reviewed template's choices change |
 | `check-packages.sh` | the legacy or Secure V1 package ID, name, version or legacy dependency differs from the reviewed values, a deployable package depends on Daml Script, or `dpm upgrade-check` rejects the two packages side by side |
-| `run-multi-participant.sh` | the local multi-participant Canton scenarios in `MultiParticipant.daml` do not behave as specified |
+| `run-multi-participant.sh` | the local multi-participant Canton scenarios in `MultiParticipant.daml` and `LegacyLineage.daml` do not behave as specified, or `check-legacy-lineage.py` gets an unexpected verdict from `verify-legacy-lineage.py` |
 
-`run-multi-participant.sh` starts a local Canton 3.5.12 network (one sequencer, one mediator and eight in-memory participants) from the SDK's Canton jar, using `daml/canton-treasury-amm-tests/multi-participant`. It writes its logs to `AMM_MP_LOG_DIR` (a temporary directory by default) and stops the network on exit. The [Secure V1 validation workflow](.github/workflows/secure-v1-validation.yml) runs all of these on GitHub Actions with read-only permissions.
+`run-multi-participant.sh` starts a local Canton 3.5.12 network (one sequencer, one mediator and nine in-memory participants: one per role plus a second provider for the migration rehearsal) from the SDK's Canton jar, using `daml/canton-treasury-amm-tests/multi-participant`. It writes its logs to `AMM_MP_LOG_DIR` (a temporary directory by default) and stops the network on exit. The [Secure V1 validation workflow](.github/workflows/secure-v1-validation.yml) runs all of these on GitHub Actions with read-only permissions.
 
 To verify the generated test DAR against Canton, start the sandbox in one shell:
 

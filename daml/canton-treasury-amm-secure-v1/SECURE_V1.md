@@ -2,7 +2,8 @@
 
 `CantonTreasuryAmm.SecureV1.Pool` and `CantonTreasuryAmm.SecureV1.SwapIntent` are a parallel
 implementation of the AMM in which pool reserves are protected contracts rather than
-operator-owned holdings. They are the Stage 2.1 "model B" prototype, productionized. They live
+operator-owned holdings. They carry the Stage 2.1 "model B" prototype into a separate,
+release-checked package; that does not make them production-ready. They live
 in their own package, `canton-treasury-amm-secure-v1` 0.2.0, which data-depends on the legacy
 `canton-treasury-amm` 0.1.0 DAR (package ID `d8cadd3c…`) for `Holding`, `Math`, `Errors`,
 `Types` and `Pool.validateSwap`. The legacy package is byte-identical to its Phase 0 build. Its

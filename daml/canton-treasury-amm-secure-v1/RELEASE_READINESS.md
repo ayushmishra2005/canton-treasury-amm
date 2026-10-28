@@ -119,8 +119,10 @@ disabled and actions pinned by commit SHA. Its steps:
 9. `scripts/check-packages.sh`: package IDs, dependencies, the vendored Token Standard DAR IDs
    and the upgrade check.
 10. Record the SHA-256 of every built and vendored DAR in the logs artifact.
-11. `scripts/run-multi-participant.sh`, including the migration rehearsal.
-12. Upload the test and Canton logs and the DAR digests as an artifact, also on failure.
+11. `python3 -m py_compile` on `verify-legacy-lineage.py` and `check-legacy-lineage.py`.
+12. `scripts/run-multi-participant.sh`, including the migration rehearsal and the legacy
+    lineage checks.
+13. Upload the test and Canton logs and the DAR digests as an artifact, also on failure.
 
 No step uses `|| true`, `continue-on-error` or skipped tests.
 
@@ -169,10 +171,16 @@ pinned here. The bootstrap was not run with networking disabled.
   [Mutation testing](#mutation-testing)).
 - No step contains `|| true` or a `latest` version.
 
+**Remote execution (recorded after Stage 4.1).** The workflow has run on GitHub Actions for the
+pushes of `c4de013`, `5f6cb43`, `13e2e12` and `e8da9ea`, and every run succeeded; `fb84f4a` has
+no run of its own. The run for
+`e8da9ea` passed every step above on `ubuntu-24.04` in about 13 minutes, of which the
+multi-participant step took about 9, within the 60-minute timeout. That verifies the Linux
+install path, the runner's memory for nine participants and the run time. It is evidence that
+the committed source builds and passes these checks on a hosted runner with in-memory nodes. It
+says nothing about a production topology, and it is not an audit.
+
 **CI blockers and gaps.**
-- **Not run on GitHub.** The workflow has never executed remotely, so there is no remote CI
-  result. The Linux install path, the runner's memory for nine participants, and the run time
-  are unverified until it does.
 - **`actionlint` unavailable.** It is not installed locally, and installing it would add an
   unreviewed tool, so the workflow's static validation is incomplete.
 - **Digest provenance.** The SDK digests are the publisher registry's own records, not a
@@ -380,7 +388,8 @@ or medium issue in Secure V1. Findings:
 
 - **Verified tests.** The full Daml Script suite passes on the IDE ledger. Legacy
   characterization tests are unchanged and still pass.
-- **CI execution status.** Implemented and validated locally. It has not run on GitHub.
+- **CI execution status.** Implemented, validated locally, and passing on GitHub Actions for
+  every push since the workflow was added, most recently for `e8da9ea` (see [CI](#ci)).
 - **Real Canton participant coverage.**
   - Stage 2.2: four Secure V1 scripts on a single-participant Canton 3.5.12 sandbox.
   - Stage 2.3: a single-participant sandbox for package coexistence, plus the multi-participant
@@ -423,7 +432,7 @@ or medium issue in Secure V1. Findings:
 | High | The pause workflow has not been reviewed or accepted by any custodian or issuer, has been run only on a local test network, and is not audited. |
 | High | No independent security audit has been done. |
 | Medium | Any one core participant can halt every pool operation, including LP exits from a paused pool, and pause and resume themselves. |
-| Medium | CI has never run remotely, and `actionlint` has not been run. The SDK archive digests come from the publisher's registry, not from a signature. |
+| Medium | `actionlint` has not been run. The SDK archive digests come from the publisher's registry, not from a signature. CI now passes on GitHub Actions, which does not change this decision. |
 | Medium | Migration has been rehearsed only with synthetic assets on local networks. The lineage verifier exists and has been exercised there only. It is unreviewed and unaudited, and it relies on anchors that no real pool has recorded. Production JSON API authentication, reader retention and the readers' own participants are untested. There is no reviewed inventory tooling, no withdrawal-window procedure, no decision on legacy dust, and no LP or issuer communication. |
 | Medium | Privacy sign-off for the issuers' and custodian's visibility is missing. |
 | Low | Intent executors choose among the trader's eligible holdings and the execution timing (see [`SECURITY.md`](SECURITY.md#secure-swapintent-scope)). |

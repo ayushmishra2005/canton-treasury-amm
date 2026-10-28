@@ -8,6 +8,63 @@ the review described in [Source review](#source-review).
 Secure V1 is a trusted-custody design. It is not trustless or fully noncustodial. It has not
 been audited, and it is not ready for deployment. See [Deployment readiness](#deployment-readiness).
 
+## Trust boundaries and residual risk (summary)
+
+Each boundary names what the ledger enforces and what is still trusted. The sections below
+hold the evidence.
+
+- **Participant hosting.** Enforced: a participant can submit only for parties it hosts, and
+  every pool transaction needs a confirmation from each core party's participant. Trusted: that
+  the custodian, the operator, both issuers and governance really are separate organizations
+  with separate participants and keys. The ledger only checks that the party IDs differ
+  ([Signer separation](#signer-separation)).
+- **Core signers and everyone else.** Enforced: charters, pool states and reserves carry all
+  four core signatures, and no coalition missing a core signer can create, move or archive them
+  (all 29 such subsets of the core plus governance are tested, see
+  [Secure V1](#secure-v1)). Trusted: the full core coalition, which can
+  forge, drain, freeze or destroy a pool ([What the full core can do](#what-the-full-core-can-do)).
+- **Pool and reserves.** Enforced: reserves have no choices and change only inside pool choices
+  that check lineage, genesis, instrument and the recorded amounts. Trusted: that the reviewed
+  choice bodies are correct. The CI change-control checks are not a semantic proof
+  ([Source review](#source-review)).
+- **Traders and LPs.** Enforced: a deposit moves only through the depositor's own
+  `TransferExact`, payouts go only to the controlling trader or provider, and a position cannot
+  be archived without its provider. Trusted: intent executors choose which eligible holding to
+  spend and when to execute ([Secure SwapIntent scope](#secure-swapintent-scope)).
+- **Governance and auditors.** Enforced: neither holds reserve authority. Governance only
+  co-controls the intent factory and intent executions; auditors only observe.
+- **Issuers and ordinary holdings.** Unchanged from the legacy token model: each issuer alone
+  can archive any ordinary `Holding` of its instrument, including payouts once they leave the
+  pool ([Destroyable assets](#destroyable-assets-and-archivable-contracts)).
+- **Legacy and Secure V1.** Enforced: a legacy diversion cannot reach Secure V1 reserves.
+  Trusted: legacy pools keep operator custody and operator-with-governance forgery until they
+  are drained ([Legacy AMM](#legacy-amm)).
+- **Migration evidence.** The lineage verifier is read-only and only reports. Trusted: the
+  independently recorded anchor, honest history from the readers' participants, and retention
+  back to the genesis. VERIFIED is not an approval
+  ([`MIGRATION.md`](MIGRATION.md#lineage-verification)).
+- **Canton infrastructure.** Out of scope: synchronizer and participant operators, key
+  management and networking. Tested only on a local in-memory network with one simulated
+  outage ([`RELEASE_READINESS.md`](RELEASE_READINESS.md#multi-participant-canton)).
+
+Residual risks that remain after these controls:
+- collusion or compromise of all four core signers;
+- any one core participant can halt swaps, deposits, LP exits (paused pools included), pause
+  and resume ([Unavailable or refusing signers](#unavailable-or-refusing-signers));
+- permanent loss of a core signer freezes every pool it signs, with no recovery
+  ([`PAUSE.md`](PAUSE.md#permanent-signer-loss));
+- archival is destructive, and no on-ledger recovery exists
+  ([Recovery after accidental archival](#recovery-after-accidental-archival));
+- the custodian and both issuers see every LP identity and share amount;
+- a finalized charter has no expiry, so its initial provider can initialize it at any later
+  time and ratio;
+- no independent audit, no custodian or issuer review of onboarding or pause, no operational
+  procedures, migration rehearsed only with synthetic assets, and SDK digests that come from the
+  publisher's registry rather than a signature.
+
+These are why the deployment decision is **NO-GO**; the severities are in
+[`RELEASE_READINESS.md`](RELEASE_READINESS.md#remaining-blockers).
+
 ## Legacy AMM
 
 The legacy `canton-treasury-amm` package (`Pool`, `PoolSetup`, `LiquidityPosition`,
@@ -153,6 +210,9 @@ legacy workflow. Any pool operation advances `stateVersion`, so an intent agains
 version fails and must be resubmitted.
 
 ## Source review
+
+This and the two following source reviews are the project's own reviews. None of them is an
+independent audit.
 
 This review covered `SecureV1/Pool.daml` and `SecureV1/SwapIntent.daml` at package ID
 `7f69816410e1c5e0…`, against the threat model above. No new critical, high or medium finding
