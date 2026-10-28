@@ -253,5 +253,8 @@ No migration of a live pool is authorized, and Secure V1 is not deployment-ready
 [`MIGRATION.md`](MIGRATION.md) describes the cutover design: a parallel deployment in which each
 LP redeems through the legacy `RemoveLiquidity` and deposits into Secure V1, with no conversion
 of legacy contracts. It has been rehearsed with synthetic assets on the IDE ledger and on the
-local multi-participant network only. [`RELEASE_READINESS.md`](RELEASE_READINESS.md) lists what is verified and
+local multi-participant network only. Before a legacy pool migrates, its history is checked
+against an independently recorded anchor by a read-only verifier
+([`MIGRATION.md`](MIGRATION.md#lineage-verification)). The verifier is evidence for a human
+decision, not an approval. [`RELEASE_READINESS.md`](RELEASE_READINESS.md) lists what is verified and
 what still blocks a deployment.

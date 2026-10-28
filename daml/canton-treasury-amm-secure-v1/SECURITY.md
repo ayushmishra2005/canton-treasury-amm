@@ -37,6 +37,20 @@ The legacy model therefore trusts the operator as reserve custodian, trusts each
 archive reserves, and trusts the operator and governance not to collude. Secure V1 does not
 change any of this for legacy contracts. A deployed legacy pool keeps these weaknesses until it
 is drained (see [`MIGRATION.md`](MIGRATION.md)).
+
+**Detection before migration (Stage 4.1).** The read-only lineage verifier
+([`MIGRATION.md`](MIGRATION.md#lineage-verification)) reports each of these powers once it has
+been used, if the auditor's and issuers' own participants still hold the history:
+- diversion and issuer archival, as `RESERVE_DIVERTED` and `RESERVE_INACTIVE`;
+- forgery and re-creation, as `LINEAGE_BROKEN`, `UNACCOUNTED_STATE` and
+  `POSITION_OUTSIDE_LINEAGE`;
+- duplicates, as `DUPLICATE_ACTIVE_STATE`;
+- unaccounted burns, as `POSITION_OUTSIDE_LINEAGE` and `SUPPLY_MISMATCH`.
+
+It prevents none of them and restores nothing. It depends on an anchor recorded independently
+at the pool's opening, on readers that report honestly, and on retention back to the genesis.
+A pool whose history is pruned or that no independent party observes cannot be verified.
+
 `SecureV1Lifecycle:legacyOperatorDiversionCannotReachSecureReserves` shows that a legacy
 diversion in the same ledger cannot touch Secure V1 reserves or pool state.
 

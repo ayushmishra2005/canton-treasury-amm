@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Runs the Secure V1 multi-participant validation (`CantonTreasuryAmm.Test.MultiParticipant`) on
-# a local, in-memory Canton topology with one participant per role, and leaves every log in the
-# output directory. Local only: it starts its own nodes on ports 15001-15093 and connects to
+# Runs the Secure V1 multi-participant validation (`CantonTreasuryAmm.Test.MultiParticipant`) and
+# the legacy lineage verification (`CantonTreasuryAmm.Test.LegacyLineage`) on a local, in-memory
+# Canton topology with one participant per role, and leaves every log in the output directory. Local only: it starts its own nodes on ports 15001-15093 and connects to
 # nothing else. Run after `dpm build --all`. Exits non-zero on any failed phase.
 set -euo pipefail
 # The SDK every daml.yaml pins; outside a package directory dpm would resolve its own default.
@@ -64,9 +64,9 @@ json.dump(base, open(f"{out}/participants-allocation.json", "w"), indent=2)
 EOF
 
 run_script() {
-  local name=$1 config=$2 input=$3 output=$4
+  local name=$1 config=$2 input=$3 output=$4 module=${5:-CantonTreasuryAmm.Test.MultiParticipant}
   echo "== $name"
-  dpm script --dar "$dar" --script-name "CantonTreasuryAmm.Test.MultiParticipant:$name" \
+  dpm script --dar "$dar" --script-name "$module:$name" \
     --participant-config "$out/$config" --input-file "$input" --output-file "$out/$output" \
     > "$out/$name.log" 2>&1
 }
@@ -137,5 +137,18 @@ json.dump(dict(hosted, party_participants=routing), open(f"{out}/participants-mi
 EOF
 run_script mpMigrationRehearsal participants-migration.json "$out/migration-parties.json" migration.json
 
-grep -h "HOSTING\|SCENARIO\|IMPERSONATION\|ONBOARDING\|LIVENESS\|PAUSE\|MIGRATION" "$out"/mp*.log
+# Lineage verification: the read-only verifier against one legacy pool per scenario, each party
+# read on its own participant, then again after the auditor's participant prunes past a genesis.
+# The expected legacy package ID is the reviewed one, also pinned in check-packages.sh.
+legacy_package_id=d8cadd3c038655678a71e052616b054a07ad53600e2feb719456f629c2772aa6
+run_script mpLineageScenarios participants-hosted.json "$out/parties.json" lineage.json CantonTreasuryAmm.Test.LegacyLineage
+python3 scripts/check-legacy-lineage.py "$out" "$legacy_package_id" | tee "$out/lineage-checks.log"
+genesis_offset=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["evidence"]["genesis"]["offset"])' "$out/lineage-00-report.json")
+AMM_PRUNE_AFTER_OFFSET=$genesis_offset java -jar "$canton_jar" run multi-participant/prune-auditor.canton \
+  --no-tty -c multi-participant/remote-auditor.conf --log-file-name "$out/prune-console.log" \
+  > "$out/prune-auditor.log" 2>&1
+cat "$out/prune-auditor.log"
+python3 scripts/check-legacy-lineage.py "$out" "$legacy_package_id" --after-pruning | tee -a "$out/lineage-checks.log"
+
+grep -h "HOSTING\|SCENARIO\|IMPERSONATION\|ONBOARDING\|LIVENESS\|PAUSE\|MIGRATION\|LINEAGE" "$out"/mp*.log
 echo "Multi-participant validation passed."

@@ -1,0 +1,20 @@
+// Prunes the local auditor participant up to a safe offset at or after AMM_PRUNE_AFTER_OFFSET,
+// for the lineage verifier's missing-history check. Canton only offers offsets covered by ACS
+// commitments, which an idle synchronizer does not compute, so the auditor pings every connected
+// participant until one is offered. Fails if none is within the deadline.
+val required = sys.env("AMM_PRUNE_AFTER_OFFSET").toLong
+val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(300)
+val counterParticipants = auditor.topology.synchronizer_trust_certificates.list().map(_.item.participantId)
+def safe(): Option[Long] = auditor.pruning.find_safe_offset(java.time.Instant.now()).filter(_ >= required)
+var offset = safe()
+while (offset.isEmpty && System.nanoTime() < deadline) {
+  counterParticipants.foreach(auditor.health.ping(_))
+  Thread.sleep(5000)
+  offset = safe()
+}
+offset match {
+  case Some(o) =>
+    auditor.pruning.prune(o)
+    println(s"auditor participant pruned up to offset $o")
+  case None => throw new IllegalStateException(s"no safe pruning offset at or after $required within the deadline")
+}

@@ -1,6 +1,7 @@
 # Install the pinned SDK from a size- and SHA-256-verified archive, build, lint and test every
 # package, check the reviewed template and choice surfaces and package IDs, and run the local
-# multi-participant Canton validation, including the migration rehearsal. Read-only:
+# multi-participant Canton validation, including the migration rehearsal and the legacy lineage
+# verification. Read-only:
 # no secrets, no deployment, no upload to any ledger outside the job's own in-memory nodes.
 name: Secure V1 validation
 
@@ -88,6 +89,11 @@ jobs:
             lib/splice-api-token-holding-v1-1.0.0.dar lib/splice-api-token-metadata-v1-1.0.0.dar \
             > "$RUNNER_TEMP/dar-sha256.txt"
           cat "$RUNNER_TEMP/dar-sha256.txt"
+
+      - name: Lineage verifier compiles
+        env:
+          PYTHONPYCACHEPREFIX: ${{ runner.temp }}/pycache
+        run: python3 -m py_compile daml/canton-treasury-amm-tests/scripts/verify-legacy-lineage.py daml/canton-treasury-amm-tests/scripts/check-legacy-lineage.py
 
       - name: Multi-participant Canton validation
         env:

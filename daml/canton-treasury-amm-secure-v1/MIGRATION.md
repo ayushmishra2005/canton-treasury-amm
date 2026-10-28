@@ -49,7 +49,9 @@ stay bound to the legacy package; nothing converts them.
    active-contract queries for the legacy package's `Pool`, `PoolSetup`, `LiquidityPosition`
    and `SwapIntent` templates. The results are grouped by `PoolId`. A `PoolId` with more than one
    active `Pool` is a duplicate-state incident: stop and escalate. Output: a signed inventory
-   with the ledger offset of the query.
+   with the ledger offset of the query. Each pool then goes through
+   [Lineage verification](#lineage-verification) against its independently recorded anchor, and
+   only a VERIFIED pool continues. Active contracts alone cannot show that a state is genuine.
 2. **Snapshot pool state and reserve contract IDs.** For each pool, record the active `Pool`
    payload at that offset: reserve contract IDs and amounts, `totalShares`, `lockedShares`, both
    fee counters and `stateVersion`. Record each reserve `Holding` payload. Snapshots from the
@@ -85,7 +87,8 @@ stay bound to the legacy package; nothing converts them.
 8. **Handle a pool already frozen by a consumed reserve.** If a referenced reserve is inactive
    (operator diversion, issuer archival or a duplicate-state settlement), every legacy pool
    choice fails and LPs cannot redeem. Treat this as an incident. Record the snapshot and the
-   transaction that consumed the reserve. Do not create a replacement `Pool`: the operator and
+   transaction that consumed the reserve (the verifier's `RESERVE_DIVERTED` reason names the
+   reserve and the choice that consumed it). Do not create a replacement `Pool`: the operator and
    governance can, but that is the forgery power. Any restoration needs the issuers and every
    affected LP to agree, an independently reconciled amount, and a separately reviewed
    procedure. Migration of that pool stops until then.
@@ -185,7 +188,207 @@ In none of these cases does anyone create, archive, move or re-issue a contract 
 numbers agree. A state that reconciles is not thereby genuine: a legacy pool archived and
 re-created unchanged by the operator and governance passes every check of the procedure, and
 only the ledger history shows it (scenario C of the rehearsal). Steps 1 and 8 therefore require
-the transaction history of each pool state, not just the active contracts.
+the transaction history of each pool state, not just the active contracts. That history check is
+[Lineage verification](#lineage-verification); a pool that does not verify does not migrate.
+
+## Lineage verification
+
+`daml/canton-treasury-amm-tests/scripts/verify-legacy-lineage.py` checks one legacy pool's
+history against a trusted starting point before its migration. It is read-only and needs only
+the Python 3 standard library. It submits nothing and creates, archives or moves no contract.
+It reads only through the documented JSON Ledger API v2 endpoints of Canton 3.5.12:
+- `GET /v2/parties/{party}`, to check that the reader's party is hosted there (`isLocal`);
+- `GET /v2/state/ledger-end`, which pins the offset the whole read refers to;
+- `GET /v2/state/latest-pruned-offsets`;
+- `POST /v2/updates/get-updates-page`, for every transaction from the pruning boundary to that
+  offset, in the ledger-effects shape;
+- `POST /v2/state/active-contracts`, at that offset.
+
+Every read is scoped to the reader's own party. This is not an audit and does not replace one.
+It is one piece of evidence that a human reviews before deciding anything.
+
+**Outcomes.** The verifier gives exactly one of three outcomes. Its exit codes are 0, 2 and 3,
+and 1 means unusable input.
+- **VERIFIED:** the evidence that was read agrees with the anchor. The report lists what is
+  still trusted.
+- **BLOCKED:** the evidence contradicts the anchor or the legacy rules. That pool's migration
+  stops.
+- **INCOMPLETE EVIDENCE:** the evidence was not enough to decide. That pool's migration stops
+  until the gap is closed.
+
+BLOCKED outranks INCOMPLETE EVIDENCE, and INCOMPLETE EVIDENCE outranks VERIFIED. Every reason
+carries a code and the contract or update it concerns. Both a JSON report and a human-readable
+summary are written.
+
+### The trusted anchor
+
+The verifier authenticates nothing on its own. Ledger history shows how the current state
+descends from an earlier one; it cannot show that the earlier one was the right pool. That
+starting point, the *anchor*, must come from outside the ledger tooling. The manifest holds it:
+
+| Field | Content |
+| --- | --- |
+| `legacyPackageId` | The reviewed legacy package (`d8cadd3c…`), from the release record, not from the ledger |
+| `pool` | The `PoolId` and the pool auditors |
+| `authorizedParties` | The operator and governance, exactly |
+| `reserveInstruments` | The two instruments, which must equal those in the `PoolId` |
+| `anchor` | `genesisCid`, the version-0 `Pool` created by `Initialize`, and `attestedBy`, the parties that recorded it |
+| `provenance` | `recordedBy` (one of the attestors), and how and when it was recorded |
+| `snapshot` | The `Pool` contract ID at the agreed snapshot boundary |
+| `knownActiveStateCid` | The state the inventory presents as current |
+| `positions` | Each provider's own confirmation of its shares, in atoms |
+| `requireComplete` | Whether outstanding legacy positions block the verdict (a completion check) |
+
+**How an auditor establishes the anchor.** When the pool is opened, the pool auditor's own
+participant receives the `Initialize` transaction, because the auditor is an observer of the
+`Pool` it creates. The auditor records the created `Pool` contract ID, the update ID and the
+`PoolId` at that time, in its own records, outside the operator's control. That record is the
+anchor. The verifier then re-checks the anchor against the auditor's participant:
+- the anchor must be a `Pool` of the expected package, at version 0 with no fees;
+- its signatories must be exactly the operator and governance;
+- its `PoolId` and auditors must match the manifest;
+- it must have been created inside a consuming `Initialize` of a legacy `PoolSetup`;
+- no other `Initialize` may have created a pool with the same `PoolId`.
+
+The anchor's status is reported as one of four values:
+- **independently verified:** an attestor other than the operator and governance is a pool
+  stakeholder whose own participant confirms the anchor, and that attestor recorded it;
+- **claimed but unverified:** the anchor is attested only by the operator or governance, was
+  recorded by someone else, or no independent stakeholder can see it. The result is INCOMPLETE
+  EVIDENCE. An anchor supplied by the operator is never accepted, however well the balances
+  reconcile;
+- **conflicting:** the history contradicts the anchor, giving BLOCKED. Examples are a state not
+  created by `Initialize`, a second genesis, or different fields;
+- **missing:** there is no anchor or no attestor, giving INCOMPLETE EVIDENCE.
+
+An issuer cannot anchor a pool on its own. Issuers are not `Pool` stakeholders, so they never
+see pool states. They do see every move of their reserve holdings, and they confirm the reserves.
+
+### What the history can and cannot show
+
+From the anchor, the verifier follows each pool state to its successor in the auditor's
+history. Each consuming exercise must be `SwapExactInput`, `AddLiquidity` or `RemoveLiquidity`
+of the expected package. It must create exactly one successor with the same `PoolId` at the
+next version, and the choice's result must name that successor. The verifier then requires all
+of the following:
+- the last state is the only active state;
+- every other state with this `PoolId` is reported;
+- the inventory's state and the snapshot are in the lineage. A snapshot earlier than the current
+  state is accepted, and the legitimate transitions since it are listed;
+- every `LiquidityPosition` of the pool was created inside the genesis `Initialize`, an
+  `AddLiquidity` or a `RemoveLiquidity` of the lineage, and was consumed only inside a lineage
+  `RemoveLiquidity`;
+- the active positions plus the locked share equal `totalShares`;
+- the active positions equal the providers' confirmations, also as read from each provider's own
+  participant where a reader is given;
+- in each issuer's history, every reserve of every lineage state was created in a lineage update
+  and consumed only in the update that consumed the state holding it. Issuers' participants see
+  the reserve moves but not the pool exercise around them, so the two views are matched by update
+  ID, which is the same on every participant;
+- the current reserves are active, of the pool's instruments, owned by the operator, and hold the
+  recorded amounts.
+
+This shows that the current state descends, through the legacy package's own pool choices, from
+the anchored genesis. It also shows that no position or reserve of the pool was created or
+consumed outside those choices, as far as the readers can see.
+
+It cannot show:
+- that the anchor was the right pool to begin with;
+- that the readers' participants report their history honestly;
+- that the legacy package does what its review says;
+- what happened before the oldest unpruned offset;
+- what happens after the read.
+
+A reconciled balance is not evidence of a lineage: a faithful re-creation and a forged position
+with a matching supply both pass the [snapshot procedure](#rehearsal) and are BLOCKED here.
+
+### Required visibility
+
+- **The pool auditor**, or another independent pool stakeholder, read on the participant that
+  hosts it. Without one the result is `NO_INDEPENDENT_VIEW`. A pool with no auditors cannot be
+  verified by anyone other than its operator and governance.
+- **Both issuers**, each read on its own participant. Without one the result is
+  `RESERVE_EVIDENCE_MISSING`.
+- **Each confirming provider**, optionally, on its own participant.
+
+A reader whose party is not hosted on the given participant is not used (`READER_NOT_HOSTED`).
+An administrator's or another participant's view does not substitute for the party's own.
+
+In production, each reader needs a JSON API access token scoped to `readAs` its own party, and
+each party gathers its own evidence. The local test network has no JSON API authentication, and
+the test checks query each party only on its own participant. That reflects the test setup, not
+an auditor capability.
+
+### Missing history and conflicting state
+
+Missing evidence is reported as INCOMPLETE EVIDENCE, never as success:
+- `HISTORY_PRUNED`: a reader's participant has pruned past the genesis;
+- `ANCHOR_NOT_VISIBLE`: the anchor is not in the reader's history;
+- `READER_UNAVAILABLE`: an endpoint failed, or the update stream stopped before the pinned
+  offset;
+- `RESERVE_ORIGIN_UNKNOWN` on a pruned issuer participant;
+- `STATE_CHANGED`: the inventory is older than the current state, so it must be re-taken.
+
+Conflicting state is BLOCKED, with codes such as `LINEAGE_BROKEN`, `UNACCOUNTED_STATE`,
+`DUPLICATE_ACTIVE_STATE`, `POSITION_OUTSIDE_LINEAGE`, `SUPPLY_MISMATCH`, `POSITION_MISMATCH`,
+`RESERVE_DIVERTED`, `RESERVE_INACTIVE`, `RESERVE_MISMATCH`, `UNEXPECTED_PACKAGE`,
+`ANCHOR_CONFLICT`, `ANCHOR_NOT_GENESIS` and `CONFLICTING_GENESIS`.
+
+A duplicate is reported only among the states the readers can see. The verifier does not claim
+that no other copy exists.
+
+**Retention.** Pruning ends the ability to verify. Every participant that is read must keep its
+history from the genesis until the migration is decided. That is the auditor's, and for
+reserves each issuer's, and it includes any automatic pruning schedule. If retention cannot be
+guaranteed, the anchor record should include each reader's own record of the lineage as it
+happens. This design does not provide that record.
+
+### Legacy reserve diversion
+
+Legacy reserves are operator-owned holdings, and the operator can move them at any time with
+`TransferExact`. The verifier detects a diversion that has already happened: the reserve is
+consumed outside a pool transition, and the pool is frozen (`RESERVE_DIVERTED`,
+`RESERVE_INACTIVE`). It can prevent neither a diversion nor its recurrence, and it cannot return
+the value. A diversion after the read is covered by step 3's repeated checks, and not by this
+verdict. See step 8 for a pool that is already frozen.
+
+### Evidence and approval
+
+For each pool, keep the following:
+- the manifest, the anchor record and its provenance;
+- the readers file, without tokens;
+- the JSON report;
+- the ledger end and pruning offset of each reader.
+
+The report's offsets bound what it covers.
+
+VERIFIED is not an approval. Cutover of a pool needs a human decision, recorded with the
+report, by the parties listed under [Stop conditions](#stop-conditions). Every remaining trusted
+assumption in the report must be accepted explicitly.
+
+The readers' participants must be re-read immediately before each legacy exit, because the
+verdict says nothing about later transactions. Multi-LP exits are not atomic (see
+[Atomicity and coordination](#atomicity-and-coordination)), so each exit is a new
+time-of-check/time-of-use window.
+
+### Limitations
+
+The verifier does not remove any of these threats; it only reports what it can see:
+- a full core, or the operator and governance together, can still do everything listed in
+  [`SECURITY.md`](SECURITY.md#legacy-amm), for example archive, re-create or forge state;
+- issuers can still archive or mint their instruments;
+- participants that serve false or partial history, or a synchronizer that sequences a different
+  history, defeat it;
+- off-ledger coordination is outside it;
+- it reads JSON API list endpoints. An active contract set larger than the participant's
+  `http-list-max-elements-limit` fails the read and gives INCOMPLETE EVIDENCE, not a partial
+  answer.
+
+It recognizes pool-like contracts by a `poolId` field equal to the manifest's; a copy that
+renames the field is not recognized as pool-like.
+
+It authorizes no live migration. It has run only against synthetic pools on a local network (see
+[Rehearsal](#rehearsal)).
 
 ## Pause and signer loss
 
@@ -251,9 +454,82 @@ participant. The phases also check that a replayed legacy exit fails on the cons
 that a wrong completion expectation is reported. This is a local, in-memory network, not
 evidence about a production topology.
 
+**Lineage verification on Canton.** `run-multi-participant.sh` then runs
+`LegacyLineage:mpLineageScenarios`, which creates one legacy pool per scenario with synthetic
+`LUST` / `LUSD` instruments, each role submitting from its own participant. The pools are:
+- genuine;
+- recreated: a faithful re-creation after a swap;
+- diverted: an operator `TransferExact` of a reserve;
+- forged: a 1,000-share position, with a re-created state whose supply includes it;
+- duplicated: a second identical active state;
+- burned: a provider's standalone partial `BurnPosition`;
+- fullyBurned: a second LP's standalone burn of its whole position;
+- regenesis: the genesis archived and re-created at version 0;
+- unobserved: a pool with no auditors;
+- legitimate: snapshot taken, then a swap, a partial exit and a deposit;
+- partial: one of two LPs has exited;
+- complete: the only LP has exited.
+
+The operator's and governance's joint actions go through the test-only `LegacyStateRewrite`,
+which governance applies on its own participant. It stands for any code those two could vet and
+use together. The phase asserts that the [snapshot procedure](#rehearsal) reconciles both the
+faithful re-creation and the forgery.
+
+`scripts/check-legacy-lineage.py` builds a manifest for each check from what the independent
+parties observed. It runs the verifier with each party read on its own participant's JSON API
+and requires the exact verdict and exit code, the listed reason codes, and no reason at all for
+VERIFIED. The auditor's participant is then pruned for real, past the genuine pool's genesis,
+and that pool is checked again.
+
+| Check | Verdict | Reasons |
+| --- | --- | --- |
+| Genuine | VERIFIED | Anchor independently verified |
+| Genuine, wrong expected package ID | BLOCKED | `UNEXPECTED_PACKAGE`, `ANCHOR_CONFLICT`, `ANCHOR_NOT_GENESIS` |
+| Genuine, anchor attested only by the operator | INCOMPLETE EVIDENCE | `ANCHOR_UNVERIFIED`, `ANCHOR_PROVENANCE` |
+| Genuine, no anchor | INCOMPLETE EVIDENCE | `ANCHOR_MISSING` |
+| Genuine, auditor read through the trader's participant | INCOMPLETE EVIDENCE | `READER_NOT_HOSTED`, `NO_INDEPENDENT_VIEW` |
+| Genuine, without the issuers' views | INCOMPLETE EVIDENCE | `RESERVE_EVIDENCE_MISSING` |
+| Genuine, one LP's position left out of the confirmations | BLOCKED | `POSITION_MISMATCH` |
+| Faithful re-creation | BLOCKED | `LINEAGE_BROKEN` (consumed by `Archive`), `UNACCOUNTED_STATE` |
+| Re-created state as the anchor, attested by the operator | BLOCKED | `ANCHOR_NOT_GENESIS`, `ANCHOR_CONFLICT`, `ANCHOR_UNVERIFIED`, `ANCHOR_PROVENANCE` |
+| Re-created state as the anchor, attested by the auditor | BLOCKED | `ANCHOR_NOT_GENESIS`, `ANCHOR_CONFLICT` |
+| Reserve diversion | BLOCKED | `RESERVE_DIVERTED`, `RESERVE_INACTIVE` |
+| Forged position with a matching supply | BLOCKED | `LINEAGE_BROKEN`, `UNACCOUNTED_STATE`, `POSITION_OUTSIDE_LINEAGE` |
+| Duplicate active state | BLOCKED | `DUPLICATE_ACTIVE_STATE` |
+| Standalone partial burn | BLOCKED | `POSITION_OUTSIDE_LINEAGE`, `SUPPLY_MISMATCH` |
+| Standalone burn of a whole position | BLOCKED | `POSITION_OUTSIDE_LINEAGE`, `SUPPLY_MISMATCH` |
+| Version-0 re-creation of the genesis as the anchor, attested by the auditor | BLOCKED | `ANCHOR_NOT_GENESIS` only |
+| The same pool with the true anchor | BLOCKED | `LINEAGE_BROKEN`, `UNACCOUNTED_STATE` |
+| No auditors, attested by the Treasury issuer | INCOMPLETE EVIDENCE | `NO_INDEPENDENT_VIEW` |
+| Legitimate changes after the snapshot | VERIFIED | 3 post-snapshot transitions listed |
+| Inventory older than the current state | INCOMPLETE EVIDENCE | `STATE_CHANGED` |
+| Snapshot from another pool's history | BLOCKED | `SNAPSHOT_NOT_IN_LINEAGE` |
+| Partial migration, completion required | BLOCKED | `MIGRATION_INCOMPLETE` |
+| Partial migration, inventory only | VERIFIED | |
+| Complete migration, completion required | VERIFIED | |
+| Genuine, after the auditor's participant was pruned past the genesis | INCOMPLETE EVIDENCE | `HISTORY_PRUNED` |
+
+**Visibility as observed.** The auditor's participant receives the following:
+- every `Initialize`, swap, deposit and withdrawal, with its node range;
+- the bare `Pool` `Archive` and the root-level `Pool` creates of a rewrite. It does not receive
+  the rewrite's own exercise, because the auditor is not its stakeholder;
+- the out-of-pool `TransferExact` and `BurnPosition`.
+
+The issuers receive each reserve move but not the pool exercise around it. The pool auditors in
+these scenarios also observe the holdings, but the verifier uses the issuers' views for
+reserves, because holding auditors are not guaranteed.
+
+**Pruning on the local network.** Canton offers a safe pruning offset only up to the
+participant's maximum deduplication duration back, and only once ACS commitments have been
+exchanged. The test topology sets `init.ledger-api.max-deduplication-duration = 10s` on the
+auditor participant only, and `prune-auditor.canton` pings the other participants until an
+offset is offered. Both are administrator actions on the test network. They are not a capability
+of the auditor's party.
+
 **Not rehearsed.**
 - A real inventory across participants with ledger offsets and signed snapshots.
-- Transaction-history checks.
+- An anchor recorded at the time of a real pool's opening.
+- Authenticated JSON API access.
 - Communication with real LPs and issuers.
 - A decision on legacy dust.
 - An LP withdrawal window under load.

@@ -88,6 +88,11 @@ unchanged (ID `aa060cbc…`, first recorded here). Only the tests package (`cant
 changed; it is never deployed. `check-packages.sh` now also pins the two vendored Token
 Standard DARs by package ID.
 
+**Stage 4.1.** No deployable source changed. The legacy package (`d8cadd3c…`, DAR SHA-256
+`42d50138…`), Secure V1 0.2.0 (`4abe2905…`, DAR SHA-256 `3d1d0442…`) and the live-reserve
+prototype (`aa060cbc…`) are unchanged. The new `LegacyLineage` test module changes only the tests
+package, now `69af2248…` (DAR SHA-256 `92aaa43a…`), which is never deployed.
+
 **External coordination still required.**
 - Every participant hosting a core party, governance, an auditor, a trader or a provider must
   upload and vet the Secure V1 DAR. The legacy package stays vetted.
@@ -189,7 +194,9 @@ networking, key management or other outage modes.
   - eight participants named `custodian`, `operator`, `governance`, `treasury_issuer`,
     `stable_issuer`, `trader`, `provider` and `auditor`, and `second_provider` for the
     migration rehearsal;
-  - in-memory storage throughout, with local ports 15001–15093 only.
+  - in-memory storage throughout, with local ports 15001–15093 only;
+  - on the auditor participant only, `init.ledger-api.max-deduplication-duration = 10s`, so
+    that the lineage check can prune within a run.
 
   `bootstrap.canton` connects every participant and uploads the test DAR. Each party is
   allocated on its own participant.
@@ -215,6 +222,7 @@ The script runs these phases in order, from `CantonTreasuryAmm.Test.MultiPartici
 | `mpResumeAfterOutage` | After reconnection, the same exit settles (353,483 shares → 250,000 / 499,801). The resume approved for the replaced paused state fails with `CONTRACT_NOT_FOUND`; a fresh four-participant resume restores the pool exactly (4,293,756 / 8,584,083, supply 6,071,067). Governance and repeated approvals and a replayed finalization are rejected. A swap settles (1,000 → 1,992) and the pre-resume version is rejected (`amm/stale-state`). |
 | `mpMigrationAllocate` | A second LP is allocated on `second_provider`, which every participant then knows. It is hosted there and nowhere else, read from each participant's own party list. |
 | `mpMigrationRehearsal` | Scenario A of [`MIGRATION.md`](MIGRATION.md#rehearsal), with the same amounts, each role submitting from its own participant. The legacy pool is set up through the test-only `LegacyPoolSetupProposal` (proposed by the operator, accepted by governance), initialized by the provider and joined by the second LP, and the trader swaps both ways. The auditor and the issuers reconcile the snapshot. Each LP exits and receives exactly its claim, and a replayed exit fails on the consumed state with the snapshot unchanged. The Secure V1 charter is onboarded on the four core participants, initialized from the first LP's proceeds (supply 7,071,091) and joined with the second's (707,108 shares). A swap (1,000 → 1,988) and a withdrawal (353,554 → 250,385 / 499,231) settle. The completion check reports no blocker, and an expectation one share off is reported. Instrument totals are unchanged throughout. |
+| `mpLineageScenarios` (`CantonTreasuryAmm.Test.LegacyLineage`) and `check-legacy-lineage.py` | Twelve legacy pools with synthetic instruments, one per lineage scenario, each role on its own participant ([`MIGRATION.md`](MIGRATION.md#rehearsal)). The read-only verifier is run against each, with each party read on its own participant's JSON API, and every verdict, exit code and reason code is checked: 24 checks. The auditor's participant is then pruned past the genuine pool's genesis, and that pool gives INCOMPLETE EVIDENCE (`HISTORY_PRUNED`). The faithful re-creation and the reconciled forgery both pass the snapshot procedure in the phase and are BLOCKED by the verifier. |
 
 The disconnection is done through the issuer participant's admin API, on the script's own local
 network only. It demonstrates one outage of one confirming participant and its recovery. It
@@ -233,7 +241,9 @@ lines, all from the stablecoin issuer's `TransactionProcessor`: "Response messag
 timed out". Two come from the first outage (the swap and the charter finalization) and two from
 the paused-pool outage (the exit and the resume finalization). In the final Stage 3.3 run,
 which took about 4 minutes 15 seconds, every phase passed, including both migration phases, with
-the same four WARN lines and no ERROR line. After
+the same four WARN lines and no ERROR line. The final Stage 4.1 run, which adds the lineage
+scenarios, the 24 verifier checks and the auditor pruning, took about 6 minutes and produced the
+same four WARN lines and no ERROR line. After
 reconnection, the sequencer refuses the issuer's late confirmations with
 `MAX_SEQUENCING_TIME_EXCEEDED`, which is logged at INFO. The expected
 rejections in the other phases are logged at INFO. The daemon exits with status 143 when the
@@ -328,6 +338,30 @@ SHA-256 matched the originals afterwards. Every mutant compiled, so each kill is
 | The platform override works outside verify-only mode | "platform override outside verification" |
 | The darwin-arm64 pin is off by one hex digit | "real archive verifies" (locally, with the real archive). On CI, the same error in the linux-amd64 pin fails the install step |
 
+**Stage 4.1.** Each mutation was applied alone to `verify-legacy-lineage.py` and checked with
+`check-legacy-lineage.py` against a live local network running `mpLineageScenarios`. The
+pruning mutation was checked after a real prune. Each was reverted, and both scripts' SHA-256
+matched the originals afterwards. A kill means at least one check got a different verdict, exit
+code or reason set. Where the verdict itself did not change, another check still refused the
+pool, and the table says so.
+
+| Mutation | Caught by |
+| --- | --- |
+| INCOMPLETE EVIDENCE findings ignored by the verdict | 6 checks; each would have reported VERIFIED |
+| Non-transition choices accepted as lineage steps | **Survived, equivalent.** Legacy `Pool` has no consuming choices besides the three transitions and `Archive`, and `Archive` creates no successor, so the successor check reports the same `LINEAGE_BROKEN` |
+| The anchor need not come from `Initialize` | The two re-creation anchors (verdict held by `ANCHOR_CONFLICT`) and, decisively, the version-0 re-creation of the genesis. Before that scenario was added, no check depended on this alone |
+| Operator and governance count as independent attestors | Operator-attested anchor (`ANCHOR_PROVENANCE` missing; the verdict stays INCOMPLETE EVIDENCE because no independent stakeholder attests) |
+| Reserve consumption outside the lineage not checked | Reserve diversion (verdict held by `RESERVE_INACTIVE`) |
+| Current reserve activeness not checked | Reserve diversion |
+| Position creation outside the lineage not checked | Forged position (verdict held by `LINEAGE_BROKEN`) |
+| Position consumption outside a withdrawal not checked | Survived at first, because a partial burn also creates a remainder outside the lineage; killed after adding the standalone burn of a whole position |
+| Reader hosting not checked | Auditor read through the trader's participant |
+| `requireComplete` ignored | Partial migration with completion required, which would have reported VERIFIED |
+| Pool states outside the lineage not reported | 4 checks; the duplicate active state would have reported VERIFIED |
+| Supply reconciliation removed | Both standalone burns |
+| Snapshot not required in the lineage | Snapshot from another pool's history (the verifier then fails closed on the missing index) |
+| History read from offset 0 despite pruning | Pruned genuine pool. Canton itself refuses the read (`PARTICIPANT_PRUNED_DATA_ACCESSED`), so the verdict stays INCOMPLETE EVIDENCE |
+
 ## Stage 3.3 security review
 
 This was a focused, read-only review of the Secure V1 sources for what the migration relies on:
@@ -354,6 +388,8 @@ or medium issue in Secure V1. Findings:
   - Stage 3.1: the multi-participant run above, with production onboarding.
   - Stage 3.2: the same run, extended with pause, paused exits during an outage, and resume.
   - Stage 3.3: the same run, extended with the migration rehearsal on a ninth participant.
+  - Stage 4.1: the same run, extended with the legacy lineage scenarios, the verifier checks and
+    real pruning of the auditor participant.
   - Every other test ran on the IDE ledger only.
 - **Multi-participant verification.** PASS, locally, for the scenarios above. Not run on any
   production-like topology.
@@ -361,7 +397,8 @@ or medium issue in Secure V1. Findings:
 - **Migration readiness.** The design ([`MIGRATION.md`](MIGRATION.md)) has been rehearsed with
   synthetic assets on the IDE ledger (scenarios A–H) and end to end on the local
   multi-participant network (scenario A). Its reconciliation procedure exists as test code,
-  not as reviewed production tooling. No real inventory has been taken, and no LP or issuer has
+  not as reviewed production tooling. The read-only lineage verifier has been exercised on the
+  local multi-participant network only (Stage 4.1). No real inventory has been taken, and no LP or issuer has
   been consulted.
 - **Privacy requirements.** The custodian and both issuers see every pool state and position,
   including LP identities and share amounts. This needs sign-off from every LP and the
@@ -387,6 +424,6 @@ or medium issue in Secure V1. Findings:
 | High | No independent security audit has been done. |
 | Medium | Any one core participant can halt every pool operation, including LP exits from a paused pool, and pause and resume themselves. |
 | Medium | CI has never run remotely, and `actionlint` has not been run. The SDK archive digests come from the publisher's registry, not from a signature. |
-| Medium | Migration has been rehearsed only with synthetic assets on local networks. There is no reviewed inventory and transaction-history tooling, no withdrawal-window procedure, no decision on legacy dust, and no LP or issuer communication. A legacy pool re-created unchanged by the operator and governance passes reconciliation. |
+| Medium | Migration has been rehearsed only with synthetic assets on local networks. The lineage verifier exists and has been exercised there only. It is unreviewed and unaudited, and it relies on anchors that no real pool has recorded. Production JSON API authentication, reader retention and the readers' own participants are untested. There is no reviewed inventory tooling, no withdrawal-window procedure, no decision on legacy dust, and no LP or issuer communication. |
 | Medium | Privacy sign-off for the issuers' and custodian's visibility is missing. |
 | Low | Intent executors choose among the trader's eligible holdings and the execution timing (see [`SECURITY.md`](SECURITY.md#secure-swapintent-scope)). |

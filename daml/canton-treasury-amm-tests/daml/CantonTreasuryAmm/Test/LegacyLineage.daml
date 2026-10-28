@@ -1,0 +1,351 @@
+-- Legacy pools for the lineage verifier (`scripts/verify-legacy-lineage.py`, `MIGRATION.md`
+-- "Lineage verification") on the local multi-participant network: one pool per scenario, built
+-- from synthetic assets with the production legacy choices, each submitted from the submitting
+-- role's own participant. The attacks that need the operator's and governance's joint authority
+-- go through `LegacyStateRewrite`, a test-only stand-in for any package those two could vet and
+-- use together. The phase reports what each independent party observed, which
+-- `scripts/check-legacy-lineage.py` turns into the manifests the verifier checks.
+module CantonTreasuryAmm.Test.LegacyLineage where
+
+import DA.Assert ((===))
+import DA.Foldable (forA_, mapA_)
+import DA.List (sortOn)
+import DA.Optional (fromSome)
+import Daml.Script
+
+import CantonTreasuryAmm.LiquidityPosition qualified as Legacy
+import CantonTreasuryAmm.Pool qualified as Legacy
+import CantonTreasuryAmm.Test.Fixtures (futureDeadline)
+import CantonTreasuryAmm.Test.MigrationRehearsal
+import CantonTreasuryAmm.Test.MultiParticipant
+import CantonTreasuryAmm.Token
+import CantonTreasuryAmm.Types
+
+-- Archives and creates legacy pool states and positions with the operator's and governance's
+-- joint authority, which every legacy pool and position carries. Test-only.
+template LegacyStateRewrite
+  with
+    operator : Party
+    governance : Party
+    archivedPools : [ContractId Legacy.Pool]
+    createdPools : [Legacy.Pool]
+    createdPositions : [Legacy.LiquidityPosition]
+  where
+    signatory operator
+    observer governance
+
+    choice ApplyLegacyStateRewrite : ([ContractId Legacy.Pool], [ContractId Legacy.LiquidityPosition])
+      controller governance
+      do
+        mapA_ archive archivedPools
+        pools <- mapA create createdPools
+        positions <- mapA create createdPositions
+        pure (pools, positions)
+
+data ConfirmedPosition = ConfirmedPosition with
+  provider : Party
+  shares : Int
+    deriving (Eq, Show)
+
+-- What the independent parties observed for one pool. `genesisCid` is the state the auditor saw
+-- created by `Initialize` and recorded at the time; `currentCid` is the active state the
+-- operator presents now; `snapshotCid` is the state recorded at the agreed snapshot boundary.
+-- `positions` are the positions each provider sees on its own participant now.
+data LineageCase = LineageCase with
+  name : Text
+  poolId : PoolId
+  auditors : [Party]
+  genesisCid : ContractId Legacy.Pool
+  currentCid : ContractId Legacy.Pool
+  snapshotCid : ContractId Legacy.Pool
+  positions : [ConfirmedPosition]
+    deriving (Eq, Show)
+
+data LineageEvidence = LineageEvidence with
+  parties : MpParties
+  cases : [LineageCase]
+    deriving (Eq, Show)
+
+data LineageMarket = LineageMarket with
+  parties : MpParties
+  treasuryInstrumentCid : ContractId TokenInstrument
+  stableInstrumentCid : ContractId TokenInstrument
+  treasuryInstrument : InstrumentId
+  stableInstrument : InstrumentId
+
+data LineagePool = LineagePool with
+  market : LineageMarket
+  poolId : PoolId
+  auditors : [Party]
+  genesisCid : ContractId Legacy.Pool
+  poolCid : ContractId Legacy.Pool
+
+-- The roles that must have applied a transaction before the next step reads it.
+lineageReaders : LineagePool -> [Party]
+lineageReaders lineagePool =
+  lineagePool.market.parties.operator :: lineagePool.market.parties.governance :: lineagePool.auditors
+
+issueLineage : LineageMarket -> Bool -> Party -> Int -> Script (ContractId Holding)
+issueLineage market treasury owner atoms =
+  if treasury
+    then issueFrom market.parties.treasuryIssuer market.treasuryInstrumentCid market.parties.auditor owner atoms
+    else issueFrom market.parties.stableIssuer market.stableInstrumentCid market.parties.auditor owner atoms
+
+-- A legacy pool initialized by the provider with 5,000,000 / 10,000,000. The setup goes through
+-- `LegacyPoolSetupProposal`, since no participant hosts both the operator and governance.
+openLineagePool : LineageMarket -> Text -> [Party] -> Script LineagePool
+openLineagePool market reference auditors = do
+  let parties = market.parties
+  let poolId = PoolId with
+        operator = parties.operator
+        governance = parties.governance
+        treasuryInstrument = market.treasuryInstrument
+        stableInstrument = market.stableInstrument
+        setupReference = reference
+  treasury <- issueLineage market True parties.provider 5000000
+  stable <- issueLineage market False parties.provider 10000000
+  proposalCid <- submit parties.operator $ createCmd LegacyPoolSetupProposal with
+    poolId
+    initialProvider = parties.provider
+    auditors
+  awaitActive [parties.governance] proposalCid
+  setupCid <- submit parties.governance $ exerciseCmd proposalCid AcceptLegacyPoolSetup
+  awaitActive [parties.provider] setupCid
+  initialized <- submit parties.provider $ exerciseCmd setupCid Legacy.Initialize with
+    treasuryHoldingCid = treasury
+    stableHoldingCid = stable
+    treasuryAmount = amountOf 5000000
+    stableAmount = amountOf 10000000
+  let lineagePool = LineagePool with market; poolId; auditors; genesisCid = initialized.poolCid; poolCid = initialized.poolCid
+  awaitActive (lineageReaders lineagePool) initialized.poolCid
+  awaitActive [parties.provider] initialized.positionCid
+  pure lineagePool
+
+poolOf : LineagePool -> Script Legacy.Pool
+poolOf lineagePool = do
+  Some pool <- queryContractId lineagePool.market.parties.operator lineagePool.poolCid
+  pure pool
+
+-- The operator's participant discloses the current state and both reserves.
+disclosuresOf : LineagePool -> Script [Disclosure]
+disclosuresOf lineagePool = do
+  let operator = lineagePool.market.parties.operator
+  pool <- poolOf lineagePool
+  mapA (fmap fromSome)
+    [ queryDisclosure operator lineagePool.poolCid
+    , queryDisclosure operator pool.treasuryReserveHoldingCid
+    , queryDisclosure operator pool.stableReserveHoldingCid ]
+
+advance : LineagePool -> ContractId Legacy.Pool -> Script LineagePool
+advance lineagePool poolCid = do
+  let next = lineagePool with poolCid
+  awaitActive (lineageReaders next) poolCid
+  pure next
+
+lineageSwap : LineagePool -> SwapDirection -> Int -> Script LineagePool
+lineageSwap lineagePool direction atoms = do
+  let market = lineagePool.market
+  input <- issueLineage market (direction == TreasuryForStable) market.parties.trader atoms
+  pool <- poolOf lineagePool
+  disclosures <- disclosuresOf lineagePool
+  deadline <- futureDeadline
+  result <- submit (actAs market.parties.trader <> discloseMany disclosures) $
+    exerciseCmd lineagePool.poolCid Legacy.SwapExactInput with
+      trader = market.parties.trader
+      direction
+      inputHoldingCid = input
+      inputAmount = amountOf atoms
+      minimumAmountOut = 0.0
+      deadline
+      expectedVersion = pool.stateVersion
+  advance lineagePool result.poolCid
+
+lineageAdd : LineagePool -> Party -> Int -> Int -> Script LineagePool
+lineageAdd lineagePool provider treasuryAtoms stableAtoms = do
+  let market = lineagePool.market
+  treasury <- issueLineage market True provider treasuryAtoms
+  stable <- issueLineage market False provider stableAtoms
+  pool <- poolOf lineagePool
+  disclosures <- disclosuresOf lineagePool
+  result <- submit (actAs provider <> discloseMany disclosures) $
+    exerciseCmd lineagePool.poolCid Legacy.AddLiquidity with
+      provider
+      treasuryHoldingCid = treasury
+      stableHoldingCid = stable
+      maximumTreasury = amountOf treasuryAtoms
+      maximumStable = amountOf stableAtoms
+      minimumShares = 0.0
+      expectedVersion = pool.stateVersion
+  awaitActive [provider] result.positionCid
+  advance lineagePool result.poolCid
+
+positionsOf : LineagePool -> Party -> Script [(ContractId Legacy.LiquidityPosition, Legacy.LiquidityPosition)]
+positionsOf lineagePool provider = do
+  positions <- query @Legacy.LiquidityPosition provider
+  pure (sortOn (show . fst) [entry | entry@(_, position) <- positions, position.poolId == lineagePool.poolId])
+
+-- Burns `burnAtoms` of the provider's only position through the pool.
+lineageRemove : LineagePool -> Party -> Int -> Script LineagePool
+lineageRemove lineagePool provider burnAtoms = do
+  [(positionCid, _)] <- positionsOf lineagePool provider
+  pool <- poolOf lineagePool
+  disclosures <- disclosuresOf lineagePool
+  result <- submit (actAs provider <> discloseMany disclosures) $
+    exerciseCmd lineagePool.poolCid Legacy.RemoveLiquidity with
+      provider
+      positionCid
+      burnShares = amountOf burnAtoms
+      minimumTreasuryOut = 0.0
+      minimumStableOut = 0.0
+      expectedVersion = pool.stateVersion
+  awaitArchived [provider] positionCid
+  advance lineagePool result.poolCid
+
+-- The operator proposes a rewrite and governance applies it on its own participant.
+rewrite : LineagePool -> [ContractId Legacy.Pool] -> [Legacy.Pool] -> [Legacy.LiquidityPosition] -> Script ([ContractId Legacy.Pool], [ContractId Legacy.LiquidityPosition])
+rewrite lineagePool archivedPools createdPools createdPositions = do
+  let parties = lineagePool.market.parties
+  rewriteCid <- submit parties.operator $ createCmd LegacyStateRewrite with
+    operator = parties.operator
+    governance = parties.governance
+    archivedPools
+    createdPools
+    createdPositions
+  awaitActive [parties.governance] rewriteCid
+  (pools, positions) <- submit parties.governance $ exerciseCmd rewriteCid ApplyLegacyStateRewrite
+  forA_ pools (awaitActive (lineageReaders lineagePool))
+  forA_ positions (awaitActive (lineageReaders lineagePool))
+  forA_ archivedPools (awaitArchived (lineageReaders lineagePool))
+  pure (pools, positions)
+
+-- The case as the independent parties report it, with the providers' own position views.
+caseOf : Text -> LineagePool -> ContractId Legacy.Pool -> Script LineageCase
+caseOf name lineagePool snapshotCid = do
+  let parties = lineagePool.market.parties
+  positions <- fmap concat $ forA [parties.provider, parties.trader] $ \provider -> do
+    held <- positionsOf lineagePool provider
+    pure [ConfirmedPosition with provider; shares = atomsOf position.shares | (_, position) <- held, position.provider == provider]
+  pure LineageCase with
+    name
+    poolId = lineagePool.poolId
+    auditors = lineagePool.auditors
+    genesisCid = lineagePool.genesisCid
+    currentCid = lineagePool.poolCid
+    snapshotCid
+    positions
+
+readersOf : MpParties -> MigrationReaders
+readersOf parties = MigrationReaders with
+  auditor = parties.auditor
+  treasuryIssuer = parties.treasuryIssuer
+  stableIssuer = parties.stableIssuer
+
+-- PHASE 14. One legacy pool per lineage scenario. The snapshot procedure of
+-- `MigrationRehearsal`, which reads only current state, is run where it matters to show which
+-- tampering it cannot see.
+mpLineageScenarios : MpParties -> Script LineageEvidence
+mpLineageScenarios parties = do
+  let treasuryInstrument = InstrumentId with issuer = parties.treasuryIssuer; symbol = "LUST"
+  let stableInstrument = InstrumentId with issuer = parties.stableIssuer; symbol = "LUSD"
+  treasuryInstrumentCid <- submit parties.treasuryIssuer $ createCmd TokenInstrument with
+    instrument = treasuryInstrument
+    displayName = "Legacy lineage Treasury"
+    auditors = [parties.auditor]
+  stableInstrumentCid <- submit parties.stableIssuer $ createCmd TokenInstrument with
+    instrument = stableInstrument
+    displayName = "Legacy lineage stablecoin"
+    auditors = [parties.auditor]
+  let market = LineageMarket with parties; treasuryInstrumentCid; stableInstrumentCid; treasuryInstrument; stableInstrument
+  let readers = readersOf parties
+  let open reference = openLineagePool market reference [parties.auditor]
+
+  -- A. Untampered: initialization, a second LP's deposit and a swap.
+  genuine <- open "lineage-genuine" >>= \p -> lineageAdd p parties.trader 500000 1000000 >>= \p -> lineageSwap p TreasuryForStable 10000
+  genuineCase <- caseOf "genuine" genuine genuine.poolCid
+
+  -- B. Faithful re-creation: the operator and governance archive the state after a swap and
+  -- create an identical one. The snapshot procedure reconciles it.
+  recreated0 <- open "lineage-recreated" >>= \p -> lineageSwap p TreasuryForStable 10000
+  recreatedPool <- poolOf recreated0
+  ([replacementCid], []) <- rewrite recreated0 [recreated0.poolCid] [recreatedPool] []
+  recreatedSnapshot <- legacySnapshot readers recreated0.poolId
+  either (\blockers -> abort ("Snapshot procedure blocked a faithful re-creation: " <> show blockers)) (\snapshot -> snapshot.poolCid === replacementCid) recreatedSnapshot
+  recreatedCase <- caseOf "recreated" (recreated0 with poolCid = replacementCid) replacementCid
+  debug "LINEAGE faithful re-creation passes the snapshot procedure"
+
+  -- C. Reserve diversion: the operator moves the whole Treasury reserve to the trader.
+  diverted <- open "lineage-diverted"
+  divertedPool <- poolOf diverted
+  _ <- submit parties.operator $ exerciseCmd divertedPool.treasuryReserveHoldingCid TransferExact with
+    newOwner = parties.trader
+    transferAmount = divertedPool.treasuryReserveAmount
+  awaitArchived [parties.treasuryIssuer] divertedPool.treasuryReserveHoldingCid
+  divertedCase <- caseOf "diverted" diverted diverted.poolCid
+
+  -- D. Forged entitlement with matching accounting: a 1,000-share position for the trader and a
+  -- replacement state whose supply includes it. The snapshot procedure reconciles it.
+  forged0 <- open "lineage-forged"
+  forgedPool <- poolOf forged0
+  ([forgedStateCid], [_]) <- rewrite forged0 [forged0.poolCid]
+    [forgedPool with totalShares = forgedPool.totalShares + amountOf 1000]
+    [Legacy.LiquidityPosition with poolId = forged0.poolId; provider = parties.trader; shares = amountOf 1000; auditors = forged0.auditors]
+  forgedSnapshot <- legacySnapshot readers forged0.poolId
+  either (\blockers -> abort ("Snapshot procedure blocked a reconciled forgery: " <> show blockers)) (\snapshot -> snapshot.poolCid === forgedStateCid) forgedSnapshot
+  forgedCase <- caseOf "forged" (forged0 with poolCid = forgedStateCid) forgedStateCid
+  debug "LINEAGE forged position with a matching supply passes the snapshot procedure"
+
+  -- E. Duplicate active states: an identical second state next to the genuine one.
+  duplicated <- open "lineage-duplicated"
+  duplicatedPool <- poolOf duplicated
+  ([_], []) <- rewrite duplicated [] [duplicatedPool] []
+  duplicatedCase <- caseOf "duplicated" duplicated duplicated.poolCid
+
+  -- F. Standalone burn: the provider burns 1,000 shares outside the pool.
+  burned <- open "lineage-burned"
+  [(burnedPositionCid, _)] <- positionsOf burned parties.provider
+  _ <- submit parties.provider $ exerciseCmd burnedPositionCid Legacy.BurnPosition with
+    expectedPoolId = burned.poolId
+    burnAmount = amountOf 1000
+  awaitArchived [parties.auditor] burnedPositionCid
+  burnedCase <- caseOf "burned" burned burned.poolCid
+
+  -- F, full: the second LP burns its whole position outside the pool, leaving no remainder.
+  fullyBurned <- open "lineage-fully-burned" >>= \p -> lineageAdd p parties.trader 500000 1000000
+  [(fullyBurnedCid, fullyBurnedPosition)] <- positionsOf fullyBurned parties.trader
+  _ <- submit parties.trader $ exerciseCmd fullyBurnedCid Legacy.BurnPosition with
+    expectedPoolId = fullyBurned.poolId
+    burnAmount = fullyBurnedPosition.shares
+  awaitArchived [parties.auditor] fullyBurnedCid
+  fullyBurnedCase <- caseOf "fullyBurned" fullyBurned fullyBurned.poolCid
+
+  -- H: the operator and governance archive the genesis and create an identical version-0 state,
+  -- which differs from the genesis only in not coming from `Initialize`.
+  regenesis <- open "lineage-regenesis"
+  regenesisPool <- poolOf regenesis
+  ([regenesisCid], []) <- rewrite regenesis [regenesis.poolCid] [regenesisPool] []
+  regenesisCase <- caseOf "regenesis" (regenesis with poolCid = regenesisCid) regenesisCid
+
+  -- G. A pool no independent party observes: no pool auditors.
+  unobserved <- openLineagePool market "lineage-unobserved" []
+  unobservedCase <- caseOf "unobserved" unobserved unobserved.poolCid
+
+  -- I. Legitimate changes after the snapshot boundary: a swap, a partial exit and a deposit.
+  legitimate0 <- open "lineage-legitimate" >>= \p -> lineageAdd p parties.trader 500000 1000000 >>= \p -> lineageSwap p TreasuryForStable 10000
+  let legitimateSnapshot = legitimate0.poolCid
+  legitimate <- lineageSwap legitimate0 StableForTreasury 5000 >>= \p -> lineageRemove p parties.trader 100000 >>= \p -> lineageAdd p parties.trader 1000 2000
+  legitimateCase <- caseOf "legitimate" legitimate legitimateSnapshot
+
+  -- J. Partial migration: the provider has exited, the second LP has not.
+  partial <- open "lineage-partial" >>= \p -> lineageAdd p parties.trader 500000 1000000 >>= \p -> lineageRemove p parties.provider 7071066
+  partialCase <- caseOf "partial" partial partial.poolCid
+
+  -- Complete migration: the only LP has exited and only the locked share remains.
+  complete <- open "lineage-complete" >>= \p -> lineageRemove p parties.provider 7071066
+  completePool <- poolOf complete
+  atomsOf completePool.totalShares === 1
+  completeCase <- caseOf "complete" complete complete.poolCid
+
+  debug "LINEAGE scenario pools created on their roles' own participants"
+  pure LineageEvidence with
+    parties
+    cases = [genuineCase, recreatedCase, divertedCase, forgedCase, duplicatedCase, burnedCase, fullyBurnedCase, regenesisCase, unobservedCase, legitimateCase, partialCase, completeCase]
